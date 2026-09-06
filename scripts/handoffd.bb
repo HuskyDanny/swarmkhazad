@@ -7,7 +7,7 @@
 ;; to), copies each finished .handoff into every recipient's inbox/new with
 ;; `recipient` and `enqueued_at` headers, moves the card on the board, sends a
 ;; generic wake-up to each recipient's tmux session, and moves the original to
-;; the sender's sent/ (or failed/ with a .error file next to it).
+;; the sender's sent/ — or to failed/ with a .error file beside it.
 ;;
 ;; Runtime files: <task>/state/daemon/{handoffd.pid,handoffd.log,stop}.
 
@@ -18,6 +18,7 @@
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
+(load-file (str (fs/path script-dir "board_lib.bb")))
 
 (def poll-ms 1000)
 (def wake-message "You have new handoff mail. If idle, run ready_for_next.bb.")
@@ -34,47 +35,33 @@
 
 (defn should-stop? [ctx] (or @stopping (fs/exists? (stop-file ctx))))
 
-(defn tmux-socket [ctx]
-  (when (fs/regular-file? (:tmux-socket-file ctx))
-    (not-empty (str/trim (slurp (str (:tmux-socket-file ctx)))))))
-
 (defn notify!
   "Type the wake-up into the recipient's pane. Best-effort: a role whose session
    is gone still gets its inbox file; only the nudge is lost."
   [ctx role]
-  (when-let [socket (tmux-socket ctx)]
+  (when-let [socket (handoff-lib/tmux-socket ctx)]
     (let [target (task-lib/session-name role)
           ok? (zero? (:exit (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "-l" wake-message)))]
-      (when ok?
-        (Thread/sleep 150)
-        (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-m")
-        (Thread/sleep 50)
-        (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-j"))
-      (when-not ok? (log! ctx "wake-failed" role)))))
-
-(defn move-with-collision [source target-dir]
-  (fs/create-dirs target-dir)
-  (let [base (fs/file-name source)
-        target (fs/path target-dir base)]
-    (fs/move source (if (fs/exists? target) (fs/path target-dir (str (now) "_" base)) target))))
+      (if ok?
+        (do (Thread/sleep 150)
+            (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-m")
+            (Thread/sleep 50)
+            (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-j"))
+        (log! ctx "wake-failed" role)))))
 
 (defn fail! [ctx path reason]
-  (let [failed-dir (fs/path (fs/parent (fs/parent path)) "failed")]
+  (let [failed-dir (fs/path (fs/parent (fs/parent path)) "failed")
+        target (fs/path failed-dir (fs/file-name path))]
     (log! ctx "failed" (str path) reason)
-    (spit (str path ".error") (str reason "\n"))
-    (move-with-collision path failed-dir)))
-
-(defn pack-board! [ctx & args]
-  (let [result (apply process/sh {:continue true} "bb" (str (fs/path script-dir "pack_board.bb")) (concat args ["--task" (:task-id ctx)]))]
-    (when-not (zero? (:exit result))
-      (throw (ex-info (str/trim (str "pack_board " (str/join " " args) ": " (:err result) (:out result))) {})))))
+    (fs/create-dirs failed-dir)
+    (fs/move path target)
+    (spit (str target ".error") (str reason "\n"))))
 
 (defn update-board! [ctx headers recipients]
   (when (= "git_handoff" (get headers "type"))
-    (let [name (or (handoff-lib/task-key headers) (:task-id ctx))]
-      (if (= "true" (get headers "non-forwarding"))
-        (pack-board! ctx "done" "--name" name)
-        (pack-board! ctx "move" "--name" name "--lane" (first recipients))))))
+    (board-lib/set-lane! ctx
+                         (or (handoff-lib/task-key headers) (:task-id ctx))
+                         (if (= "true" (get headers "non-forwarding")) "done" (first recipients)))))
 
 (defn phantom? [from] (boolean (re-matches #"\(.+\)" (or from ""))))
 
@@ -97,9 +84,9 @@
         (when-not (fs/exists? target)
           (spit (str target) (handoff-lib/render-message (assoc headers "recipient" r "enqueued_at" (now)) body)))
         (notify! ctx r)))
-    (move-with-collision path (sent-dir ctx sender))
-    (when (and (not (phantom? sender)) (handoff-lib/role-known? ctx sender))
-      (process/sh {:continue true} "bb" (str (fs/path script-dir "pack_board.bb")) "archive" "--role" sender "--task" (:task-id ctx)))
+    (let [dir (sent-dir ctx sender)]
+      (fs/create-dirs dir)
+      (fs/move path (fs/path dir (fs/file-name path))))
     (log! ctx "delivered" (str path) "to" (str/join "," recipients))))
 
 (defn outbox-files [ctx]
@@ -120,12 +107,6 @@
         (try (fail! ctx (fs/path path) (.getMessage e))
              (catch Exception nested (log! ctx "failed-to-archive" path (.getMessage nested))))))))
 
-(defn sleep-poll! [ctx ms]
-  (loop [remaining ms]
-    (when (and (pos? remaining) (not (should-stop? ctx)))
-      (Thread/sleep (min remaining 100))
-      (recur (- remaining 100)))))
-
 (defn shutdown! [ctx]
   ;; Runs from the TERM shutdown hook and from the stop-file path; log once.
   (when (compare-and-set! stopping false true)
@@ -141,7 +122,7 @@
   (try
     (while (not (should-stop? ctx))
       (poll-once! ctx)
-      (sleep-poll! ctx poll-ms))
+      (Thread/sleep poll-ms))
     (finally
       (shutdown! ctx))))
 

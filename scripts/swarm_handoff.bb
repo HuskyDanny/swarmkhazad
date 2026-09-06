@@ -89,7 +89,7 @@
 ;; ---------------------------------------------------------------- state
 
 (defn in-process-files [ctx sender]
-  (handoff-lib/in-process-files (handoff-lib/in-process-dir ctx sender)))
+  (handoff-lib/in-process-files ctx sender))
 
 (defn inbound-non-forwarding? [ctx sender]
   (boolean (some #(= "true" (handoff-lib/header-field % "non-forwarding")) (in-process-files ctx sender))))
@@ -129,16 +129,24 @@
     "git_handoff" (str "Re-read your instructions.\n\nmerge_and_process.bb " sender " " commit "\n")
     "note" (str "Re-read your instructions.\n\n" message "\n")))
 
+(defn fresh-stamp
+  "A millisecond stamp no other file in this outbox carries."
+  [out sender]
+  (loop []
+    (let [s (handoff-lib/stamp)]
+      (if (seq (fs/glob out (str "*_" s "_from_" sender "_to_*.handoff")))
+        (do (Thread/sleep 1) (recur))
+        s))))
+
 (defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base]}]
-  (let [stamp (handoff-lib/id-timestamp)
-        seq (handoff-lib/next-sequence ctx)
+  (let [out (handoff-lib/outbox-dir ctx sender)
+        stamp (fresh-stamp out sender)
         type (get headers "type")
         priority (or (get headers "priority") "50")
-        filename (str priority "_" stamp "_" seq "_from_" sender "_to_" (str/join "_" recipients) ".handoff")
-        out (handoff-lib/outbox-dir ctx sender)
+        filename (str priority "_" stamp "_from_" sender "_to_" (str/join "_" recipients) ".handoff")
         tmp (fs/path out "tmp" (str filename ".tmp"))
         final (fs/path out filename)
-        h (cond-> {"id" (str stamp "_" seq "_from_" sender)
+        h (cond-> {"id" (str stamp "_from_" sender)
                    "from" sender
                    "to" (str/join "," recipients)
                    "priority" priority

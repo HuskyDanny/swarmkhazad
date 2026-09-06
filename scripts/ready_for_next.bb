@@ -43,9 +43,7 @@
   (merge-inbound! worktree target))
 
 (defn task-mode! [ctx role worktree]
-  (let [in-process (handoff-lib/in-process-dir ctx role)
-        batches (handoff-lib/batch-dirs in-process)
-        files (handoff-lib/handoff-files in-process)]
+  (let [{:keys [dir files batches]} (handoff-lib/in-process-state ctx role)]
     (when (seq batches)
       (fail! 2 "TASK_IN_PROCESS_IS_BATCH: this role receives in task mode but a batch is in process." (str/join "\n" (map #(str "- " %) batches))))
     (when (> (count files) 1)
@@ -57,19 +55,17 @@
         (if (empty? new-files)
           (println "NO_TASK")
           (let [source (first new-files)
-                target (fs/path in-process (fs/file-name source))]
+                target (fs/path dir (fs/file-name source))]
             (accept-one! worktree source target)
             (handoff-lib/print-task target)))))))
 
 (defn new-batch-dir [in-process]
   (loop [n 1]
-    (let [dir (fs/path in-process (format "batch_%s_%06d" (handoff-lib/id-timestamp) n))]
+    (let [dir (fs/path in-process (format "batch_%s_%06d" (handoff-lib/stamp) n))]
       (if (fs/exists? dir) (recur (inc n)) dir))))
 
 (defn batch-mode! [ctx role worktree]
-  (let [in-process (handoff-lib/in-process-dir ctx role)
-        batches (handoff-lib/batch-dirs in-process)
-        files (handoff-lib/handoff-files in-process)]
+  (let [{:keys [dir files batches]} (handoff-lib/in-process-state ctx role)]
     (when (seq files)
       (fail! 2 "TASK_IN_PROCESS_IS_SINGLE: this role receives in batch mode but a single task is in process." (str/join "\n" (map #(str "- " %) files))))
     (when (> (count batches) 1)
@@ -82,11 +78,11 @@
           (println "NO_TASK")
           (let [priority (or (handoff-lib/header-field (first new-files) "priority") "50")
                 selected (filter #(= priority (or (handoff-lib/header-field % "priority") "50")) new-files)
-                dir (new-batch-dir in-process)]
-            (fs/create-dirs dir)
+                batch (new-batch-dir dir)]
+            (fs/create-dirs batch)
             (doseq [source selected]
-              (accept-one! worktree source (fs/path dir (fs/file-name source))))
-            (handoff-lib/print-batch dir)))))))
+              (accept-one! worktree source (fs/path batch (fs/file-name source))))
+            (handoff-lib/print-batch batch)))))))
 
 (defn -main []
   (let [ctx (task-lib/ctx-from-env)

@@ -1,8 +1,9 @@
 #!/usr/bin/env bb
 
 ;; handoff-lib — the mail transport's shared vocabulary: where a role's mail
-;; lives, how a handoff file is parsed and rewritten, timestamps, sequence
-;; numbers, and the TASK/BATCH printouts every receive helper emits.
+;; lives, how a handoff file is parsed and rewritten, timestamps, the
+;; in-process inspection every receive helper does, pane archiving, and the
+;; TASK/BATCH printouts.
 ;;
 ;; All mail lives in the task folder, never in a repo:
 ;;
@@ -76,8 +77,11 @@
 (defn timestamp []
   (.format java.time.format.DateTimeFormatter/ISO_INSTANT (java.time.Instant/now)))
 
-(defn id-timestamp []
-  (.format (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmss'Z'")
+(defn stamp
+  "Millisecond UTC stamp for ids and filenames: sorts by time, needs no counter
+   and no lock. A writer that finds its filename taken waits a millisecond."
+  []
+  (.format (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd'T'HHmmssSSS'Z'")
            (java.time.ZonedDateTime/now java.time.ZoneOffset/UTC)))
 
 (defn valid-priority? [value]
@@ -101,12 +105,23 @@
          vec)
     []))
 
+(defn in-process-state
+  "What a role has accepted and not finished: single files and batch dirs.
+   Both receive helpers validate against this one view."
+  [ctx role-name]
+  (let [dir (in-process-dir ctx role-name)]
+    {:dir dir :files (handoff-files dir) :batches (batch-dirs dir)}))
+
 (defn in-process-files
   "Single in-process handoffs plus every file inside an in-process batch."
-  [dir]
-  (into (handoff-files dir) (mapcat handoff-files (batch-dirs dir))))
+  [ctx role-name]
+  (let [{:keys [files batches]} (in-process-state ctx role-name)]
+    (into files (mapcat handoff-files batches))))
 
-(defn glob-handoffs [dir]
+(defn glob-handoffs
+  "Every .handoff at any depth under dir. `**` alone does not match depth 0
+   in babashka.fs (RAN), hence both patterns."
+  [dir]
   (if (fs/directory? dir)
     (->> (concat (fs/glob dir "*.handoff") (fs/glob dir "**/*.handoff"))
          (filter fs/regular-file?)
@@ -189,67 +204,39 @@
       (println "BATCH_ITEM:" (inc index))
       (print-task file))))
 
-;; ---------------------------------------------------------------- sequence
+;; ---------------------------------------------------------------- panes
 
-(defn next-sequence
-  "A task-wide six-digit counter, serialised with a lock directory so two roles
-   sending in the same second never collide."
-  [ctx]
-  (let [dir (:mail-dir ctx)
-        seq-file (fs/path dir "sequence")
-        lock-dir (fs/path dir "sequence.lock")]
-    (fs/create-dirs dir)
-    (loop [tries 0]
-      (when-not (try (fs/create-dir lock-dir) true (catch Exception _ false))
-        (when (> tries 200) (throw (ex-info (str "sequence lock is stuck: " lock-dir) {:exit 1})))
-        (Thread/sleep 50)
-        (recur (inc tries))))
-    (try
-      (let [last-value (if (fs/exists? seq-file) (str/trim (slurp (str seq-file))) "0")
-            n (inc (if (re-matches #"[0-9]+" last-value) (Long/parseLong last-value) 0))]
-        (spit (str seq-file) (format "%06d\n" n))
-        (format "%06d" n))
-      (finally
-        (fs/delete-tree lock-dir)))))
+(defn tmux-socket [ctx]
+  (when (fs/regular-file? (:tmux-socket-file ctx))
+    (not-empty (str/trim (slurp (str (:tmux-socket-file ctx)))))))
+
+(defn capture-pane [ctx role-name]
+  (when-let [socket (tmux-socket ctx)]
+    (let [r (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" (task-lib/session-name role-name) "-S" "-")]
+      (when (zero? (:exit r)) (:out r)))))
+
+(defn archive-role!
+  "Snapshot the role's pane to state/sessions/<role>/pane.txt — what the portal
+   shows once the session is gone."
+  [ctx role-name]
+  (when-let [text (or (System/getenv "SWARMKHAZAD_PANE_STUB") (capture-pane ctx role-name))]
+    (let [file (fs/path (:sessions-dir ctx) role-name "pane.txt")]
+      (fs/create-dirs (fs/parent file))
+      (spit (str file) text))))
+
+(defn archive-all! [ctx]
+  (doseq [r (role-names ctx)] (archive-role! ctx r)))
 
 ;; ---------------------------------------------------------------- done
-
-(defn archive-current-role! [ctx role-name]
-  (let [result (process/sh {:continue true}
-                           "bb" (str (fs/path script-dir "pack_board.bb")) "archive" "--role" role-name)]
-    (when-not (zero? (:exit result))
-      (binding [*out* *err*] (print (str (:err result) (:out result)))))))
-
-(defn announce-follow-up! [ctx role-name]
-  (if (seq (handoff-files (new-dir ctx role-name)))
-    (println "MAIL_WAITING")
-    (println "NO_TASK")))
 
 (defn finish-done!
   "Archive the role's pane and say whether more mail waits."
   [ctx role-name]
   (try
-    (archive-current-role! ctx role-name)
+    (archive-role! ctx role-name)
     (catch Exception e
       (binding [*out* *err*]
         (println (str "archive failed role=" role-name " error=" (.getMessage e))))))
-  (announce-follow-up! ctx role-name))
-
-(defn -main [& args]
-  (try
-    (let [c (ctx)]
-      (case (first args)
-        "role" (println (role c))
-        "header-field" (if-let [v (header-field (second args) (nth args 2))] (println v) (System/exit 1))
-        "body" (print (body (second args)))
-        "set-header" (set-header! (second args) (nth args 2) (nth args 3))
-        "print-task" (print-task (second args))
-        "next-sequence" (println (next-sequence c))
-        (do (binding [*out* *err*] (println "Usage: handoff_lib.bb role|header-field|body|set-header|print-task|next-sequence"))
-            (System/exit 2))))
-    (catch clojure.lang.ExceptionInfo e
-      (binding [*out* *err*] (println (ex-message e)))
-      (System/exit (or (:exit (ex-data e)) 1)))))
-
-(when (= (str *file*) (System/getProperty "babashka.file"))
-  (apply -main *command-line-args*))
+  (if (seq (handoff-files (new-dir ctx role-name)))
+    (println "MAIL_WAITING")
+    (println "NO_TASK")))

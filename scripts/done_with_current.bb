@@ -26,10 +26,8 @@
   (let [ctx (task-lib/ctx-from-env)
         role (handoff-lib/role ctx)
         mode (handoff-lib/role-receive-mode ctx role)
-        in-process (handoff-lib/in-process-dir ctx role)
+        {:keys [files batches]} (handoff-lib/in-process-state ctx role)
         completed (handoff-lib/completed-dir ctx role)
-        batches (handoff-lib/batch-dirs in-process)
-        files (handoff-lib/handoff-files in-process)
         stamp (handoff-lib/timestamp)]
     (fs/create-dirs completed)
     (case mode

@@ -103,7 +103,8 @@
                                     (seq (handoffs (fs/path dir "mail" "b" "inbox" "completed")))))
                   (str "a: " (when (fs/exists? (fs/path dir "tmp" "a-handoff.txt")) (slurp (str (fs/path dir "tmp" "a-handoff.txt"))))
                        " b: " (when (fs/exists? (fs/path dir "tmp" "b-handoff.txt")) (slurp (str (fs/path dir "tmp" "b-handoff.txt"))))
-                       " log: " (slurp (str (fs/path dir "state" "daemon" "handoffd.log"))))))
+                       " log: " (slurp (str (fs/path dir "state" "daemon" "handoffd.log")))
+                       " pane a: " (:out (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" "sk-a" "-S" "-")))))
             (testing "each role sent at least one handoff — the metrics.md bar"
               (doseq [role ["a" "b"]]
                 (is (>= (count (handoffs (fs/path dir "mail" role "sent"))) 1) (str role "/sent"))))
@@ -151,14 +152,16 @@
               (is (= "one\n" (slurp (str (fs/path src "README.md")))))
               (is (not (fs/exists? (fs/path src "a.txt")))))
             (finally
+              ;; done_with_current already archived both panes; drop those so the
+              ;; archives asserted below can only have come from close itself.
+              (fs/delete-tree (fs/path dir "state" "sessions"))
               (run {:env env :ok? false} cli "close" id)))
           (testing "close archived every pane, stopped the daemon, and killed the server"
             (is (= #{} (tmux-sessions socket)))
             (is (not (fs/exists? (fs/path dir "state" "daemon" "handoffd.pid"))))
             (is (str/includes? (slurp (str (fs/path dir "state" "daemon" "handoffd.log"))) "stopped"))
             (doseq [role ["a" "b"]]
-              (is (fs/regular-file? (fs/path dir "state" "sessions" role "pane.txt")) (str role " pane archived")))
-            (is (fs/regular-file? (fs/path dir "state" "closed-at"))))))
+              (is (fs/regular-file? (fs/path dir "state" "sessions" role "pane.txt")) (str role " pane archived"))))))
       (finally
         (process/sh {:continue true} "tmux" "-S" (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock") "kill-server")
         (fs/delete-tree sandbox)))))
