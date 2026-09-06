@@ -1,0 +1,6 @@
+.claude/worktrees/
+.claude/STATUS.md
+.claude/COMPLETE.md
+.claude/ESCALATION.md
+.claude/.credentials.json
+tmp/
