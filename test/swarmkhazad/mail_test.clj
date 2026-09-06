@@ -268,18 +268,44 @@
           (is (= 2 (:exit r)))
           (is (str/includes? (:err r) "TASK_IN_PROCESS_IS_BATCH")))))))
 
-(deftest harness-launch-strings-carry-each-cli-s-own-flags
+(deftest harness-argv-carries-each-cli-s-own-flags-in-both-modes
   (load-file (str (fs/path scripts "swarm_lib.bb")))
-  (let [ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"}
+  (let [prompt (fs/create-temp-file {:prefix "sk-prompt." :suffix ".md"})
+        _ (spit (str prompt) "PROMPT-TEXT")
+        ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"}
         row (fn [h] {:role "r" :harness h :worktree-path "/tmp/t/worktrees/r" :extra-args "--flag va'lue"})
-        cmd (fn [h] ((resolve 'swarm-lib/harness-command) ctx (row h) (str "/bin/" h) "/tmp/t/prompts/r.md"))]
-    (is (str/includes? (cmd "claude") "'/bin/claude' --append-system-prompt-file '/tmp/t/prompts/r.md'"))
-    (is (str/includes? (cmd "claude") "--permission-mode bypassPermissions -n 'sk r' '--flag' 'va'\"'\"'lue' -- 'You are role r"))
-    (is (str/includes? (cmd "codex") "'/bin/codex' -C '/tmp/t/worktrees/r' --no-alt-screen --yolo '--flag' 'va'\"'\"'lue' \"$(cat '/tmp/t/prompts/r.md')"))
-    (is (str/includes? (cmd "copilot") "'/bin/copilot' -C '/tmp/t/worktrees/r' --no-alt-screen --name 'sk r' --yolo"))
-    (is (str/includes? (cmd "copilot") " -i \"$(cat '/tmp/t/prompts/r.md')"))
-    (is (str/includes? (cmd "grok") "'/bin/grok' --cwd '/tmp/t/worktrees/r' --permission-mode bypassPermissions '--flag' 'va'\"'\"'lue' --minimal --rules \"$(cat '/tmp/t/prompts/r.md')\" --verbatim 'You are role r"))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no launch command for harness" (cmd "gemini")))))
+        argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
+        start-with #(str/starts-with? % "You are role r in task t.")]
+    (try
+      (testing "claude: system prompt file, bypass, name in the pane, extra args, then the message after --"
+        (let [a (argv "claude" :interactive)]
+          (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude" "--append-system-prompt-file" (str prompt)
+                  "--permission-mode" "bypassPermissions" "-n" "sk r" "--flag" "va'lue" "--"] (butlast a)))
+          (is (start-with (last a))))
+        (let [a (argv "claude" :smoke)]
+          (is (some #{"-p"} a))
+          (is (= "json" (second (drop-while #(not= "--output-format" %) a))))
+          (is (not (some #{"-n"} a)) "no display name in print mode")
+          (is (= "SMOKE" (last a)))))
+      (testing "codex and copilot have no system-prompt flag: the prompt text leads the message"
+        (let [a (argv "codex" :interactive)]
+          (is (= ["/bin/codex" "-C" "/tmp/t/worktrees/r" "--no-alt-screen" "--yolo" "--flag" "va'lue"] (butlast a)))
+          (is (str/starts-with? (last a) "PROMPT-TEXT\n\nYou are role r")))
+        (is (= ["/bin/codex" "exec" "--skip-git-repo-check" "-C" "/tmp/t/worktrees/r" "--flag" "va'lue"] (butlast (argv "codex" :smoke))))
+        (let [a (argv "copilot" :interactive)]
+          (is (= ["/bin/copilot" "-C" "/tmp/t/worktrees/r" "--no-alt-screen" "--name" "sk r" "--yolo" "--flag" "va'lue" "-i"] (butlast a)))
+          (is (str/starts-with? (last a) "PROMPT-TEXT\n\n")))
+        (is (= "-p" (last (butlast (argv "copilot" :smoke))))))
+      (testing "grok takes the prompt text as --rules and the message as --verbatim"
+        (let [a (argv "grok" :interactive)]
+          (is (= ["/bin/grok" "--cwd" "/tmp/t/worktrees/r" "--permission-mode" "bypassPermissions" "--flag" "va'lue" "--minimal" "--rules" "PROMPT-TEXT" "--verbatim"] (butlast a)))
+          (is (start-with (last a)))))
+      (testing "the launch script single-quotes every token, so a quote in an arg survives the shell"
+        (let [line ((resolve 'swarm-lib/launch-script) {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md" :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"} (row "claude") prompt)]
+          (is (str/includes? line "exec 'env' 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1' '/tmp/t/bin/claude'"))
+          (is (str/includes? line "'--flag' 'va'\"'\"'lue' '--' 'You are role r"))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no launch command for harness" (argv "gemini" :interactive)))
+      (finally (fs/delete prompt)))))
 
 (deftest close-of-a-task-that-was-never-opened-is-a-no-op
   (with-task

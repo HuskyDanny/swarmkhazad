@@ -19,10 +19,22 @@
 
 (def known-agents #{"claude" "codex" "copilot" "grok"})
 (def receive-modes #{"task" "batch"})
-;; Vendors the harness shim knows how to configure. The shim (bin/claude) is the
-;; layer that must be able to build each of these; the declaration is validated
-;; here so a typo fails at `prepare`, not at the first agent launch.
-(def known-vendors #{"anthropic" "glm" "kimi" "deepseek" "qwen"})
+
+;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the
+;; bash shim (a copy under <task>/state/) and the smoke's model check read:
+;;   vendor  base_url  keychain_service  model_main  model_small  ctx_tokens
+(def vendors-file (fs/path (fs/parent (fs/absolutize *file*)) "vendors.tsv"))
+(def vendor-columns [:vendor :base-url :keychain-service :model-main :model-small :ctx-tokens])
+
+(defn read-vendors []
+  (into {} (for [line (remove str/blank? (str/split-lines (slurp (str vendors-file))))
+                 :let [m (zipmap vendor-columns (concat (str/split line #"\t" -1) (repeat "")))]]
+             [(:vendor m) m])))
+
+;; Vendors a role may declare: every row of vendors.tsv plus `anthropic`, which
+;; means the user's own login, direct. Validated at `prepare` so a typo fails
+;; there, not at the first agent launch.
+(def known-vendors (conj (set (keys (read-vendors))) "anthropic"))
 
 ;; roles.tsv column order. Read by every helper; never index a column by number
 ;; anywhere else. A role without a repo carries the literal `none` in :repo.

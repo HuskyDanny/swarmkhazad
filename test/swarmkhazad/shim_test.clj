@@ -1,6 +1,7 @@
 (ns swarmkhazad.shim-test
-  "bin/{claude,codex,grok} shims: per-role model env from roles.tsv, the real
-   binary from harnesses.tsv, OTEL tags; trust seeding; the smoke command."
+  "bin/<harness> shims: per-role model env from roles.tsv + vendors.tsv, the
+   real binary from harnesses.tsv, OTEL tags; trust seeding and removal; the
+   smoke command."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -41,17 +42,18 @@
                  :when k]
              [k (or v "")])))
 
+(defn executable! [path text]
+  (spit (str path) text)
+  (fs/set-posix-file-permissions path "rwxr-xr-x"))
+
 (defn with-sandbox [f]
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-shim."})
         home (str (fs/path sandbox "home"))
         src (str (fs/path sandbox "src" "fixture"))
         stubdir (str (fs/path sandbox "stubbin"))
         claude-json (str (fs/path sandbox "claude.json"))
-        keychain-ok (str (fs/path sandbox "keychain-ok.sh"))
-        keychain-empty (str (fs/path sandbox "keychain-empty.sh"))
         env {"SWARMKHAZAD_HOME" home
              "SWARMKHAZAD_CLAUDE_JSON" claude-json
-             "SWARMKHAZAD_KEYCHAIN_LOOKUP" keychain-ok
              ;; The operator's shell may carry a vendor routing (a cc_alt session, a
              ;; local model router); an anthropic role must not inherit it.
              "ANTHROPIC_BASE_URL" "http://example.invalid:1"
@@ -62,16 +64,20 @@
       (fs/create-dirs stubdir)
       (fs/copy stub (fs/path stubdir "claude"))
       (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
+      ;; A keychain stand-in on PATH: `security find-generic-password -s <svc> -w`.
+      (executable! (fs/path stubdir "security") "#!/bin/bash\nsvc=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in -s) svc=\"$2\"; shift;; esac; shift; done\necho \"tok-from-test:$svc\"\n")
       (spit claude-json (json/generate-string {"projects" {"/somewhere/else" {"hasTrustDialogAccepted" true "allowedTools" []}}
                                                "numStartups" 7}))
-      ;; Two keychain stand-ins: one that has the token, one that has nothing.
-      (spit keychain-ok "#!/bin/bash\necho \"tok-from-test:$1\"\n")
-      (spit keychain-empty "#!/bin/bash\nexit 44\n")
-      (fs/set-posix-file-permissions keychain-ok "rwxr-xr-x")
-      (fs/set-posix-file-permissions keychain-empty "rwxr-xr-x")
-      (f {:sandbox (str sandbox) :home home :src src :env env :claude-json claude-json :keychain-empty keychain-empty})
+      (f {:sandbox (str sandbox) :home home :src src :env env :claude-json claude-json :stubdir stubdir})
       (finally
         (fs/delete-tree sandbox)))))
+
+(deftest roles-tsv-model-column-is-the-sixth-the-shim-reads
+  (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
+  (is (= 5 (.indexOf @(resolve 'task-lib/roles-tsv-columns) :model)) "shim.sh reads $6 for the vendor")
+  (is (= #{"anthropic" "glm" "kimi" "deepseek" "qwen"} @(resolve 'task-lib/known-vendors)) "vendors.tsv rows plus anthropic")
+  (is (= "moonshotai/kimi-k3:exacto" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
+  (is (= "" (:ctx-tokens (get ((resolve 'task-lib/read-vendors)) "qwen"))) "an empty last column survives"))
 
 (deftest smoke-runs-every-role-through-its-shim-with-its-own-model-env
   (with-sandbox
@@ -85,16 +91,15 @@
                    "deep claude " src " task model=deepseek --model sonnet\n"))
         (let [result (run {:env env} cli "smoke" id)
               out (:out result)]
-          (testing "every role reports OK and sent its note"
+          (testing "every role reports OK and sent its note to itself"
             (doseq [role ["plain" "fast" "deep"]]
               (is (re-find (re-pattern (str "(?m)^OK +" role " ")) out) (str role ": " out))
-              (is (str/includes? out (str role "  claude")))
-              (is (fs/regular-file? (fs/path dir "tmp" (str "smoke-" role ".out"))) "the stub ran swarm_handoff.bb")
-              (is (str/includes? (slurp (str (fs/path dir "tmp" (str "smoke-" role ".out")))) "HANDOFF QUEUED")))
+              (is (str/includes? (slurp (str (fs/path dir "tmp" (str "smoke-" role ".out")))) "HANDOFF QUEUED") "the stub ran swarm_handoff.bb"))
             (is (empty? (fs/glob (fs/path dir "mail") "**/outbox/*.handoff")) "smoke notes are removed so a later open does not deliver them"))
-          (testing "the shims exist and point at the recorded real binary"
-            (doseq [h ["claude" "codex" "grok"]]
+          (testing "the shims and the vendor table exist; harnesses.tsv points at the recorded real binary"
+            (doseq [h ["claude" "codex" "grok" "copilot"]]
               (is (fs/executable? (fs/path dir "bin" h)) h))
+            (is (fs/regular-file? (fs/path dir "state" "vendors.tsv")))
             (is (str/includes? (slurp (str (fs/path dir "state" "harnesses.tsv"))) "stubbin/claude")))
           (testing "an anthropic role gets no vendor env, but does get telemetry tags"
             (let [e (env-map (fs/path dir "tmp" "launch-plain.env"))]
@@ -121,40 +126,42 @@
               (is (= ["--model" "moonshotai/kimi-k3:exacto"] (take 2 argv)) "the pin comes first so declared args can still override")
               (is (str/includes? out "used=moonshotai/kimi-k3:exacto"))))
           (testing "a deepseek role with declared extra args keeps both the pin and the args"
-            (let [e (env-map (fs/path dir "tmp" "launch-deep.env"))]
+            (let [e (env-map (fs/path dir "tmp" "launch-deep.env"))
+                  argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-deep.argv"))))]
               (is (= "deepseek/deepseek-v4-flash-vision-exp" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL")))
               (is (= "deepseek/deepseek-v4-flash" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
-              (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS"))))
-            (is (str/includes? out "used=deepseek/deepseek-v4-flash-vision-exp")))
+              (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS")))
+              (is (= ["--model" "deepseek/deepseek-v4-flash-vision-exp"] (take 2 argv)))
+              (is (str/includes? out "used=deepseek/deepseek-v4-flash-vision-exp"))))
           (testing "smoke does not seed trust or start tmux; that is open's job"
             (is (= 1 (count (get (json/parse-string (slurp claude-json)) "projects"))))
             (is (not (fs/exists? (fs/path dir "state" "tmux-socket"))))))))))
 
-(deftest smoke-reports-a-role-whose-shim-cannot-launch
+(deftest smoke-reports-a-role-whose-shim-cannot-launch-or-answers-with-another-model
   (with-sandbox
-    (fn [{:keys [env src home keychain-empty]}]
+    (fn [{:keys [env src home stubdir]}]
       (let [id "t-smoke-bad"
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles")) (str "a claude " src " task model=kimi\n"))
-        ;; No token in the keychain: the shim must refuse, and smoke must report it, not hang or pass.
-        (let [result (run {:env (assoc env "SWARMKHAZAD_KEYCHAIN_LOOKUP" keychain-empty) :ok? false} cli "smoke" id)]
-          (is (not= 0 (:exit result)))
-          (is (re-find #"(?m)^FAIL +a " (:out result)))
-          (is (or (str/includes? (:out result) "no keychain token")
-                  (str/includes? (:out result) "note=none"))
-              (:out result)))
         (testing "a run that answers with some other model is a collision, not a pass"
           (let [result (run {:env (assoc env "SWARMKHAZAD_STUB_MODEL" "claude-opus-5") :ok? false} cli "smoke" id)]
             (is (not= 0 (:exit result)))
-            (is (re-find #"(?m)^FAIL +a .*note=sent.*used=claude-opus-5.*expected=moonshotai/kimi-k3:exacto" (:out result)) (:out result))))))))
+            (is (re-find #"(?m)^FAIL +a .*note=sent.*used=claude-opus-5.*expected=moonshotai/kimi-k3:exacto" (:out result)) (:out result))))
+        (testing "no token in the keychain: the shim refuses and smoke reports it, not hangs or passes"
+          (executable! (fs/path stubdir "security") "#!/bin/bash\nexit 44\n")
+          (let [result (run {:env env :ok? false} cli "smoke" id)]
+            (is (not= 0 (:exit result)))
+            (is (re-find #"(?m)^FAIL +a .*note=none" (:out result)) (:out result))
+            (is (str/includes? (:out result) "no keychain token for service 'openrouter-token'") (:out result))))))))
 
-(deftest open-seeds-folder-trust-for-claude-worktrees-only
+(deftest open-seeds-folder-trust-for-claude-worktrees-and-close-removes-it
   (with-sandbox
     (fn [{:keys [env src home claude-json]}]
       (let [id "t-trust"
             _ (run {:env env} cli "new" id "--repo" src)
-            dir (fs/path home "tasks" id)]
+            dir (fs/path home "tasks" id)
+            socket (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")]
         (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude none\n"))
         (try
           (run {:env env} cli "open" id)
@@ -171,7 +178,12 @@
             (testing "a second open adds nothing"
               (run {:env env} cli "close" id)
               (run {:env env} cli "open" id)
-              (is (= 3 (count (get (json/parse-string (slurp claude-json)) "projects"))))))
+              (is (= 3 (count (get (json/parse-string (slurp claude-json)) "projects")))))
+            (testing "close removes exactly the entries open added"
+              (run {:env env} cli "close" id)
+              (let [after (get (json/parse-string (slurp claude-json)) "projects")]
+                (is (= #{"/somewhere/else"} (set (keys after))))
+                (is (= true (get-in after ["/somewhere/else" "hasTrustDialogAccepted"]))))))
           (finally
             (run {:env env :ok? false} cli "close" id)
-            (process/sh {:continue true} "tmux" "-S" (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock") "kill-server")))))))
+            (process/sh {:continue true} "tmux" "-S" socket "kill-server")))))))
