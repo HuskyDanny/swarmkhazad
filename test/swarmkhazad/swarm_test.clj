@@ -116,7 +116,8 @@
                 (is (some? (get a-done "dequeued_at")))
                 (is (= "git_handoff" (get b-done "type")))
                 (is (= "a" (get b-done "from")))
-                (is (some? (get b-done "task_base_commit")))
+                (is (= (git (fs/path dir "repos" "fixture") "rev-parse" "--short=10" "main") (get b-done "task_base_commit"))
+                    "the base is b's HEAD when it accepted — the pinned clone commit, not a's commit")
                 (is (= id (get b-done "task_id")))
                 (is (some? (get b-done "completed_at")))))
             (testing "a's git_handoff carried the commit and its artifacts; b merged it by SHA"
