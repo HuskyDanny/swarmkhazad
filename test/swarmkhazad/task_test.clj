@@ -310,3 +310,18 @@
         (let [result (run {:env env :ok? false} cli "paths" bad)]
           (is (not= 0 (:exit result)) (pr-str bad))))
       (is (str/includes? (:out (run {:env env} cli "paths" "ok-id_1.2")) "task-dir")))))
+
+(deftest no-arguments-prints-the-usage-text
+  ;; `print` to *err* followed by System/exit discards the buffer, so this
+  ;; exited 1 with nothing on either stream — the CLI's own front door, silent.
+  (with-home
+    (fn [{:keys [env]}]
+      (let [r (run {:env env :ok? false} cli)]
+        (is (= 1 (:exit r)))
+        (is (str/includes? (:err r) "Usage:"))
+        (doseq [verb ["new" "prepare" "open" "close" "smoke" "paths" "portal" "telemetry"]]
+          (is (str/includes? (:err r) (str "swarmkhazad " verb)) verb)))
+      (testing "an unknown verb says the same thing rather than failing mutely"
+        (let [r (run {:env env :ok? false} cli "frobnicate")]
+          (is (= 1 (:exit r)))
+          (is (str/includes? (:err r) "Usage:")))))))
