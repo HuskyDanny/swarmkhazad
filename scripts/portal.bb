@@ -9,6 +9,9 @@
 ;;                              files, the board card, Attention, role cards
 ;;   /tasks/<id>/roles/<role>   the role's pane, streamed by polling
 ;;   /tasks/<id>/roles/<role>/pane   text/plain: live tmux capture, else the archive
+;;   /projects                  POST: create a project (checkouts + role lineup)
+;;   /projects/<name>/new       the only task form: goal, not-goal, bars
+;;   /projects/<name>/tasks     POST: scaffold from the project, then open
 ;;   /tasks/<id>/doc?path=<rel> any text file inside the task folder (doc-file)
 ;;   POST /tasks                kickstart: new + roles + open, then redirect
 ;;
@@ -26,6 +29,7 @@
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "task_lib.bb")))
+(load-file (str (fs/path script-dir "project_lib.bb")))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 (load-file (str (fs/path script-dir "board_lib.bb")))
 (load-file (str (fs/path script-dir "run_evidence.bb")))
@@ -168,30 +172,64 @@
                  (not (fs/starts-with? file (fs/path root "worktrees"))))
         file))))
 
-;; ---------------------------------------------------------------- kickstart
+;; ---------------------------------------------------------------- projects
 
 (defn parse-form [body]
   (into {} (for [pair (str/split (or body "") #"&") :when (not (str/blank? pair))
                  :let [[k v] (str/split pair #"=" 2)]]
              [(java.net.URLDecoder/decode k "UTF-8") (java.net.URLDecoder/decode (or v "") "UTF-8")])))
 
-(defn kickstart!
-  "new <id> --repo … ; write roles ; open in the background. Returns {:ok id} or {:error msg}."
-  [{:strs [task-id repos roles]}]
+(defn create-project!
+  "Write a project from the form. Repos come from the checkbox list plus any
+   typed paths; roles come from the cards that were ticked, in the order the
+   stage prompts are listed, which is the order the swimlane columns take."
+  [{:strs [name extra-repos] :as params}]
+  (let [nm (str/trim (or name ""))
+        picked (->> (keys params)
+                    (keep #(second (re-matches #"repo:(.+)" %)))
+                    sort)
+        repos (vec (distinct (concat picked (nonblank-lines extra-repos))))
+        roles (vec (for [stage (project-lib/stage-prompts)
+                         :when (get params (str "role:" stage))]
+                     {:role stage
+                      :harness (or (get params (str "harness:" stage)) "claude")
+                      :model (or (get params (str "model:" stage)) "anthropic")
+                      :repo (or (not-empty (get params (str "repo-of:" stage))) (first repos))}))]
+    (cond
+      (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
+      (project-lib/read-project nm) {:error (str "project already exists: " nm)}
+      (empty? repos) {:error "pick at least one checkout"}
+      (empty? roles) {:error "pick at least one role"}
+      (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
+                                                              (first (remove task-lib/git-checkout? repos)))}
+      (not (every? #(contains? (set repos) (:repo %)) roles))
+      {:error "a role was pointed at a checkout this project does not hold"}
+      (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
+      :else (do (project-lib/write-project! {:name nm :repos repos :roles roles})
+                {:ok nm}))))
+
+(defn kickstart-project!
+  "A task inside a project: the repos and the role lineup come from the project,
+   so the form contributes only the goal, the not-goals and the bars."
+  [project {:strs [task-id goal not-goal bars]}]
   (let [id (str/trim (or task-id ""))
-        repo-list (nonblank-lines repos)
-        roles-text (str (str/trim (or roles "")) "\n")]
+        goals (nonblank-lines goal)
+        ctx (when (task-lib/valid-task-id? id) (task-lib/task-ctx id))]
     (cond
       (not (task-lib/valid-task-id? id)) {:error (str "invalid task id: " (pr-str id))}
-      (fs/exists? (:task-dir (task-lib/task-ctx id))) {:error (str "task already exists: " id)}
-      (str/blank? (str/trim roles-text)) {:error "declare at least one role"}
+      (fs/exists? (:task-dir ctx)) {:error (str "task already exists: " id)}
+      (empty? goals) {:error "write at least one goal line"}
       :else
-      (let [ctx (task-lib/task-ctx id)
-            new (apply process/sh {:continue true} "bb" cli "new" id (mapcat #(vector "--repo" %) repo-list))]
+      (let [new (apply process/sh {:continue true} "bb" cli "new" id
+                       (mapcat #(vector "--repo" %) (:repos project)))]
         (if-not (zero? (:exit new))
           {:error (str "new failed: " (:err new))}
           (do
-            (spit (str (:roles-file ctx)) roles-text)
+            (spit (str (:goal-file ctx)) (project-lib/goal-md id goals (nonblank-lines not-goal)))
+            (when (seq (nonblank-lines bars))
+              (spit (str (:metrics-file ctx)) (project-lib/metrics-md id (nonblank-lines bars))))
+            (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
+            (spit (str (:roles-file ctx)) (project-lib/roles-text project))
             (fs/create-dirs (:state-dir ctx))
             (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
               (process/process ["bb" cli "open" id] {:out log :err log}))
@@ -275,6 +313,35 @@
      border-radius:10px;padding:.6rem 1.2rem;cursor:pointer;white-space:nowrap;flex:none}
    .err{color:var(--red);font-size:.9rem;margin:0 0 .5rem}
    .empty{color:var(--muted);font-size:.9rem;padding:.6rem 0}
+   .project{margin:0 0 2.4rem}
+   .project-head{display:flex;align-items:baseline;gap:.75rem;margin:0 0 .7rem}
+   .pname{font-size:1.05rem;font-weight:600;color:var(--ink);margin:0;letter-spacing:-.01em}
+   .project-head .muted{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+   .btn{font-size:.85rem;font-weight:500;color:#fff;background:var(--accent);border-radius:8px;
+     padding:.35rem .8rem;text-decoration:none;white-space:nowrap}
+   .btn:hover{filter:brightness(1.06)}
+   .swim{display:flex;gap:.5rem;min-width:min-content}
+   .col{flex:1 0 190px;min-width:190px}
+   .colname{font-size:.72rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--muted);padding:0 .2rem .4rem}
+   .slot{min-height:96px;border:1px dashed var(--line);border-radius:12px;padding:.4rem;
+     background:transparent}
+   .col.live .slot{border-style:solid}
+   .tcard{display:block;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+     padding:.6rem .7rem;margin-bottom:.4rem;text-decoration:none;color:inherit}
+   .tcard:hover{background:var(--row)}
+   .tcard .name{font-weight:600;font-size:.92rem;margin-bottom:.15rem}
+   .picklist{max-height:210px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;
+     background:var(--surface);padding:.35rem .5rem;margin-top:.25rem}
+   .pick{display:flex;align-items:center;gap:.5rem;padding:.18rem 0;font-size:.85rem;color:var(--ink)}
+   .pick input{flex:none}
+   .rolepick{margin:.3rem 0 .7rem;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
+   .rolecard{cursor:pointer}
+   .rolecard .card-top{margin-bottom:.4rem}
+   select{font:inherit;font-size:.85rem;color:inherit;background:var(--surface);
+     border:1px solid var(--line);border-radius:8px;padding:.3rem .4rem;width:100%}
+   .fields.stack{display:block}
+   .fields.stack>label{display:block;min-width:0;margin-bottom:.7rem}
    .composer summary{max-width:1040px;margin:0 auto;list-style:none;cursor:pointer;
      background:var(--surface);border:1px solid var(--line);border-radius:12px;
      padding:.75rem 1rem;color:var(--muted);font-size:.95rem}
@@ -310,48 +377,151 @@
 (def default-roles
   "implement claude <repo-path> task\nreview claude <repo-path> task\nrun claude <repo-path> task")
 
-(defn kickstart-form
-  "A composer pinned to the bottom, closed until you reach for it — <details>
-   does the toggle, so the page still carries no script. An error forces it open
-   and keeps what was typed, or the reason costs the reader their input."
+(defn project-form
+  "New project: a name, the checkouts found under the repo roots, and the role
+   cards. The roles are picked once here so no task ever asks for them again."
   [error params]
-  (let [stages (->> (fs/glob (fs/path (fs/parent script-dir) "prompts") "*.prompt") (map #(str/replace (fs/file-name %) #"\.prompt$" "")) sort)]
+  (let [available (project-lib/available-repos)
+        picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
+        first-run? (empty? params)
+        default (set (map :role project-lib/default-roles))]
     [:details.composer {:open (boolean error)}
-     [:summary "Start a task — a task id, the checkouts, and who is in the swarm"]
+     [:summary "New project — the checkouts and the swarm, set once"]
      [:div.inner
       (when error [:p.err error])
-      [:form {:method "post" :action "/tasks"}
+      [:form {:method "post" :action "/projects"}
        [:div.fields
-        [:label "task id"
-         [:input {:type "text" :name "task-id" :placeholder "2026-09-06-something" :required true
-                  :value (get params "task-id" "")}]]
-        [:label "repos — one local checkout path per line"
-         [:textarea {:name "repos" :rows 2 :placeholder "/Users/you/repos/thing"} (get params "repos")]]
-        [:label (str "roles — " (str/trim task-lib/roles-grammar-comment))
-         [:textarea {:name "roles" :rows 3} (or (not-empty (get params "roles")) default-roles)]]]
+        [:label "project name"
+         [:input {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
+                  :value (get params "name" "")}]]
+        [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
+         [:div.picklist
+          (if (seq available)
+            (for [r available]
+              [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
+                                    :checked (contains? picked r)}]
+               [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
+            [:p.empty "no git checkouts found — type a path below"])]]
+        [:label "or paths not under those roots, one per line"
+         [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
+          (get params "extra-repos")]]]
+       [:p.muted "roles — the swimlane's columns, in this order"]
+       [:div.cards.rolepick
+        (for [stage (project-lib/stage-prompts)
+              :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
+          [:label.card.rolecard
+           [:div.card-top [:span.name stage]
+            [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
+           [:select {:name (str "model:" stage)}
+            (for [v (sort task-lib/known-vendors)]
+              [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
+           ;; Which checkout this role works in. One repo and there is nothing
+           ;; to choose; several and the choice is the whole point — a lineup
+           ;; silently pinned to repo one is how multi-repo stops being real.
+           (when (> (count picked) 1)
+             [:select {:name (str "repo-of:" stage)}
+              (for [r (sort picked)]
+                [:option {:value r :selected (= r (get params (str "repo-of:" stage)))}
+                 (task-lib/repo-name r)])])])]
        [:div.go
-        [:button {:type "submit"} "Open the swarm"]
-        [:span.muted "stage prompts: " (str/join ", " stages) " · harnesses: " (str/join ", " (sort task-lib/known-agents))
-         " · vendors: " (str/join ", " (sort task-lib/known-vendors))]]]]]))
+        [:button {:type "submit"} "Create project"]
+        [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]]]))
+
+(defn project-section
+  "One project: its role lanes as columns, its tasks as cards in the lane each
+   one is actually in. The lane comes from the task's own board, so a card moves
+   because a git handoff moved it, never because the portal said so."
+  [project]
+  (let [columns (conj (mapv :role (:roles project)) "done")
+        cards (for [id (project-lib/tasks-for (:name project))
+                    :let [ctx (task-lib/task-ctx id)]]
+                {:id id :lane (lane ctx) :attention (count (attention ctx))})
+        placed (set (map :lane cards))
+        stray (remove #(contains? (set columns) (:lane %)) cards)]
+    [:section.project
+     [:div.project-head
+      [:h2.pname (:name project)]
+      [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
+      [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
+     [:div.scroll
+      [:div.swim
+       (for [col columns]
+         [:div.col {:class (when (contains? placed col) "live")}
+          [:div.colname col]
+          [:div.slot
+           (for [c cards :when (= col (:lane c))]
+             [:a.tcard {:href (str "/tasks/" (:id c))}
+              [:div.name.trunc (:id c)]
+              (if (pos? (:attention c))
+                [:span.status.unmet (:attention c) " needs you"]
+                [:span.status.met "clear"])])]])]]
+     (when (seq stray)
+       [:p.muted "not in a lane yet: "
+        (interpose ", " (for [c stray] [:a {:href (str "/tasks/" (:id c))} (:id c) " (" (:lane c) ")"]))])]))
 
 (defn index-page [error params]
-  (let [ids (task-lib/list-task-ids)]
-    (page {:title "tasks"}
-          [:section
-           [:h2 "Tasks"]
-           (if (seq ids)
-             (for [id ids :let [ctx (task-lib/task-ctx id) att (attention ctx) l (lane ctx)]]
+  (let [projects (project-lib/list-projects)
+        owned (set (mapcat #(project-lib/tasks-for (:name %)) projects))
+        loose (remove owned (task-lib/list-task-ids))]
+    (page {:title "projects"}
+          (if (seq projects)
+            (for [p projects] (project-section p))
+            [:section [:h2 "Projects"]
+             [:p.empty "no projects yet — a project holds the checkouts and the swarm, so a task only has to say what it wants done. Open the composer below."]])
+          (when (seq loose)
+            [:section [:h2 "Tasks outside a project"]
+             (for [id loose :let [ctx (task-lib/task-ctx id) att (attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
-                [:div.grow
-                 [:div.name.trunc id]
+                [:div.grow [:div.name.trunc id]
                  [:div.muted.trunc (str/join ", " (map :role (roles ctx)))]]
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
-                  [:span.status.met "0 waiting"])
-                [:span.lane {:class (when (= "done" l) "done")} l]
-                [:span.chev "›"]])
-             [:p.empty "no tasks under " (str (task-lib/tasks-dir)) " — open the composer below to start one"])]
-          (kickstart-form error params))))
+                  [:span.status.met "clear"])
+                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane ctx)]
+                [:span.chev "›"]])])
+          ;; a plain child: .composer is position:fixed, so it needs no help
+          ;; from the shell to sit at the bottom of the viewport.
+          (project-form error (or params {})))))
+
+(defn new-task-page
+  "The only form a task needs: what to do, what not to do, and how it is
+   measured. Repos and roles are the project's, shown but not asked for."
+  [project error params]
+  (page {:title (str "new task · " (:name project)) :crumb (:name project)}
+        [:section
+         [:h2 "New task in " (:name project)]
+         (when error [:p.err error])
+         [:div.row.head
+          [:div.grow
+           [:div.name "the swarm"]
+           [:div.muted (str/join " · " (for [{:keys [role model repo]} (:roles project)]
+                                         (str role " (" model ") in " (task-lib/repo-name (or repo "none")))))]]]
+         [:div.row.head
+          [:div.grow
+           [:div.name "checkouts"]
+           [:div.muted (str/join " · " (:repos project))
+            (let [idle (project-lib/unused-repos project)]
+              (when (seq idle)
+                [:span.status.pending "no role works in " (str/join ", " (map task-lib/repo-name idle))]))]]]
+         [:form {:method "post" :action (str "/projects/" (:name project) "/tasks")}
+          [:div.fields.stack
+           [:label "task id"
+            [:input {:type "text" :name "task-id" :required true
+                     :placeholder (str (java.time.LocalDate/now) "-something")
+                     :value (get params "task-id" "")}]]
+           [:label (str "goal — one outcome per line, each starting with the role that owns it "
+                        "(the judge grades a role against its own lines)")
+            [:textarea {:name "goal" :rows 5
+                        :placeholder "implement — the route returns 200 for a valid token\nrun — the repo's own test command exits 0"}
+             (get params "goal")]]
+           [:label "not-goal — one per line"
+            [:textarea {:name "not-goal" :rows 3 :placeholder "no schema change — the migration lands separately"}
+             (get params "not-goal")]]
+           [:label "metrics bars — one per line, `<name> — bar: <threshold> — measure: `<command>``"
+            [:textarea {:name "bars" :rows 4
+                        :placeholder "repo tests — bar: exits 0 — measure: `bun run test`"}
+             (get params "bars")]]]
+          [:div.go [:button {:type "submit"} "Open the swarm"]]]]))
 
 (defn task-page [ctx]
   (let [id (:task-id ctx) vs (verdicts ctx) l (lane ctx) att (attention ctx)]
@@ -451,12 +621,24 @@
   (let [method (or request-method :get)]
     (or
      (when (and (= :get method) (= "/" uri)) (html 200 (index-page nil nil)))
-     (when (and (= :post method) (= "/tasks" uri))
+     (when (and (= :post method) (= "/projects" uri))
        (let [params (parse-form (if (string? body) body (some-> body slurp)))
-             result (kickstart! params)]
-         (if-let [id (:ok result)]
-           {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}
+             result (create-project! params)]
+         (if (:ok result)
+           {:status 303 :headers {"Location" "/"} :body ""}
            (html 400 (index-page (:error result) params)))))
+     (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/new" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (html 200 (new-task-page project nil {}))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/tasks" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               result (kickstart-project! project params)]
+           (if-let [id (:ok result)]
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}
+             (html 400 (new-task-page project (:error result) params))))
+         (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)" uri))]
        (if-let [ctx (ctx-for id)] (html 200 (task-page ctx)) (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)/doc" uri))]
