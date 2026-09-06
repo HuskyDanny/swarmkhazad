@@ -15,6 +15,7 @@
        "  swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
        "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
+       "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"))
 
 (defn usage! []
@@ -69,6 +70,18 @@
   (swarm-lib/close! task-id)
   (println "swarm closed:" task-id))
 
+(defn smoke! [task-id]
+  (let [results (swarm-lib/smoke! task-id)]
+    (doseq [{:keys [role harness vendor ok exit seconds models expected note cost turns detail]} results]
+      (println (str (if ok "OK   " "FAIL ") role "  " harness " model=" vendor
+                    "  exit=" exit "  " seconds "s  note=" (if note "sent" "none")
+                    (when (seq models) (str "  used=" (str/join "," models)))
+                    (when (and expected (not (some #{expected} models))) (str "  expected=" expected))
+                    (when cost (format "  cost=$%.4f" (double cost)))
+                    (when turns (str "  turns=" turns))))
+      (when detail (println (str "     " (str/replace detail #"\n" "\n     ")))))
+    (System/exit (if (every? :ok results) 0 1))))
+
 (defn -main [& args]
   (try
     (case (first args)
@@ -76,6 +89,7 @@
       "prepare" (if (second args) (prepare! (second args)) (usage!))
       "open" (if (second args) (open! (second args)) (usage!))
       "close" (if (second args) (close! (second args)) (usage!))
+      "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
       (usage!))
     (catch clojure.lang.ExceptionInfo e
