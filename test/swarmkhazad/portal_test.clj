@@ -130,7 +130,13 @@
           (let [body (:body (request env :get (str "/tasks/" id "/roles/implement")))]
             (is (str/includes? body "PANE-MARK"))
             (is (re-find (re-pattern (str "class=\"sub\"><span><a href=\"/tasks/" id "\">" id "</a> · implement")) body)
-                "the crumb links back to the task, which is the only way off the role page"))
+                "the crumb links back to the task, which is the only way off the role page")
+            (is (str/includes? body (str "data-role=\"implement\" data-task=\"" id "\""))
+                "the poller reads the task and role from escaped attributes")
+            (is (str/includes? body "p.dataset.task")
+                "and from the dataset at runtime")
+            (is (not (re-find (re-pattern (str "<script>[^<]*" id)) body))
+                "so neither value is baked into the script string, which is the one raw sink on the page"))
           (let [r (request env :get (str "/tasks/" id "/roles/implement/pane"))]
             (is (= 200 (:status r)))
             (is (= "text/plain; charset=utf-8" (get (:headers r) "Content-Type")))
@@ -176,7 +182,8 @@
           (is (str/includes? (:body r) "a claude none") "and the roles that were typed, not the placeholder three"))
         (let [r (request env :post "/tasks" {:body (str "task-id=" id "&repos=" src "&roles=")})]
           (is (= 400 (:status r)))
-          (is (str/includes? (:body r) "declare at least one role")))
+          (is (str/includes? (:body r) "declare at least one role"))
+          (is (str/includes? (:body r) src) "the typed repos survive a role-less rejection too"))
         (is (not (fs/exists? (fs/path home "tasks" id)))))
       (testing "good input: new, roles written, open started, redirect to the task page"
         (let [r (request env :post "/tasks" {:body (str "task-id=" id "&repos=" (java.net.URLEncoder/encode src "UTF-8")
