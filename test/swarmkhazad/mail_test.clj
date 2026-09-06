@@ -270,16 +270,19 @@
 
 (deftest harness-argv-carries-each-cli-s-own-flags-in-both-modes
   (load-file (str (fs/path scripts "swarm_lib.bb")))
-  (let [prompt (fs/create-temp-file {:prefix "sk-prompt." :suffix ".md"})
+  (let [scratch (fs/create-temp-dir {:prefix "sk-argv."})
+        prompt (fs/path scratch "r.md")
         _ (spit (str prompt) "PROMPT-TEXT")
-        ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"}
+        ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"
+             :hooks-dir (fs/path scratch "hooks") :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"}
         row (fn [h] {:role "r" :harness h :worktree-path "/tmp/t/worktrees/r" :extra-args "--flag va'lue"})
         argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
         start-with #(str/starts-with? % "You are role r in task t.")]
     (try
-      (testing "claude: system prompt file, bypass, name in the pane, extra args, then the message after --"
+      (testing "claude: system prompt file, hook settings, bypass, name in the pane, extra args, then the message after --"
         (let [a (argv "claude" :interactive)]
           (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude" "--append-system-prompt-file" (str prompt)
+                  "--settings" (str (fs/path scratch "hooks" "r.settings.json"))
                   "--permission-mode" "bypassPermissions" "-n" "sk r" "--flag" "va'lue" "--"] (butlast a)))
           (is (start-with (last a))))
         (let [a (argv "claude" :smoke)]
@@ -301,11 +304,11 @@
           (is (= ["/bin/grok" "--cwd" "/tmp/t/worktrees/r" "--permission-mode" "bypassPermissions" "--flag" "va'lue" "--minimal" "--rules" "PROMPT-TEXT" "--verbatim"] (butlast a)))
           (is (start-with (last a)))))
       (testing "the launch script single-quotes every token, so a quote in an arg survives the shell"
-        (let [line ((resolve 'swarm-lib/launch-script) {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md" :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"} (row "claude") prompt)]
+        (let [line ((resolve 'swarm-lib/launch-script) ctx (row "claude") prompt)]
           (is (str/includes? line "exec 'env' 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1' '/tmp/t/bin/claude'"))
           (is (str/includes? line "'--flag' 'va'\"'\"'lue' '--' 'You are role r"))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no launch command for harness" (argv "gemini" :interactive)))
-      (finally (fs/delete prompt)))))
+      (finally (fs/delete-tree scratch)))))
 
 (deftest close-of-a-task-that-was-never-opened-is-a-no-op
   (with-task
