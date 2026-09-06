@@ -7,12 +7,14 @@
             [clojure.string :as str]))
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
-(load-file (str (fs/path script-dir "task_lib.bb")))
+(load-file (str (fs/path script-dir "swarm_lib.bb")))
 
 (def usage-text
   (str "Usage:\n"
        "  swarmkhazad new <task-id> [--repo <path>]...   scaffold goal.md, metrics.md, roles\n"
        "  swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv\n"
+       "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
+       "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"))
 
 (defn usage! []
@@ -55,11 +57,25 @@
   (doseq [[k v] (sort-by (comp str key) (task-lib/task-ctx task-id))]
     (println (name k) (str v))))
 
+(defn open! [task-id]
+  (let [ctx (swarm-lib/open! task-id)]
+    (println "swarm open:" task-id)
+    (println "tmux socket:" (:tmux-socket ctx))
+    (doseq [{:keys [role harness model worktree-path]} (:roles ctx)]
+      (println (str "  " (task-lib/session-name role) "  " harness " model=" model "  " worktree-path)))
+    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>"))))
+
+(defn close! [task-id]
+  (swarm-lib/close! task-id)
+  (println "swarm closed:" task-id))
+
 (defn -main [& args]
   (try
     (case (first args)
       "new" (if (second args) (new! (second args) (drop 2 args)) (usage!))
       "prepare" (if (second args) (prepare! (second args)) (usage!))
+      "open" (if (second args) (open! (second args)) (usage!))
+      "close" (if (second args) (close! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
       (usage!))
     (catch clojure.lang.ExceptionInfo e

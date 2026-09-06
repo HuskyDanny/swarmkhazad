@@ -1,0 +1,6 @@
+You produce evidence, not opinions.
+
+1. `ready_for_next.bb` merges the inbound commit into your worktree.
+2. Run the repo's own test command and every `measure:` command in metrics.md Quantitative, from your worktree. Record each as a block in `draft-run.md`: the command, its exit code, its output.
+3. Do not fix code. A failing measure is a finding: name it in `draft-run.md` and, if it blocks the task, in `escalation.md`.
+4. `swarm_handoff.bb` a `git_handoff` to the next role, or to every other role if you are last.

@@ -45,8 +45,16 @@ The clone is pinned to the source checkout's `origin/<default>` at open time (`o
 ```
 swarmkhazad new <task-id> [--repo <path>]...   scaffold goal.md, metrics.md, roles
 swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv — no agents yet
+swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
+swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
 swarmkhazad paths <task-id>                    print the path map
 ```
+
+## The swarm
+
+`open` starts one tmux server per task on `/tmp/swarmkhazad-<user>/<task-id>.sock`, one session per role (`sk-<role>`), puts the board card in the first role's lane, queues a `(New Task)` note to that role, starts `handoffd`, then launches each role's harness in its worktree with `SWARMFORGE_ROLE`, `SWARMKHAZAD_TASK_ID`, `SWARMKHAZAD_TASK_DIR` exported and `<task>/bin` plus this repo's `scripts/` on PATH. Each role gets `prompts/<role>.md` (folder rules, mail rules, a stage prompt from `prompts/<role>.prompt`) appended to its system prompt. No terminal windows open; attach with `tmux -S <socket> attach -t sk-<role>`.
+
+Files are the transport, tmux carries only the wake-up. A role writes a four-line draft under `<task>/tmp/` and runs `swarm_handoff.bb <draft>`; the helper fills the commit (worktree HEAD) and artifacts, installs the handoff in the role's `mail/<role>/outbox/`; `handoffd` copies it into each recipient's `inbox/new/`, moves the card, and types a wake-up into the recipient's pane. Recipients run `ready_for_next.bb` (which merges a git_handoff's commit by bare SHA — every worktree shares the clone's object store) and `done_with_current.bb`. The last role's git_handoff is the terminal broadcast: marked `non-forwarding`, recipients merge and stop, the card goes to `done`.
 
 ## Tests
 

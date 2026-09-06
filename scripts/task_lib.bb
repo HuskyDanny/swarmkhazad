@@ -56,6 +56,12 @@
 (defn valid-task-id? [id]
   (boolean (and (string? id) (re-matches #"[A-Za-z0-9][A-Za-z0-9._-]{0,99}" id))))
 
+(defn tmux-socket-path
+  "One tmux server per task. Lives in /tmp because a unix socket path is capped
+   at ~100 bytes and the task folder is already longer than that."
+  [task-id]
+  (str (fs/path "/tmp" (str "swarmkhazad-" (System/getProperty "user.name")) (str task-id ".sock"))))
+
 ;; A role is a path component (worktrees/<role>, mail/<role>) and a refname
 ;; segment (sk/<task-id>/<role>) and a handoff-filename field, so: alphanumeric
 ;; start, then letters/digits/dot/dash. No underscore (handoff filenames use it
@@ -82,8 +88,35 @@
      :worktrees-dir (fs/path task-dir "worktrees")
      :mail-dir (fs/path task-dir "mail")
      :tmp-dir (fs/path task-dir "tmp")
+     :bin-dir (fs/path task-dir "bin")
+     :prompts-dir (fs/path task-dir "prompts")
      :state-dir state-dir
-     :roles-tsv (fs/path state-dir "roles.tsv")}))
+     :roles-tsv (fs/path state-dir "roles.tsv")
+     :tmux-socket (tmux-socket-path task-id)
+     :tmux-socket-file (fs/path state-dir "tmux-socket")
+     :board-dir (fs/path state-dir "board")
+     :daemon-dir (fs/path state-dir "daemon")
+     :sessions-dir (fs/path state-dir "sessions")}))
+
+(defn ctx-from-env
+  "The ctx of the task this process runs inside: SWARMKHAZAD_TASK_ID is set in
+   every role session and every daemon the swarm starts."
+  []
+  (let [id (System/getenv "SWARMKHAZAD_TASK_ID")]
+    (when (str/blank? id)
+      (throw (ex-info "SWARMKHAZAD_TASK_ID is not set; run this inside a swarm role" {:exit 1})))
+    (task-ctx id)))
+
+(defn list-task-ids []
+  (let [dir (tasks-dir)]
+    (if (fs/directory? dir)
+      (->> (fs/list-dir dir)
+           (filter fs/directory?)
+           (map fs/file-name)
+           (filter valid-task-id?)
+           sort
+           vec)
+      [])))
 
 ;; ---------------------------------------------------------------- roles file
 ;;
@@ -192,6 +225,33 @@
                (for [row roles]
                  (str (str/join "\t" (map #(str (or (get row %) "none")) roles-tsv-columns)) "\n")))))
 
+(defn read-roles-tsv
+  "roles.tsv → vector of role maps keyed by roles-tsv-columns, in declaration
+   order. A `none` repo reads back as nil so `(when (:repo row) …)` is honest."
+  [ctx]
+  (let [file (:roles-tsv ctx)]
+    (if (fs/regular-file? file)
+      (->> (str/split-lines (slurp (str file)))
+           (remove str/blank?)
+           (mapv (fn [line]
+                   (let [row (zipmap roles-tsv-columns (concat (str/split line #"\t" -1) (repeat "")))]
+                     (update row :repo #(when-not (= "none" %) (not-empty %)))))))
+      [])))
+
+(defn role-row [ctx role]
+  (some #(when (= role (:role %)) %) (read-roles-tsv ctx)))
+
+(defn role-names [ctx]
+  (mapv :role (read-roles-tsv ctx)))
+
+(defn extra-argv
+  "roles.tsv :extra-args back to argv. Never splice the string into a shell."
+  [row]
+  (vec (remove str/blank? (str/split (or (:extra-args row) "") #"\s+"))))
+
+(defn session-name [role]
+  (str "sk-" role))
+
 ;; ---------------------------------------------------------------- mail dirs
 
 (def mail-subdirs ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"])
@@ -199,10 +259,17 @@
 (defn role-mail-dir [ctx role]
   (fs/path (:mail-dir ctx) role))
 
+(defn system-mail-dir
+  "Where phantom senders — the New Task note `open` queues — leave their mail."
+  [ctx]
+  (fs/path (:mail-dir ctx) "_system"))
+
 (defn prepare-mail-dirs! [ctx roles]
   (doseq [row roles
           sub mail-subdirs]
-    (fs/create-dirs (fs/path (role-mail-dir ctx (:role row)) sub))))
+    (fs/create-dirs (fs/path (role-mail-dir ctx (:role row)) sub)))
+  (doseq [sub ["outbox/tmp" "sent" "failed"]]
+    (fs/create-dirs (fs/path (system-mail-dir ctx) sub))))
 
 ;; ---------------------------------------------------------------- clone
 
@@ -277,6 +344,11 @@
           (do (git dest "remote" "set-url" "origin" upstream)
               (git dest "branch" "--quiet" (str "--set-upstream-to=origin/" branch) branch))
           (git dest "remote" "remove" "origin"))
+        ;; Roles commit as the human's checkout would; the clone has no local
+        ;; identity of its own and a role must never be asked to configure one.
+        (doseq [key ["user.name" "user.email"]]
+          (when (git-ok? src "config" "--get" key)
+            (git dest "config" key (git src "config" "--get" key))))
         {:repo src :clone (str dest) :fresh true :branch branch :sha sha :upstream upstream}))))
 
 (defn clone-repos!
@@ -315,7 +387,8 @@
       (throw (ex-info (str "task is missing " (fs/file-name f) ": " f) {})))))
 
 (defn create-layout! [ctx]
-  (doseq [k [:repos-dir :worktrees-dir :mail-dir :tmp-dir :state-dir]]
+  (doseq [k [:repos-dir :worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
+             :board-dir :daemon-dir :sessions-dir]]
     (fs/create-dirs (get ctx k)))
   (doseq [k [:decision-file :gotcha-file :escalation-file]]
     (when-not (fs/exists? (get ctx k))
