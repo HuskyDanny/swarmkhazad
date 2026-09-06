@@ -88,7 +88,8 @@
     (cond
       (and (has? "package.json") (has? "pnpm-lock.yaml")) "pnpm test"
       (and (has? "package.json") (has? "yarn.lock")) "yarn test"
-      (and (has? "package.json") (has? "bun.lockb")) "bun test"
+      ;; bun writes bun.lockb (binary) or bun.lock (text, the current default).
+      (and (has? "package.json") (or (has? "bun.lockb") (has? "bun.lock"))) "bun test"
       (has? "package.json") "npm test"
       (has? "bb.edn") "bb test"
       (or (has? "pyproject.toml") (has? "pytest.ini") (has? "setup.py")) "pytest"

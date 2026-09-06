@@ -159,10 +159,34 @@
                  (concat (handoff-lib/in-process-files ctx role)
                          (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role))))))
 
+(defn untouched?
+  "The worktree holds no work: nothing committed past the clone's base and
+   nothing uncommitted. A failure to answer counts as touched — never claim a
+   role is idle because a git command did not run."
+  [worktree]
+  (if (nil? worktree)
+    true
+    (let [count (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" "origin/HEAD..HEAD")
+          dirty (process/sh {:continue true :dir (str worktree)} "git" "status" "--porcelain")]
+      (and (zero? (:exit count)) (= "0" (str/trim (:out count)))
+           (zero? (:exit dirty)) (str/blank? (:out dirty))))))
+
+(defn idle?
+  "The role has never had work: no mail has ever reached it and its worktree is
+   untouched. `open` mails only the first role, so every other role's first stop
+   is this — and grading it against a goal it was never handed is how a swarm
+   greets itself with a wall of false unmet lines."
+  [ctx role worktree]
+  (and (empty? (handoff-lib/in-process-files ctx role))
+       (empty? (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role)))
+       (empty? (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role)))
+       (untouched? worktree)))
+
 (defn decide
   "khazad's decide_stop: {:block? bool :reason str}."
-  [{:keys [met unmet down]} {:keys [terminal? sent? repo? blocks]}]
+  [{:keys [met unmet down]} {:keys [terminal? sent? repo? blocks idle]}]
   (cond
+    idle {:block? false :reason "no task yet: nothing has reached this role's inbox and it has committed nothing. Waiting is correct."}
     terminal? {:block? false :reason "terminal broadcast received; merge and stop"}
     (>= blocks max-blocks) {:block? false :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
     down {:block? false :reason "judge unavailable; verdict is met=false until it returns"}
@@ -172,6 +196,8 @@
 
 (defn escalate! [ctx role verdict previous]
   (when (and (not (:met verdict))
+             (not (:idle verdict))
+             (seq (:unmet verdict))
              (not= (set (:unmet verdict)) (set (:unmet previous))))
     (spit (str (:escalation-file ctx))
           (str "- **" role ": goal judge says unmet — " (str/join "; " (:unmet verdict)) "** — at "
@@ -191,10 +217,16 @@
           session-id (or (get input "session_id") "unknown")
           goals (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
           previous (read-json (verdict-file ctx role))
-          verdict (grade goals (working-state ctx role worktree (get input "last_assistant_message")))
+          idle (idle? ctx role worktree)
+          ;; An idle role is not graded at all: there is nothing to grade, and a
+          ;; model call per idle stop is spend for a foregone answer.
+          verdict (if idle
+                    {:met false :unmet [] :idle true}
+                    (grade goals (working-state ctx role worktree (get input "last_assistant_message"))))
           facts {:terminal? (terminal-inbound? ctx role)
                  :sent? (handoff-sent? ctx role worktree)
                  :repo? (boolean (:repo row))
+                 :idle idle
                  :blocks (blocks-so-far ctx role session-id)}
           decision (decide verdict facts)]
       (fs/create-dirs (fs/path (:state-dir ctx) "judge"))

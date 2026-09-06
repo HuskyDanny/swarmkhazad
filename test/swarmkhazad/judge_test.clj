@@ -58,6 +58,11 @@
         (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude " src " task\nc grok none\n"))
         (spit (str (fs/path dir "goal.md")) "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n\n## Hints\n- none\n")
         (run {:env base-env} cli "prepare" id)
+        ;; Role a is a working role: something reached its inbox. A role with an
+        ;; empty inbox and an untouched worktree is idle and is not graded at
+        ;; all, which `a-role-with-no-task-yet-is-not-graded-at-all` covers.
+        (write! (fs/path dir "mail" "a" "inbox" "in_process" "50_20260101T000000000Z_from_New-Task_to_a.handoff")
+                "id: seed\nfrom: (New Task)\nto: a\npriority: 50\ntype: note\nmessage: begin\n\nbegin\n")
         (letfn [(stop! [role verdict & [{:keys [session message]}]]
                   (run {:dir (str (fs/path dir "worktrees" (if (= role "c") "" role)))
                         :env (cond-> (assoc base-env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir))
@@ -211,6 +216,32 @@
         (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
           (is (= 1 (:exit r)))
           (is (str/includes? (:err r) "judge_unavailable")))))))
+
+(deftest a-role-with-no-task-yet-is-not-graded-at-all
+  (with-task
+    (fn [{:keys [dir stop!]}]
+      (testing "open mails only the first role, so every other role's first stop is this"
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+          (is (zero? (:exit r)) (:err r))
+          (is (nil? (decision r)) "waiting is correct; blocking would tell it to work on a task it never got")
+          (let [v (verdict-file dir "b")]
+            (is (true? (:idle v)))
+            (is (= [] (:unmet v)))
+            (is (str/includes? (:reason v) "no task yet")))
+          (is (not (fs/exists? (fs/path dir "tmp" "judge-b.argv"))) "no model was called: nothing to grade")
+          (is (= "" (slurp (str (fs/path dir "escalation.md")))) "and no false unmet line")))
+      (testing "once mail arrives, the role is graded again"
+        (write! (fs/path dir "mail" "b" "inbox" "in_process" "50_x_from_a_to_b.handoff")
+                "id: x\nfrom: a\nto: b\npriority: 50\ntype: note\nmessage: go\n\ngo\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+          (is (= "block" (:decision (decision r))))
+          (is (str/includes? (:reason (decision r)) "goals unmet: GOAL-X"))))
+      (testing "a role that has committed is never idle, even with an empty inbox"
+        (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "a") "add" "x.txt")
+        (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+        (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+          (is (= "block" (:decision (decision r)))))))))
 
 (deftest the-hook-is-inert-outside-a-role-and-on-other-events
   (let [r (process/sh {:continue true :in "{\"hook_event_name\":\"Stop\"}" :extra-env {"SWARMKHAZAD_TASK_DIR" "" "SWARMFORGE_ROLE" ""}}

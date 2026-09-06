@@ -29,16 +29,16 @@ Each stage creates the directories it fills; `prepare` creates `repos/ worktrees
 ### The `roles` declaration
 
 ```
-<role> <harness> <repo-path|none> [task|batch] [model=<vendor>] [cli args...]
+<role> <harness> <repo-path|none> [task|batch] [model=<vendor>] [branch=<name>] [cli args...]
 ```
 
-`role` is `[A-Za-z0-9][A-Za-z0-9.-]*` (it is a path component and a refname segment). `harness` is `claude|codex|copilot|grok`. `repo-path` is a local git checkout (a linked worktree is fine, a shallow clone is not); `none` means the role works in the task folder. The two optional tokens may appear in either order; anything else is passed to the harness CLI verbatim. Two checkouts with the same basename cannot share a task — they would share one clone.
+`role` is `[A-Za-z0-9][A-Za-z0-9.-]*` (it is a path component and a refname segment). `harness` is `claude|codex|copilot|grok`. `repo-path` is a local git checkout — a linked worktree is fine, and a shallow one works too, it just costs disk because git declines to hardlink objects out of it; `none` means the role works in the task folder. `branch=<name>` pins the clone to that branch of the checkout instead of its default — the branch must already exist there, since the swarm never fetches, and roles sharing a repo must name the same one. The optional tokens may appear in any order; anything else is passed to the harness CLI verbatim. Two checkouts with the same basename cannot share a task — they would share one clone.
 
-`state/roles.tsv` is the snapshot `prepare` writes, one row per role, columns `role harness repo worktree-path receive-mode model extra-args`; a repo-less role says `none`.
+`state/roles.tsv` is the snapshot `prepare` writes, one row per role, columns `role harness repo worktree-path receive-mode model branch extra-args`; an absent value is the literal `none`.
 
 ### The clone
 
-The clone is pinned to the source checkout's `origin/<default>` at open time (`origin/HEAD`'s target, else `main`, else the source's own branch), its `origin` is repointed at the source's upstream URL — or removed when the source has none — and every other ref and local branch is dropped. After that the source is never read again.
+The clone is pinned to the source checkout's `origin/<default>` at open time (`origin/HEAD`'s target, else `main`, else the source's own branch), or to `origin/<branch>` when a role names one. `git clone` transfers only what the source's local branches reach, so when the source has fetched but not merged and its `origin/<branch>` is ahead of its local one, that commit never arrives; the pin then falls back to the branch tip the clone actually holds. The clone's `origin` is repointed at the source's upstream URL — or removed when the source has none — and every other ref and local branch is dropped. After that the source is never read again.
 
 ## Commands
 

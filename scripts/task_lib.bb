@@ -42,7 +42,7 @@
 ;; the declaration is split on whitespace — and must be re-split into argv by the
 ;; consumer, never spliced into a shell string.
 (def roles-tsv-columns
-  [:role :harness :repo :worktree-path :receive-mode :model :extra-args])
+  [:role :harness :repo :worktree-path :receive-mode :model :branch :extra-args])
 
 (defn fail! [message]
   (binding [*out* *err*]
@@ -173,7 +173,9 @@
         receive-mode (or (some receive-modes trailing) "task")
         model-token (some #(when (str/starts-with? % "model=") %) trailing)
         model (if model-token (subs model-token (count "model=")) "anthropic")
-        extra (remove #(or (receive-modes %) (str/starts-with? % "model=")) trailing)]
+        branch-token (some #(when (str/starts-with? % "branch=") %) trailing)
+        branch (when branch-token (subs branch-token (count "branch=")))
+        extra (remove #(or (receive-modes %) (str/starts-with? % "model=") (str/starts-with? % "branch=")) trailing)]
     (when-not (valid-role? role)
       (throw (ex-info (format "roles line %d: role %s must match [A-Za-z0-9][A-Za-z0-9.-]* (a path component and a refname segment; no underscore, slash, or leading dot/dash)" line-no (pr-str role)) {})))
     (when-not (known-agents harness)
@@ -185,21 +187,30 @@
      :repo (when-not (= "none" repo) (str (fs/expand-home repo)))
      :receive-mode receive-mode
      :model model
+     :branch branch
      :extra-args (str/join " " extra)}))
 
 (defn repo-name [repo-path]
   (str/replace (fs/file-name (fs/canonicalize (fs/path repo-path))) #"\.git$" ""))
 
 (defn check-repos!
-  "Every named repo is a git checkout, not shallow, and no two distinct
-   checkouts share a basename (they would share one clone dir)."
+  "Every named repo is a git checkout, and no two distinct checkouts share a
+   basename (they would share one clone dir).
+
+   A shallow source is allowed. Measured: cloning one, adding worktrees off the
+   clone and merging a bare SHA between them all work — every handoff commit
+   descends from the pinned HEAD, which is inside the shallow window, so the
+   merge base is always present. The one loss is that git declines to hardlink
+   objects out of a shallow repository, so the clone costs disk. That is worth
+   a warning, not a refusal: most working checkouts on this machine are shallow."
   [rows]
   (doseq [{:keys [repo role]} rows
           :when repo]
     (when-not (git-checkout? repo)
       (throw (ex-info (format "role %s: repo %s is not a git checkout" role repo) {})))
     (when (= "true" (sh-out "git" "-C" repo "rev-parse" "--is-shallow-repository"))
-      (throw (ex-info (format "role %s: repo %s is a shallow clone; the swarm needs full history to merge by SHA" role repo) {}))))
+      (binding [*out* *err*]
+        (println (format "note: role %s: %s is shallow; its clone copies objects instead of hardlinking them" role repo)))))
   (let [by-name (->> rows
                      (keep :repo)
                      (map #(str (fs/canonicalize (fs/path %))))
@@ -304,12 +315,15 @@
       "main"))
 
 (defn source-pin-sha
-  "The source's origin/<branch> at open time; falls back to its HEAD when the
-   source has no such remote ref."
+  "The source's origin/<branch> at open time — the shared upstream state, not
+   the operator's local work. Falls back to the source's own branch, then HEAD."
   [src branch]
-  (if (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/remotes/origin/" branch))
+  (cond
+    (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/remotes/origin/" branch))
     (git src "rev-parse" (str "refs/remotes/origin/" branch))
-    (git src "rev-parse" "HEAD")))
+    (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/heads/" branch))
+    (git src "rev-parse" (str "refs/heads/" branch))
+    :else (git src "rev-parse" "HEAD")))
 
 (defn source-origin-url [src]
   (when (git-ok? src "remote" "get-url" "origin")
@@ -337,41 +351,58 @@
    so no later fetch can reach back into ~/repos), and every other ref and
    local branch is dropped. Nothing under the source is written; nothing is
    read from it again."
-  [ctx repo-path]
+  [ctx repo-path & [want-branch]]
   (let [src (str (fs/canonicalize (fs/path repo-path)))
         dest (clone-dir ctx repo-path)]
     (fs/create-dirs (:repos-dir ctx))
+    (when (and want-branch (not (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/heads/" want-branch))))
+      (throw (ex-info (format "%s has no branch %s; the clone can only pin a branch the checkout already has (the swarm never fetches)"
+                              src want-branch) {})))
     (if (fs/exists? (fs/path dest ".git"))
       {:repo src :clone (str dest) :fresh false}
-      (let [branch (source-default-branch src)
+      (let [branch (or want-branch (source-default-branch src))
             sha (source-pin-sha src branch)
             upstream (source-origin-url src)
             remote-ref (str "refs/remotes/origin/" branch)]
         (sh-out "git" "clone" "--quiet" "--no-checkout" "--" src (str dest))
-        (git dest "update-ref" remote-ref sha)
-        (git dest "symbolic-ref" "refs/remotes/origin/HEAD" remote-ref)
-        (git dest "checkout" "--quiet" "-B" branch sha)
-        (delete-refs! dest (->> (str/split-lines (git dest "for-each-ref" "--format=%(refname)" "refs/remotes/origin/" "refs/heads/"))
-                                (remove str/blank?)
-                                (remove #{remote-ref "refs/remotes/origin/HEAD" (str "refs/heads/" branch)})))
-        (if upstream
-          (do (git dest "remote" "set-url" "origin" upstream)
-              (git dest "branch" "--quiet" (str "--set-upstream-to=origin/" branch) branch))
-          (git dest "remote" "remove" "origin"))
-        ;; Roles commit as the human's checkout would; the clone has no local
-        ;; identity of its own and a role must never be asked to configure one.
-        (doseq [key ["user.name" "user.email"]]
-          (when (git-ok? src "config" "--get" key)
-            (git dest "config" key (git src "config" "--get" key))))
-        {:repo src :clone (str dest) :fresh true :branch branch :sha sha :upstream upstream}))))
+        ;; `git clone` transfers what the source's LOCAL branches reach. When the
+        ;; source has fetched but not merged, its origin/<branch> is ahead of its
+        ;; local one and that commit never arrives — pinning to it fails with
+        ;; "nonexistent object". Fall back to what the clone actually holds: the
+        ;; source's own branch tip, which git wrote as origin/<branch> here.
+        (let [sha (if (git-ok? dest "cat-file" "-e" (str sha "^{commit}"))
+                    sha
+                    (git dest "rev-parse" remote-ref))]
+          (git dest "update-ref" remote-ref sha)
+          (git dest "symbolic-ref" "refs/remotes/origin/HEAD" remote-ref)
+          (git dest "checkout" "--quiet" "-B" branch sha)
+          (delete-refs! dest (->> (str/split-lines (git dest "for-each-ref" "--format=%(refname)" "refs/remotes/origin/" "refs/heads/"))
+                                  (remove str/blank?)
+                                  (remove #{remote-ref "refs/remotes/origin/HEAD" (str "refs/heads/" branch)})))
+          (if upstream
+            (do (git dest "remote" "set-url" "origin" upstream)
+                (git dest "branch" "--quiet" (str "--set-upstream-to=origin/" branch) branch))
+            (git dest "remote" "remove" "origin"))
+          ;; Roles commit as the human's checkout would; the clone has no local
+          ;; identity of its own and a role must never be asked to configure one.
+          (doseq [key ["user.name" "user.email"]]
+            (when (git-ok? src "config" "--get" key)
+              (git dest "config" key (git src "config" "--get" key))))
+          {:repo src :clone (str dest) :fresh true :branch branch :sha sha :upstream upstream})))))
 
 (defn clone-repos!
-  "One clone per distinct repo named in roles."
+  "One clone per distinct repo named in roles. Roles sharing a repo share its
+   clone, so they must agree on the branch it is pinned to."
   [ctx roles]
-  (->> roles
-       (keep :repo)
-       distinct
-       (mapv #(clone-repo! ctx %))))
+  (let [with-repo (filter :repo roles)
+        branches (->> with-repo (group-by :repo)
+                      (map (fn [[repo rows]] [repo (distinct (keep :branch rows))])))]
+    (doseq [[repo bs] branches
+            :when (> (count bs) 1)]
+      (throw (ex-info (format "roles disagree on the branch for %s: %s — one clone cannot be two branches"
+                              repo (str/join ", " (sort bs))) {})))
+    (->> branches
+         (mapv (fn [[repo bs]] (clone-repo! ctx repo (first bs)))))))
 
 ;; ---------------------------------------------------------------- worktrees
 
