@@ -72,12 +72,12 @@
     (testing "every query is scoped to the task, grouped by role, dotted names verbatim, over a lookback"
       (is (= 4 (count @seen)))
       (is (every? #(str/includes? % "{task_id=\"t-1\"}[7d]") @seen))
-      (is (every? #(str/includes? % "last_over_time(") @seen)
-          "a counter's series goes stale 5 minutes after its last sample; a finished task must still report")
-      (is (some #{"sum by (role) (last_over_time(claude_code.cost.usage{task_id=\"t-1\"}[7d]))"} @seen))
-      (is (some #{"sum by (role) (last_over_time(claude_code.session.count{task_id=\"t-1\"}[7d]))"} @seen))
-      (is (some #{"sum by (role) (last_over_time(claude_code.active_time.total{task_id=\"t-1\"}[7d]))"} @seen))
-      (is (some #{"sum by (role, type) (last_over_time(claude_code.token.usage{task_id=\"t-1\"}[7d]))"} @seen)))
+      (is (every? #(str/includes? % "sum_over_time(") @seen)
+          "deltas must be summed over the window, and the window also outlives the 5-minute staleness of an instant query")
+      (is (some #{"sum by (role) (sum_over_time(claude_code.cost.usage{task_id=\"t-1\"}[7d]))"} @seen))
+      (is (some #{"sum by (role) (sum_over_time(claude_code.session.count{task_id=\"t-1\"}[7d]))"} @seen))
+      (is (some #{"sum by (role) (sum_over_time(claude_code.active_time.total{task_id=\"t-1\"}[7d]))"} @seen))
+      (is (some #{"sum by (role, type) (sum_over_time(claude_code.token.usage{task_id=\"t-1\"}[7d]))"} @seen)))
     (testing "cost per role and the task total"
       (is (= {"implement" 0.25 "review" 0.5} (:cost t)))
       (is (= 0.75 (:total-cost t))))

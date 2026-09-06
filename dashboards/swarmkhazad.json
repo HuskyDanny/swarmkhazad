@@ -8,12 +8,12 @@
         {
           "title": "Cost per task (USD, cumulative)",
           "unit": "$",
-          "expr": ["sum by (task_id) (last_over_time(claude_code.cost.usage[7d]))"]
+          "expr": ["sum by (task_id) (sum_over_time(claude_code.cost.usage[7d]))"]
         },
         {
           "title": "Cost per role (USD, cumulative)",
           "unit": "$",
-          "expr": ["sum by (task_id, role) (last_over_time(claude_code.cost.usage[7d]))"]
+          "expr": ["sum by (task_id, role) (sum_over_time(claude_code.cost.usage[7d]))"]
         },
         {
           "title": "Spend rate per role (USD/hour)",
@@ -27,11 +27,11 @@
       "panels": [
         {
           "title": "Tokens per role",
-          "expr": ["sum by (task_id, role) (last_over_time(claude_code.token.usage[7d]))"]
+          "expr": ["sum by (task_id, role) (sum_over_time(claude_code.token.usage[7d]))"]
         },
         {
           "title": "Tokens per role by kind",
-          "expr": ["sum by (role, type) (last_over_time(claude_code.token.usage[7d]))"]
+          "expr": ["sum by (role, type) (sum_over_time(claude_code.token.usage[7d]))"]
         },
         {
           "title": "Token rate per role (per minute)",
@@ -44,16 +44,16 @@
       "panels": [
         {
           "title": "Sessions started per role",
-          "expr": ["sum by (task_id, role) (last_over_time(claude_code.session.count[7d]))"]
+          "expr": ["sum by (task_id, role) (sum_over_time(claude_code.session.count[7d]))"]
         },
         {
           "title": "Active time per role (seconds)",
           "unit": "s",
-          "expr": ["sum by (task_id, role) (last_over_time(claude_code.active_time.total[7d]))"]
+          "expr": ["sum by (task_id, role) (sum_over_time(claude_code.active_time.total[7d]))"]
         },
         {
           "title": "Model in use per role",
-          "expr": ["sum by (role, model) (last_over_time(claude_code.cost.usage[7d]))"]
+          "expr": ["sum by (role, model) (sum_over_time(claude_code.cost.usage[7d]))"]
         }
       ]
     }

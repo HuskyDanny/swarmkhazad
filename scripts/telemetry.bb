@@ -47,16 +47,19 @@
 (defn task-totals
   "Per role: cost, tokens by kind, sessions, active seconds. Plus the task total."
   [task-id]
-  ;; last_over_time, not a bare selector: these are cumulative counters written
-  ;; while a role runs, and an instant query stops seeing a series 5 minutes
-  ;; after its last sample. A task read back an hour later must still report.
+  ;; sum_over_time over a window, not an instant read and not last_over_time.
+  ;; Claude Code exports these as DELTA counters: each sample is the increment
+  ;; since the previous export, so a series rises and falls (measured on a live
+  ;; three-role task: samples 0.092, 0.048, 0.209, … whose sum, $3.01, matched
+  ;; the three sessions' own reported $3.03, while last_over_time said $0.40).
+  ;; The window also outlives the 5-minute staleness an instant query stops at.
   (let [sel (str "{task_id=\"" task-id "\"}[" lookback "]")
         ;; A nil from `query` means the server did not answer — that must stay
         ;; nil all the way out, so a caller can say "no telemetry" instead of
         ;; showing a confident $0.00.
         rows->map (fn [rows] (when rows (into {} (for [{:keys [labels value]} rows] [(:role labels) value]))))
-        by-role (fn [metric] (rows->map (query (str "sum by (role) (last_over_time(" metric sel "))"))))
-        tokens (query (str "sum by (role, type) (last_over_time(claude_code.token.usage" sel "))"))
+        by-role (fn [metric] (rows->map (query (str "sum by (role) (sum_over_time(" metric sel "))"))))
+        tokens (query (str "sum by (role, type) (sum_over_time(claude_code.token.usage" sel "))"))
         cost (by-role "claude_code.cost.usage")]
     (when (some? cost)
       {:cost cost
