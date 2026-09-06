@@ -48,6 +48,7 @@ swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail d
 swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
 swarmkhazad paths <task-id>                    print the path map
+swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
 ```
 
 ## The swarm
@@ -77,6 +78,15 @@ The `run` role does not judge; it measures. `run_evidence.bb`, run from its work
 `swarmkhazad smoke <task-id>` proves each declared role callable without a swarm: in parallel, it runs each role's shim in print mode with the role's prompt, asking it to read `goal.md`, write a note draft addressed to itself and run `swarm_handoff.bb`; it reports per role the exit code, whether the note reached the outbox, the model the run reported (checked against the vendor's pin — another model is a collision, not a pass), cost and turns. The smoke notes are removed afterwards.
 
 Files are the transport, tmux carries only the wake-up. A role writes a four-line draft under `<task>/tmp/` and runs `swarm_handoff.bb <draft>`; the helper fills the commit (worktree HEAD) and artifacts, installs the handoff in the role's `mail/<role>/outbox/`; `handoffd` copies it into each recipient's `inbox/new/`, moves the card, and types a wake-up into the recipient's pane. Recipients run `ready_for_next.bb` (which merges a git_handoff's commit by bare SHA — every worktree shares the clone's object store) and `done_with_current.bb`. The last role's git_handoff is the terminal broadcast: marked `non-forwarding`, recipients merge and stop, the card goes to `done`.
+
+## The portal
+
+`swarmkhazad portal` serves a local, server-rendered page over `~/.swarmkhazad` (http-kit and hiccup ship inside `bb`; `SWARMKHAZAD_PORTAL_PORT` or `--port` picks the port; it binds 127.0.0.1 only). It is the one always-on process besides a task's own daemon, and it is read-mostly: nothing it shows is stored anywhere but the task folder.
+
+- `/` — every task with its board lane, roles and attention count, plus the kickstart form: task id, one local checkout per line, the `roles` declaration (stage prompts, harnesses and vendors listed under it). Submitting runs `new`, writes `roles`, starts `open` in the background (`state/portal-open.log`) and redirects to the task page.
+- `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
+- `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
+- `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`allowed-doc?`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
 
 ## Tests
 

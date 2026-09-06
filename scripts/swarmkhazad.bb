@@ -16,7 +16,8 @@
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
        "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
-       "  swarmkhazad paths <task-id>                    print the path map\n"))
+       "  swarmkhazad paths <task-id>                    print the path map\n"
+       "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"))
 
 (defn usage! []
   (binding [*out* *err*] (print usage-text))
@@ -91,6 +92,8 @@
       "close" (if (second args) (close! (second args)) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
+      "portal" (do (load-file (str (fs/path script-dir "portal.bb")))
+                   (apply (resolve 'portal/-main) (rest args)))
       (usage!))
     (catch clojure.lang.ExceptionInfo e
       (task-lib/fail! (str "swarmkhazad: " (ex-message e))))))
