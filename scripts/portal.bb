@@ -132,6 +132,45 @@
 (defn roles [ctx]
   (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
 
+(def sgr-class
+  "The SGR codes an agent TUI actually emits, and the class each becomes.
+   Anything else — 256-colour, truecolour, underline, blink — is dropped rather
+   than guessed at, because a wrong colour reads as meaning that is not there."
+  {"1" "b" "2" "d" "3" "i"
+   "30" "f0" "31" "f1" "32" "f2" "33" "f3" "34" "f4" "35" "f5" "36" "f6" "37" "f7"
+   "90" "f8" "91" "f9" "92" "f10" "93" "f11" "94" "f12" "95" "f13" "96" "f14" "97" "f15"
+   "40" "g0" "41" "g1" "42" "g2" "43" "g3" "44" "g4" "45" "g5" "46" "g6" "47" "g7"})
+
+(defn ansi->hiccup
+  "Turn a pane capture into hiccup, one span per run of styling. Escapes that
+   are not SGR are dropped: tmux emits cursor moves and title sets that mean
+   nothing inside a <pre>. The text itself is never touched, so hiccup escapes
+   it exactly as it escapes any other string.
+
+   Returns a SEQ, not a vector — hiccup reads a vector as an element, so
+   returning one renders the first child as a tag name."
+  [s]
+  (let [s (str/replace (or s "") #"\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)" "")
+        parts (re-seq #"(?s)\u001b\[([0-9;]*)m|((?:[^\u001b]|\u001b(?!\[[0-9;]*m))+)" s)]
+    (loop [parts parts active #{} out []]
+      (if-let [[_ codes text] (first parts)]
+        (cond
+          codes (recur (rest parts)
+                       (reduce (fn [acc c]
+                                 (cond
+                                   (contains? #{"" "0"} c) #{}
+                                   (contains? sgr-class c) (conj acc (sgr-class c))
+                                   :else acc))
+                               active
+                               (str/split codes #";"))
+                       out)
+          (seq text) (recur (rest parts) active
+                            (conj out (if (seq active)
+                                        [:span {:class (str/join " " (sort active))} text]
+                                        text)))
+          :else (recur (rest parts) active out))
+        (seq out)))))
+
 (defn pane-state
   "Whether the pane the rail shows is a running tmux session, the capture taken
    when the task closed, or nothing yet. A closed task still has a terminal to
@@ -144,11 +183,12 @@
 
 (defn pane-text
   "The live pane when the task's tmux server is up, else the archived capture."
-  [ctx role]
-  (let [live (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))
+  ([ctx role] (pane-text ctx role {}))
+  ([ctx role {:keys [ansi]}]
+  (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
         archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))
         s (or (not-empty live) archived "")]
-    (str/join "\n" (take-last pane-tail-lines (str/split-lines s)))))
+    (str/join "\n" (take-last pane-tail-lines (str/split-lines s))))))
 
 (defn role-cards [ctx]
   (let [vs (verdicts ctx)]
@@ -334,6 +374,21 @@
    .railhead{display:flex;align-items:baseline;gap:.75rem;margin-bottom:.35rem}
    .railhead .status{flex:1;min-width:0}
    .rail pre{margin:0;max-height:72vh;min-height:320px}
+   pre.term{background:#16150f;border-color:#2a2822;color:#d6d2c4;font-size:12px;
+     line-height:1.45;padding:.9rem 1rem}
+   pre.term .b{font-weight:700}
+   pre.term .d{opacity:.62}
+   pre.term .i{font-style:italic}
+   pre.term .f0{color:#5c5850}pre.term .f1{color:#e06c5f}pre.term .f2{color:#88b874}
+   pre.term .f3{color:#d5a24a}pre.term .f4{color:#6f9bd1}pre.term .f5{color:#b98cc9}
+   pre.term .f6{color:#5fb3b3}pre.term .f7{color:#d6d2c4}
+   pre.term .f8{color:#7d7871}pre.term .f9{color:#f0897c}pre.term .f10{color:#a4d18f}
+   pre.term .f11{color:#e8bf6a}pre.term .f12{color:#8fb7e3}pre.term .f13{color:#cfa7dd}
+   pre.term .f14{color:#7fcdcd}pre.term .f15{color:#f2efe6}
+   pre.term .g0{background:#2a2822}pre.term .g1{background:#5a2b26}
+   pre.term .g2{background:#31462a}pre.term .g3{background:#5a4520}
+   pre.term .g4{background:#2c3f57}pre.term .g5{background:#452f4d}
+   pre.term .g6{background:#26494a}pre.term .g7{background:#403c34}
    @media(max-width:1100px){.split{grid-template-columns:minmax(0,1fr)}
      .rail{position:static;margin-top:1.6rem}}
    .project{margin:0 0 2.4rem}
@@ -587,7 +642,8 @@
          [:span.status {:class (case state :live "met" :archived "pending" "unmet")}
           (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
          [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
-        [:pre#pane {:data-task id :data-role watching} (pane-text ctx watching)]
+        [:pre#pane.term {:data-task id :data-role watching}
+         (ansi->hiccup (pane-text ctx watching {:ansi true}))]
         [:p.muted "attach: " [:code (str "tmux -S " (:tmux-socket ctx) " attach -t " (task-lib/session-name watching))]]))]))
 
 (defn task-page [ctx watching]

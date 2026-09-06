@@ -6,6 +6,7 @@
             [babashka.process :as process]
             [clojure.edn :as edn]
             [clojure.string :as str]
+            [hiccup2.core :as h]
             [clojure.test :refer [deftest is testing]]))
 
 (def repo-root (str (fs/cwd)))
@@ -180,6 +181,36 @@
           (is (= 404 (:status (request env :get "/nothing"))))))
       (finally
         (fs/delete-tree sandbox)))))
+
+(deftest the-pane-renders-a-terminal-and-still-escapes-what-is-in-it
+  ;; every other test in this file drives the handler in a child bb, so the
+  ;; namespace is not loaded here until we ask for it.
+  (load-file (str (fs/path repo-root "scripts" "portal.bb")))
+  (let [f @(resolve 'portal/ansi->hiccup)
+        E (str (char 27))
+        render (fn [s] (str (h/html [:pre (f s)])))]
+    (testing "SGR runs become spans; a reset ends the run"
+      (is (= (list "plain " [:span {:class "f2"} "green"] " back")
+             (f (str "plain " E "[32mgreen" E "[0m back")))))
+    (testing "codes combine, and the class list is stable so the output is diffable"
+      (is (= (list [:span {:class "b f1"} "bold red"])
+             (f (str E "[1;31mbold red")))))
+    (testing "a code we do not render is dropped, never guessed at, and its text survives"
+      (is (= (list "fancy" " plain") (f (str E "[38;5;213mfancy" E "[0m plain")))
+          "256-colour is ignored: a wrong colour reads as meaning that is not there"))
+    (testing "escapes that are not SGR are dropped — tmux emits title sets and cursor moves"
+      (is (= (list "kept") (f (str E "]0;a title" (char 7) "kept")))))
+    (testing "text with no escapes at all passes through whole"
+      (is (= (list "no escapes at all") (f "no escapes at all"))))
+    (testing "it returns a seq, because hiccup reads a vector as an element"
+      (is (seq? (f "x")) "a vector here would render the first line as a tag name")
+      (is (= "<pre>x</pre>" (render "x"))))
+    (testing "pane content is still escaped — the terminal look must not open a sink"
+      (is (= "<pre>a<span class=\"f1\">&lt;b&gt;&amp;c</span></pre>"
+             (render (str "a" E "[31m<b>&c" E "[0m"))))
+      (is (str/includes? (render (str E "[32m</pre><script>alert(1)</script>"))
+                         "&lt;/pre&gt;&lt;script&gt;")
+          "markup inside a coloured run is escaped like any other text"))))
 
 (deftest a-project-supplies-the-repos-and-the-roles-so-a-task-only-brings-a-goal
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-k."})

@@ -38,6 +38,49 @@
   (let [result (process/sh {:continue true} "sh" "-c" (str "command -v " command))]
     (when (zero? (:exit result)) (not-empty (str/trim (:out result))))))
 
+(def wrapper-shim-markers
+  "Path fragments that mark a per-session wrapper standing in for the real CLI.
+
+   A terminal that injects its own agent integration puts one first on PATH and
+   rewrites the argv it forwards. Ours carries `--settings <path>`, which cmux's
+   wrapper merges and hands back INLINE, so the exec dies with `Argument list
+   too long` and the role relaunches forever — a swarm that starts and does
+   nothing, with the reason only visible in the pane.
+
+   These are deliberately narrow. The first version of this test rejected
+   anything under a temp directory, which is true of cmux's shim and equally
+   true of every stub binary a test puts on PATH — it sent the smoke suite at
+   the live vendors. A wrong binary that is merely reported beats a right one
+   that is silently skipped, so anything not listed here is resolved normally
+   and the choice is printed at open."
+  ["/cmux-cli-shims/" ".app/Contents/"])
+
+(defn wrapper-shim? [path]
+  (let [real (str (try (fs/real-path path) (catch Exception _ path)))]
+    (boolean (some #(str/includes? real %) wrapper-shim-markers))))
+
+(defn harness-candidates
+  "Every executable of that name on PATH, in PATH order."
+  [command]
+  (->> (str/split (or (System/getenv "PATH") "") #":")
+       (remove str/blank?)
+       (map #(fs/path % command))
+       (filter fs/executable?)
+       (map str)
+       distinct
+       vec))
+
+(defn resolve-harness
+  "The real binary for a harness. An explicit SWARMKHAZAD_HARNESS_<NAME> wins;
+   otherwise the first candidate on PATH that is not a wrapper shim. Returns
+   {:path ... :skipped [...]} or nil."
+  [harness]
+  (if-let [pinned (not-empty (or (System/getenv (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness))) ""))]
+    {:path pinned :skipped [] :pinned true}
+    (let [all (harness-candidates harness)
+          [skipped [chosen]] (split-with wrapper-shim? all)]
+      (when chosen {:path chosen :skipped (vec skipped)}))))
+
 (defn check-dependencies! []
   (doseq [command ["tmux" "git" "bb"]]
     (when-not (command-path command)
@@ -48,14 +91,35 @@
    record it in state/harnesses.tsv for the shims. The tmux login shell
    re-sources rc files and rebuilds PATH, so a bare `claude` typed into the pane
    could resolve to a different binary than the one the operator ran `open`
-   with — or to nothing."
+   with — or to nothing.
+
+   Wrapper shims are skipped rather than pinned. `open` is often run from inside
+   a terminal that puts its own wrapper first on PATH, and pinning that wrapper
+   is worse than not resolving at all: every role launches, dies on an argv the
+   wrapper rewrote, and relaunches, which reads as a swarm that started and did
+   nothing. Skipping is reported, and a harness with nothing but wrappers fails
+   here with the paths it rejected."
   [ctx roles]
-  (let [paths (into {} (for [h (distinct (map :harness roles))]
-                         [h (or (command-path h)
-                                (throw (ex-info (str "'" h "' is required but not on PATH") {})))]))]
+  (let [resolved (into {} (for [h (distinct (map :harness roles))]
+                            [h (resolve-harness h)]))]
+    (doseq [[h r] resolved]
+      (when-not r
+        (let [all (harness-candidates h)]
+          (throw (ex-info (if (seq all)
+                            (str "'" h "' resolves only to wrapper shims, which rewrite the argv we pass:\n  "
+                                 (str/join "\n  " all)
+                                 "\nRun `open` outside that terminal, or pin the real binary with "
+                                 "SWARMKHAZAD_HARNESS_" (str/upper-case h) "=/path/to/" h)
+                            (str "'" h "' is required but not on PATH"))
+                          {:harness h :candidates all}))))
+      (doseq [skipped (:skipped r)]
+        (binding [*out* *err*]
+          (println (str "swarmkhazad: " h ": skipped wrapper shim " skipped))))
+      (binding [*out* *err*]
+        (println (str "swarmkhazad: " h " -> " (:path r) (when (:pinned r) " (pinned)")))))
     (spit (str (fs/path (:state-dir ctx) "harnesses.tsv"))
-          (apply str (for [[h p] paths] (str h "\t" p "\n"))))
-    paths))
+          (apply str (for [[h r] resolved] (str h "\t" (:path r) "\n"))))
+    (into {} (for [[h r] resolved] [h (:path r)]))))
 
 (defn write-shims!
   "Install scripts/shim.sh as <task>/bin/<harness> for every known harness, and

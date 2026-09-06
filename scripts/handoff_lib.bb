@@ -210,9 +210,16 @@
   (when (fs/regular-file? (:tmux-socket-file ctx))
     (not-empty (str/trim (slurp (str (:tmux-socket-file ctx)))))))
 
-(defn capture-pane [ctx role-name]
+(defn capture-pane
+  "The pane's scrollback. `-e` keeps the SGR escapes, without which an agent TUI
+   arrives as flat grey text and every colour it used to mean something with is
+   gone. Callers that want plain text strip them; the portal renders them."
+  [ctx role-name & {:keys [ansi] :or {ansi false}}]
   (when-let [socket (tmux-socket ctx)]
-    (let [r (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" (task-lib/session-name role-name) "-S" "-")]
+    (let [args (concat ["tmux" "-S" socket "capture-pane" "-p"]
+                       (when ansi ["-e"])
+                       ["-t" (task-lib/session-name role-name) "-S" "-"])
+          r (apply process/sh {:continue true} args)]
       (when (zero? (:exit r)) (:out r)))))
 
 (defn archive-role!
