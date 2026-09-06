@@ -9,6 +9,18 @@ set -u
 T="$SWARMKHAZAD_TASK_DIR"
 R="$SWARMFORGE_ROLE"
 printf '%s\n' "$@" > "$T/tmp/launch-$R.argv"
+env | grep -E '^(ANTHROPIC_|OTEL_|CLAUDE_CODE_|API_TIMEOUT)' | sort > "$T/tmp/launch-$R.env"
+
+# `-p` = the smoke: behave like a print-mode session that read goal.md and sent
+# the note the prompt asked for, then report a JSON result naming a model.
+if printf ' %s ' "$@" | grep -q ' -p '; then
+  to=$(printf '%s\n' "$@" | sed -n 's/^to: //p' | head -1)
+  printf 'type: note\nto: %s\npriority: 50\nmessage: smoke from %s\n' "$to" "$R" > "$T/tmp/smoke-$R.txt"
+  swarm_handoff.bb "$T/tmp/smoke-$R.txt" > "$T/tmp/smoke-$R.out" 2>&1 || { cat "$T/tmp/smoke-$R.out" >&2; exit 1; }
+  model="${SWARMKHAZAD_STUB_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-stub}}"
+  printf '{"type":"result","is_error":false,"num_turns":3,"total_cost_usd":0.01,"result":"HANDOFF_OK","modelUsage":{"%s":{}}}\n' "$model"
+  exit 0
+fi
 
 wait_task() {
   for _ in $(seq 90); do

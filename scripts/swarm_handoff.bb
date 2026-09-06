@@ -73,7 +73,6 @@
        (str/blank? to) (conj "Missing required header 'to'.")
        (some str/blank? recipients) (conj "Header 'to' contains an empty recipient.")
        (not= (count recipients) (count (distinct recipients))) (conj "Duplicate recipient in 'to'.")
-       (some #{sender} recipients) (conj "A role cannot hand off to itself.")
        :always (into (for [r recipients :when (and (not (str/blank? r)) (not (handoff-lib/role-known? ctx r)))]
                        (format "Unknown recipient role '%s'." r))))]))
 

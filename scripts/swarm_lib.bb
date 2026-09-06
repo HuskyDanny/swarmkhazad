@@ -15,6 +15,7 @@
 (ns swarm-lib
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
+            [cheshire.core :as json]
             [clojure.string :as str]))
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
@@ -24,6 +25,15 @@
 (def prompts-src-dir (fs/path (fs/parent script-dir) "prompts"))
 (def pane-history-limit 10000)
 (def daemon-stop-timeout-ms 5000)
+(def shimmed-harnesses ["claude" "codex" "grok"])
+(def smoke-timeout-ms 240000)
+
+;; The model each vendor's shim pins, so a smoke can prove a role used its own.
+(def vendor-model
+  {"glm" "z-ai/glm-5.3-flash"
+   "kimi" "moonshotai/kimi-k3:exacto"
+   "deepseek" "deepseek/deepseek-v4-flash-vision-exp"
+   "qwen" "qwen3.7-max[1m]"})
 
 (defn sq [value]
   (str "'" (str/replace (str value) #"'" "'\"'\"'") "'"))
@@ -50,6 +60,54 @@
     (spit (str (fs/path (:state-dir ctx) "harnesses.tsv"))
           (apply str (for [[h p] paths] (str h "\t" p "\n"))))
     paths))
+
+(defn write-shims!
+  "Install scripts/shim.sh as <task>/bin/{claude,codex,grok}. The shim reads the
+   role's vendor from roles.tsv and the real binary from harnesses.tsv."
+  [ctx]
+  (fs/create-dirs (:bin-dir ctx))
+  (doseq [h shimmed-harnesses]
+    (let [target (fs/path (:bin-dir ctx) h)]
+      (fs/copy (fs/path script-dir "shim.sh") target {:replace-existing true})
+      (fs/set-posix-file-permissions target "rwxr-xr-x"))))
+
+(defn launch-binary
+  "What the pane runs: the shim for harnesses that have one, else the real path."
+  [ctx harnesses harness]
+  (if (some #{harness} shimmed-harnesses)
+    (str (fs/path (:bin-dir ctx) harness))
+    (get harnesses harness)))
+
+;; ---------------------------------------------------------------- trust
+
+(defn claude-json-path []
+  (or (not-empty (System/getenv "SWARMKHAZAD_CLAUDE_JSON"))
+      (str (fs/path (fs/home) ".claude.json"))))
+
+(defn trust-worktrees!
+  "Pre-accept Claude Code's folder-trust dialog for every claude role's cwd.
+   Neither --permission-mode bypassPermissions nor --dangerously-skip-permissions
+   skips that dialog, hooks do not run until it is accepted, and a trusted parent
+   does not cover a new child (all RAN); the only non-interactive door is
+   `projects[<realpath>].hasTrustDialogAccepted` in ~/.claude.json. Additive:
+   one key per worktree, nothing else in the file is touched. Skipped when the
+   file does not exist (Claude has never run for this user)."
+  [ctx roles]
+  (let [path (claude-json-path)]
+    (when (fs/regular-file? path)
+      (let [dirs (->> roles
+                      (filter #(= "claude" (:harness %)))
+                      (map :worktree-path)
+                      (map #(str (fs/canonicalize (fs/path %))))
+                      distinct)
+            cfg (json/parse-string (slurp path))
+            already (set (keys (get cfg "projects")))
+            missing (remove #(get-in cfg ["projects" % "hasTrustDialogAccepted"]) dirs)]
+        (when (seq missing)
+          (spit path (json/generate-string
+                      (reduce (fn [c d] (assoc-in c ["projects" d "hasTrustDialogAccepted"] true)) cfg missing)
+                      {:pretty true})))
+        {:trusted (vec dirs) :added (vec missing) :already (vec (filter already dirs))}))))
 
 ;; ---------------------------------------------------------------- tmux
 
@@ -155,7 +213,7 @@
   [ctx roles harnesses row]
   (let [prompt (write-prompt! ctx roles row)
         script (fs/path (:prompts-dir ctx) (str (:role row) ".launch.sh"))]
-    (spit (str script) (launch-script ctx row (get harnesses (:harness row)) prompt))
+    (spit (str script) (launch-script ctx row (launch-binary ctx harnesses (:harness row)) prompt))
     (fs/set-posix-file-permissions script "rwxr-xr-x")
     (tmux! ctx "send-keys" "-t" (task-lib/session-name (:role row)) (str "bash " (sq script)) "Enter")
     (str script)))
@@ -225,12 +283,96 @@
     (stop-handoffd! ctx)
     (kill-server! ctx)
     (boot-sessions! ctx roles)
-    (fs/create-dirs (:bin-dir ctx))
+    (write-shims! ctx)
+    (trust-worktrees! ctx roles)
     (when-not (board-lib/card-lane ctx task-id)
       (board-lib/create-card! ctx task-id (:role (first roles)))
       (queue-new-task-note! ctx (:role (first roles))))
     (start-handoffd! ctx)
     (assoc ctx :roles roles :commands (mapv #(launch-role! ctx roles harnesses %) roles))))
+
+;; ---------------------------------------------------------------- smoke
+
+(defn smoke-target [roles role]
+  (let [names (mapv :role roles)
+        idx (.indexOf names role)]
+    (or (get names (inc idx)) (first names))))
+
+(defn smoke-prompt [ctx role target]
+  (str "Smoke test for role " role ". Do exactly these steps and nothing else.\n"
+       "1. Read " (:goal-file ctx) " (one Read call).\n"
+       "2. Write the file " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) " with exactly these four lines:\n"
+       "type: note\nto: " target "\npriority: 50\nmessage: smoke from " role "\n"
+       "3. Run: swarm_handoff.bb " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) "\n"
+       "4. Reply with the single line HANDOFF_OK if that command printed HANDOFF QUEUED, else the error text."))
+
+(defn smoke-command
+  "One non-interactive run of the role's shim that must read goal.md and send a note."
+  [ctx harnesses row prompt-file target]
+  (let [bin (launch-binary ctx harnesses (:harness row))
+        text (smoke-prompt ctx (:role row) target)]
+    (case (:harness row)
+      "claude" ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin "-p"
+                "--append-system-prompt-file" (str prompt-file)
+                "--permission-mode" "bypassPermissions"
+                "--tools" "Read,Write,Bash"
+                "--strict-mcp-config" "--mcp-config" "{\"mcpServers\":{}}"
+                "--no-session-persistence" "--output-format" "json" "--" text]
+      "codex" [bin "exec" "--skip-git-repo-check" "-C" (:worktree-path row) "--" text]
+      "grok" [bin "--cwd" (:worktree-path row) "--permission-mode" "bypassPermissions" "--minimal" "--verbatim" text]
+      "copilot" [bin "-C" (:worktree-path row) "--yolo" "-p" text]
+      (throw (ex-info (str "no smoke for harness " (:harness row)) {})))))
+
+(defn smoke-note
+  "The note this role's smoke queued, if any."
+  [ctx role]
+  (some (fn [f]
+          (let [h (:headers (handoff-lib/parse-message f))]
+            (when (and (= "note" (get h "type")) (= role (get h "from"))
+                       (str/starts-with? (or (get h "message") "") "smoke from"))
+              f)))
+        (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role))))
+
+(defn smoke-role!
+  "Launch, read goal.md, send one note, exit clean — through the role's shim."
+  [ctx roles harnesses row]
+  (let [role (:role row)
+        prompt (write-prompt! ctx roles row)
+        target (smoke-target roles role)
+        argv (smoke-command ctx harnesses row prompt target)
+        started (System/currentTimeMillis)
+        p (process/process argv {:dir (:worktree-path row)
+                                 :out :string :err :string
+                                 :extra-env {"SWARMFORGE_ROLE" role
+                                             "SWARMKHAZAD_TASK_ID" (:task-id ctx)
+                                             "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))
+                                             "PATH" (str (:bin-dir ctx) ":" script-dir ":" (System/getenv "PATH"))}})
+        done (deref p smoke-timeout-ms nil)
+        _ (when-not done (process/destroy-tree p))
+        result (if done @p {:exit -1 :out "" :err "timed out"})
+        json-out (try (json/parse-string (:out result)) (catch Exception _ nil))
+        models (vec (keys (get json-out "modelUsage")))
+        expected (get vendor-model (:model row))
+        note (smoke-note ctx role)
+        ok? (and done (zero? (:exit result)) (some? note)
+                 (or (nil? expected) (some #{expected} models))
+                 (or (not= "claude" (:harness row)) (some? json-out)))]
+    (when note (fs/delete note))
+    {:role role :harness (:harness row) :vendor (:model row) :ok ok?
+     :exit (:exit result) :seconds (quot (- (System/currentTimeMillis) started) 1000)
+     :models models :expected expected :note (some? note)
+     :cost (get json-out "total_cost_usd") :turns (get json-out "num_turns")
+     :detail (when-not ok? (str/trim (str (:err result) "\n" (subs (or (:out result) "") 0 (min 600 (count (or (:out result) "")))))))}))
+
+(defn smoke!
+  "Prepare the task (no tmux, no daemon) and smoke every declared role."
+  [task-id]
+  (let [ctx (task-lib/task-ctx task-id)
+        {:keys [roles]} (task-lib/prepare! ctx)
+        _ (check-dependencies!)
+        harnesses (resolve-harnesses! ctx roles)]
+    (write-shims! ctx)
+    (mapv #(smoke-role! ctx roles harnesses %) roles)))
 
 (defn close!
   "Tear the swarm down: archive panes, stop the daemon, kill the tmux server."
