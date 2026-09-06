@@ -29,6 +29,7 @@
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 (load-file (str (fs/path script-dir "board_lib.bb")))
 (load-file (str (fs/path script-dir "run_evidence.bb")))
+(load-file (str (fs/path script-dir "telemetry.bb")))
 
 (def cli (str (fs/path script-dir "swarmkhazad.bb")))
 (def default-port 8765)
@@ -261,6 +262,21 @@
                [:td (if-let [e (:evidence b)]
                       [:div [:span.status {:class (if (= "0" (:exit e)) "met" "unmet")} "exit " (:exit e)] " " [:span.muted (:at e)] [:pre (:tail e)]]
                       [:span.status.pending "no evidence yet"])]])]]
+          (let [t (telemetry/task-totals id)]
+            [:section [:h2 "Telemetry"
+                       (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]
+             (if t
+               [:table [:tr [:th "role"] [:th "cost"] [:th "input"] [:th "output"] [:th "cache"] [:th "sessions"] [:th "active"]]
+                (for [role (sort (keys (:cost t))) :let [tok (get (:tokens t) role {})]]
+                  [:tr [:td role] [:td (format "$%.4f" (get (:cost t) role 0.0))]
+                   [:td (long (get tok "input" 0.0))] [:td (long (get tok "output" 0.0))]
+                   [:td (long (+ (get tok "cacheRead" 0.0) (get tok "cacheCreation" 0.0)))]
+                   [:td (long (get (:sessions t) role 0.0))]
+                   [:td (str (long (get (:active-seconds t) role 0.0)) "s")]])]
+               [:p.muted "no telemetry for this task at " (telemetry/base-url)
+                " — start VictoriaMetrics (`brew services start victoriametrics`) before `open`, or the roles' exports are dropped."])
+             [:p.muted "dashboard: " [:a {:href (str (telemetry/base-url) "/vmui/#/?g0.expr=" (java.net.URLEncoder/encode (str "sum by (task_id, role) (claude_code.cost.usage{task_id=\"" id "\"})") "UTF-8"))} "vmui"]
+              " · repo dashboard: dashboards/swarmkhazad.json"]])
           [:section [:h2 "Roles"]
            [:div.cards
             (for [c (role-cards ctx)]
