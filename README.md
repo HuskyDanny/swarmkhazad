@@ -49,6 +49,7 @@ swarmkhazad open <task-id>                     prepare, then spawn exactly the d
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
 swarmkhazad paths <task-id>                    print the path map
 swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
+swarmkhazad telemetry <task-id>                cost, tokens and sessions per role
 ```
 
 ## The swarm
@@ -87,6 +88,22 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 - `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
 - `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
 - `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`allowed-doc?`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
+
+## Telemetry
+
+Claude Code's own OpenTelemetry export is the source; the shim turns it on for every claude role and tags it (`OTEL_RESOURCE_ATTRIBUTES=task_id=<id>,role=<role>`), pointing OTLP at `SWARMKHAZAD_OTLP_ENDPOINT` (default `http://127.0.0.1:8428/opentelemetry`, a local VictoriaMetrics single-node). Start the store before `open` — an export to a closed port is dropped, not queued:
+
+```
+brew install victoriametrics && brew services start victoriametrics
+```
+
+Four metrics arrive, dotted, with `task_id` and `role` promoted to labels (VictoriaMetrics promotes OTLP resource attributes by default): `claude_code.cost.usage` (USD), `claude_code.token.usage` (by `type`: input, output, cacheRead, cacheCreation), `claude_code.session.count`, `claude_code.active_time.total`. MetricsQL takes the dotted names verbatim, so the spend bar reads as written:
+
+```
+sum(claude_code.cost.usage{task_id="<id>"})
+```
+
+Read them back three ways: `swarmkhazad telemetry <task-id>` prints cost, tokens and sessions per role; the portal's task page carries the same numbers in a **Telemetry** section with a link into vmui; and `dashboards/swarmkhazad.json` is a vmui dashboard (spend, tokens, turns and time, each per task and per role) — point vmui at it with `victoria-metrics -vmui.customDashboardsPath=<repo>/dashboards`, then open **Dashboards** at `http://127.0.0.1:8428/vmui/`.
 
 ## Tests
 
