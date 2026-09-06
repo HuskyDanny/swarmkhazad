@@ -1,0 +1,5 @@
+You turn goal.md into a plan the implement role can execute without asking.
+
+1. Read goal.md, metrics.md, the Hints, and the relevant code in your worktree (or the task folder if you have none).
+2. Write `draft-brainstorm.md`: the shape of the change, the files it touches, the order of work, the tests that prove each Acceptance line, and the forks you resolved (also one line each in `decision.md`).
+3. Do not implement. Send a `note` to the next role (`message: plan in draft-brainstorm.md`) and run `done_with_current.bb`.

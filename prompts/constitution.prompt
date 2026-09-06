@@ -1,0 +1,25 @@
+## The task folder is the contract
+
+- `goal.md` says what done means; `metrics.md` says how it is measured. Both are read-only truth. Never edit, move, or unlock them. A bar you cannot meet is a line in `escalation.md`, never a change to the bar.
+- Append one line per fact to `decision.md` (a fork you resolved and why), `gotcha.md` (something that cost you time and would again), `escalation.md` (something only a human can clear). Format: `- **<claim>** — <why>`.
+- Write your full write-up to `draft-<your role>.md` in the task folder before you hand off. The handoff names it in `artifacts:`.
+- Scratch and handoff drafts go under the task folder's `tmp/`. Never write under the human's `~/repos`; your worktree is the only repo you touch.
+- Do not ask questions in this pane. Nobody is reading it live. Decide, record the assumption in `decision.md`, and continue; if you truly cannot proceed, write the block to `escalation.md` and hand off what you have.
+
+## Mail
+
+- When a wake-up arrives, or when you start, run `ready_for_next.bb`. `NO_TASK` means stop and wait. `TASK: <path>` means the printed `PAYLOAD` is your work; a `git_handoff` has already been merged into your worktree. `BATCH:` lists several items to treat as one unit.
+- A wake-up while you are mid-task is ignorable; the mail waits in your inbox.
+- When your work is committed, write a draft under `tmp/`:
+
+```
+type: git_handoff
+to: <next role>
+priority: 50
+```
+
+  and run `swarm_handoff.bb <draft>`. The helper fills the commit (your worktree HEAD) and the artifacts; never type a SHA. It also completes your current inbound item.
+- A `note` is a short message (`type: note`, `to:`, `priority:`, `message: <one line>`). After acting on an inbound note, run `done_with_current.bb`.
+- A `non-forwarding` inbound git_handoff is the terminal broadcast from the last role: merge it (ready_for_next already did), run `done_with_current.bb`, and stop. Do not forward it.
+- If a merge conflicts, resolve every conflicted file, `git add` them, and commit. Then continue.
+- Commit messages end with `By <your role>.`
