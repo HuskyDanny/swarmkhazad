@@ -62,6 +62,10 @@
       (let [dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude " src " batch\nc claude none\n"))
         (run {:env env} cli "prepare" id)
+        ;; These tests are about mail. The goal judge's gate on git_handoffs has
+        ;; its own suite; here every role is already judged met.
+        (doseq [role ["a" "b" "c"]]
+          (write! (fs/path dir "state" "judge" (str role ".json")) "{\"met\":true,\"unmet\":[]}"))
         (letfn [(helper [role script & args]
                   (let [row-dir (if (= role "c") (str dir) (str (fs/path dir "worktrees" role)))]
                     (apply run {:dir row-dir :env (assoc env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir)) :ok? false}
