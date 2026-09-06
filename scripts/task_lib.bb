@@ -90,6 +90,7 @@
      :tmp-dir (fs/path task-dir "tmp")
      :bin-dir (fs/path task-dir "bin")
      :prompts-dir (fs/path task-dir "prompts")
+     :hooks-dir (fs/path task-dir "hooks")
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
      :tmux-socket (tmux-socket-path task-id)
