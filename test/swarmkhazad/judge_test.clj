@@ -58,6 +58,11 @@
         (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude " src " task\nc grok none\n"))
         (spit (str (fs/path dir "goal.md")) "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n\n## Hints\n- none\n")
         (run {:env base-env} cli "prepare" id)
+        ;; Role a is a working role: something reached its inbox. A role with an
+        ;; empty inbox and an untouched worktree is idle and is not graded at
+        ;; all, which `a-role-with-no-task-yet-is-not-graded-at-all` covers.
+        (write! (fs/path dir "mail" "a" "inbox" "in_process" "50_20260101T000000000Z_from_New-Task_to_a.handoff")
+                "id: seed\nfrom: (New Task)\nto: a\npriority: 50\ntype: note\nmessage: begin\n\nbegin\n")
         (letfn [(stop! [role verdict & [{:keys [session message]}]]
                   (run {:dir (str (fs/path dir "worktrees" (if (= role "c") "" role)))
                         :env (cond-> (assoc base-env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir))
@@ -77,6 +82,17 @@
 
 (defn decision [r]
   (when-not (str/blank? (:out r)) (json/parse-string (:out r) true)))
+
+(defn handoffs [dir]
+  (if (fs/directory? dir)
+    (->> (concat (fs/glob dir "*.handoff") (fs/glob dir "**/*.handoff")) (filter fs/regular-file?) distinct (sort-by str) vec)
+    []))
+
+(defn headers [file]
+  (into {} (for [line (take-while (complement str/blank?) (str/split-lines (slurp (str file))))
+                 :let [[k v] (str/split line #": " 2)]
+                 :when (and k v)]
+             [k v])))
 
 (defn verdict-file [dir role]
   (json/parse-string (slurp (str (fs/path dir "state" "judge" (str role ".json")))) true))
@@ -211,6 +227,96 @@
         (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
           (is (= 1 (:exit r)))
           (is (str/includes? (:err r) "judge_unavailable")))))))
+
+(deftest a-role-with-no-task-yet-is-not-graded-at-all
+  (with-task
+    (fn [{:keys [dir stop!]}]
+      (testing "open mails only the first role, so every other role's first stop is this"
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+          (is (zero? (:exit r)) (:err r))
+          (is (nil? (decision r)) "waiting is correct; blocking would tell it to work on a task it never got")
+          (let [v (verdict-file dir "b")]
+            (is (true? (:idle v)))
+            (is (= [] (:unmet v)))
+            (is (str/includes? (:reason v) "no task yet")))
+          (is (not (fs/exists? (fs/path dir "tmp" "judge-b.argv"))) "no model was called: nothing to grade")
+          (is (= "" (slurp (str (fs/path dir "escalation.md")))) "and no false unmet line")))
+      (testing "once mail arrives, the role is graded again"
+        (write! (fs/path dir "mail" "b" "inbox" "in_process" "50_x_from_a_to_b.handoff")
+                "id: x\nfrom: a\nto: b\npriority: 50\ntype: note\nmessage: go\n\ngo\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+          (is (= "block" (:decision (decision r))))
+          (is (str/includes? (:reason (decision r)) "goals unmet: GOAL-X"))))
+      (testing "mail delivered but not yet accepted is still mail — handoffd writes to inbox/new first"
+        (write! (fs/path dir "mail" "b" "inbox" "new" "50_y_from_a_to_b.handoff")
+                "id: y\nfrom: a\nto: b\npriority: 50\ntype: git_handoff\ncommit: 0000000000\nnon-forwarding: true\n\nmerge me\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-new"})]
+          (is (= "block" (:decision (decision r)))
+              "otherwise a terminal broadcast can sit undelivered while its recipient is told nothing has arrived")))
+      (testing "a role with an empty inbox that has COMMITTED is graded — the worktree half of idle?"
+        ;; b, not a: a's fixture seeds mail, so a would be non-idle for that
+        ;; reason alone and this case would pass with untouched? deleted.
+        (doseq [f (concat (fs/glob (fs/path dir "mail" "b" "inbox" "new") "*.handoff")
+                          (fs/glob (fs/path dir "mail" "b" "inbox" "in_process") "*.handoff"))]
+          (fs/delete f))
+        (write! (fs/path dir "worktrees" "b" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "b") "add" "x.txt")
+        (git (fs/path dir "worktrees" "b") "commit" "-q" "-m" "x")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-commit"})]
+          (is (= "block" (:decision (decision r))))
+          (is (not (:idle (verdict-file dir "b"))))))
+      (testing "an uncommitted change also counts as touched"
+        (git (fs/path dir "worktrees" "b") "reset" "-q" "--hard" "HEAD~1")
+        (write! (fs/path dir "worktrees" "b" "dirty.txt") "d\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-dirty"})]
+          (is (= "block" (:decision (decision r))))
+          (is (not (:idle (verdict-file dir "b"))))))
+      (testing "a git that cannot answer counts as touched, never as idle"
+        (fs/delete-tree (fs/path dir "worktrees" "b" "dirty.txt"))
+        (fs/delete-if-exists (fs/path dir "worktrees" "b" ".git"))
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-broken"})]
+          (is (= "block" (:decision (decision r)))
+              "a broken worktree must be graded, not silently excused as having no task"))))))
+
+(deftest a-role-is-graded-on-its-own-goal-lines-not-the-whole-task
+  (with-task
+    (fn [{:keys [dir stop!]}]
+      (fs/set-posix-file-permissions (fs/path dir "goal.md") "rw-r--r--")
+      (spit (str (fs/path dir "goal.md"))
+            "# t\n\n## Goal\n- [ ] a — MINE-ONE\n- [ ] b — THEIRS\n- [ ] MINE-SHARED with no role named\n\n## Not-goal\n- none\n")
+      (stop! "a" "{\"met\":false,\"unmet\":[\"MINE-ONE\"]}")
+      (let [prompt (slurp (str (fs/path dir "tmp" "judge-a.argv")))
+            goals (subs prompt (str/index-of prompt "<goals_md>") (str/index-of prompt "</goals_md>"))]
+        (testing "the Goal section carries this role's lines and the unowned one"
+          (is (str/includes? goals "- [ ] a — MINE-ONE"))
+          (is (str/includes? goals "- [ ] MINE-SHARED with no role named")))
+        (testing "another role's line is moved out of the Goal section and labelled"
+          (is (str/includes? goals "## Not yours — other roles own these; do not grade them\n- [ ] b — THEIRS"))
+          (is (< (str/index-of goals "- [ ] a — MINE-ONE") (str/index-of goals "Not yours"))
+              "a role's own lines come first; the others are context after them"))
+        (testing "graded whole, every role of a multi-role task is unmet until the last one finishes"
+          (is (= 1 (count (re-seq #"- \[ \] b — THEIRS" goals)))
+              "b's line appears once, only in the not-yours block"))))))
+
+(deftest a-spent-block-budget-lets-the-handoff-through-carrying-the-gap
+  (with-task
+    (fn [{:keys [dir stop! helper]}]
+      (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
+      (git (fs/path dir "worktrees" "a") "add" "x.txt")
+      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+      (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
+      (testing "while blocks remain, an unmet role is refused"
+        (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")
+        (is (= 1 (:exit (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))))))
+      (testing "after the budget is spent, it goes through — refusing forever would wedge the task on one role"
+        (dotimes [_ 3] (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"))
+        (is (true? (:exhausted (verdict-file dir "a"))))
+        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
+          (is (zero? (:exit r)) (:err r))
+          (is (str/includes? (:err r) "block budget is spent"))))
+      (testing "and the handoff names the gap, so the recipient is never told the work is clean"
+        (let [h (headers (first (handoffs (fs/path dir "mail" "a" "outbox"))))]
+          (is (= "GOAL-X" (get h "unmet"))))))))
 
 (deftest the-hook-is-inert-outside-a-role-and-on-other-events
   (let [r (process/sh {:continue true :in "{\"hook_event_name\":\"Stop\"}" :extra-env {"SWARMKHAZAD_TASK_DIR" "" "SWARMFORGE_ROLE" ""}}

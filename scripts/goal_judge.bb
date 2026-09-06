@@ -49,8 +49,29 @@
   (str "You are a goal-completion judge for one role of an agent swarm. You are given goal.md — the task's "
        "contract — and a summary of the role's working state: its commits and diff, its draft write-up, and any "
        "measurement evidence. Decide whether EVERY goal and acceptance line that this role is responsible for is "
-       "met by the state as shown. Judge only from the evidence given; a claim in the draft without a matching "
+       "met by the state as shown. A goal.md checkbox reads `- [ ] <role> — <outcome>`; grade ONLY the lines naming "
+       "this role or naming none, and never a line under a heading that says the lines are not this role's. "
+       "Judge only from the evidence given; a claim in the draft without a matching "
        "commit, file or measurement is not met. Be strict and literal. Report through the structured output only."))
+
+(defn goals-for-role
+  "goal.md, with the Goal checkboxes split into this role's and the others'.
+
+   The convention is `- [ ] <role> — <outcome>`, so a three-role task's goal.md
+   names work no single role can do. Graded whole, every role is unmet until the
+   last one finishes — measured on the fixture: implement met all seven of its
+   own lines and was blocked on `run —` and `review —`. A line naming no role
+   belongs to everyone."
+  [goals-md role]
+  (let [lines (str/split-lines (or goals-md ""))
+        box? #(re-matches #"\s*- \[[ xX]\]\s*.*" %)
+        mine? (fn [l] (let [[_ named] (re-matches #"\s*- \[[ xX]\]\s*([A-Za-z0-9][A-Za-z0-9.-]*)\s+—.*" l)]
+                        (or (nil? named) (= named role))))
+        [mine others] [(filter #(and (box? %) (mine? %)) lines)
+                       (filter #(and (box? %) (not (mine? %))) lines)]]
+    {:mine (vec mine)
+     :others (vec others)
+     :whole (str/join "\n" (remove #(and (box? %) (not (mine? %))) lines))}))
 
 (defn clip [s]
   (let [s (str s)]
@@ -109,7 +130,13 @@
   (let [prompt-text (str "<goals_md>\n" goals-md "\n</goals_md>\n\n<working_state>\n" state "\n</working_state>")
         p (process/process (judge-argv prompt-text)
                            {:out :string :err :string
-                            :extra-env {"MAX_THINKING_TOKENS" "0" "CLAUDE_CODE_MAX_OUTPUT_TOKENS" "600"}})
+                            :extra-env {"MAX_THINKING_TOKENS" "0" "CLAUDE_CODE_MAX_OUTPUT_TOKENS" "600"
+                                        ;; The judge runs through the role's shim and would otherwise
+                                        ;; export its own spend and session count under the role's own
+                                        ;; labels — measured on the fixture, where three roles reported
+                                        ;; 5, 4 and 3 sessions for one session each plus their gradings.
+                                        "OTEL_RESOURCE_ATTRIBUTES" (str "task_id=" (System/getenv "SWARMKHAZAD_TASK_ID")
+                                                                        ",role=" (System/getenv "SWARMFORGE_ROLE") "-judge")}})
         done (deref p judge-timeout-ms nil)
         _ (when-not done (process/destroy-tree p))
         result (if done @p {:exit -1 :out "" :err "timed out"})
@@ -159,12 +186,55 @@
                  (concat (handoff-lib/in-process-files ctx role)
                          (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role))))))
 
+(defn base-ref
+  "The ref a role's work is counted against. `origin/HEAD` is the usual answer,
+   but a source checkout with no upstream has its origin removed at clone time,
+   and then origin/HEAD does not exist at all — fall back to the clone's own
+   default branch, which every worktree branched from."
+  [worktree]
+  (let [ok? (fn [r] (zero? (:exit (process/sh {:continue true :dir (str worktree)}
+                                              "git" "rev-parse" "--verify" "--quiet" r))))]
+    (first (filter ok? ["origin/HEAD" "main" "master"]))))
+
+(defn untouched?
+  "The worktree holds no work: nothing committed past the clone's base and
+   nothing uncommitted. A failure to answer counts as touched — never claim a
+   role is idle because a git command did not run."
+  [worktree]
+  (if (nil? worktree)
+    true
+    (if-let [base (base-ref worktree)]
+      (let [count (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" (str base "..HEAD"))
+            dirty (process/sh {:continue true :dir (str worktree)} "git" "status" "--porcelain")]
+        (and (zero? (:exit count)) (= "0" (str/trim (:out count)))
+             (zero? (:exit dirty)) (str/blank? (:out dirty))))
+      false)))
+
+(defn idle?
+  "The role has never had work: no mail has ever reached it and its worktree is
+   untouched. `open` mails only the first role, so every other role's first stop
+   is this — and grading it against a goal it was never handed is how a swarm
+   greets itself with a wall of false unmet lines."
+  [ctx role worktree]
+  (and (empty? (handoff-lib/in-process-files ctx role))
+       ;; inbox/new too: handoffd delivers there first, so mail the role has not
+       ;; accepted yet is still mail. Without this, a role whose turn ended
+       ;; between delivery and ready_for_next is told "nothing has reached your
+       ;; inbox" while a handoff — a terminal broadcast, even — sits in it.
+       (empty? (handoff-lib/handoff-files (handoff-lib/new-dir ctx role)))
+       (empty? (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role)))
+       (empty? (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role)))
+       (empty? (handoff-lib/handoff-files (fs/path (handoff-lib/mail-dir ctx role) "sent")))
+       (untouched? worktree)))
+
 (defn decide
   "khazad's decide_stop: {:block? bool :reason str}."
-  [{:keys [met unmet down]} {:keys [terminal? sent? repo? blocks]}]
+  [{:keys [met unmet down]} {:keys [terminal? sent? repo? blocks idle]}]
   (cond
+    idle {:block? false :reason "no task yet: nothing has reached this role's inbox and it has committed nothing. Waiting is correct."}
     terminal? {:block? false :reason "terminal broadcast received; merge and stop"}
-    (>= blocks max-blocks) {:block? false :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
+    (>= blocks max-blocks) {:block? false :exhausted true
+                            :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
     down {:block? false :reason "judge unavailable; verdict is met=false until it returns"}
     (not met) {:block? true :reason (str "goals unmet: " (str/join "; " unmet) ". Keep working on these, then stop again. A bar you cannot meet is an escalation.md line.")}
     (and repo? (not sent?)) {:block? true :reason "goals met, but no git_handoff for your current HEAD has been queued. Commit if needed, then run swarm_handoff.bb on a git_handoff draft, then stop."}
@@ -172,6 +242,8 @@
 
 (defn escalate! [ctx role verdict previous]
   (when (and (not (:met verdict))
+             (not (:idle verdict))
+             (seq (:unmet verdict))
              (not= (set (:unmet verdict)) (set (:unmet previous))))
     (spit (str (:escalation-file ctx))
           (str "- **" role ": goal judge says unmet — " (str/join "; " (:unmet verdict)) "** — at "
@@ -189,17 +261,29 @@
           row (task-lib/role-row ctx role)
           worktree (when (:repo row) (:worktree-path row))
           session-id (or (get input "session_id") "unknown")
-          goals (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
+          goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
+          split (goals-for-role goals-md role)
+          goals (str (:whole split)
+                     (when (seq (:others split))
+                       (str "\n\n## Not yours — other roles own these; do not grade them\n"
+                            (str/join "\n" (:others split)) "\n")))
           previous (read-json (verdict-file ctx role))
-          verdict (grade goals (working-state ctx role worktree (get input "last_assistant_message")))
+          idle (idle? ctx role worktree)
+          ;; An idle role is not graded at all: there is nothing to grade, and a
+          ;; model call per idle stop is spend for a foregone answer.
+          verdict (if idle
+                    {:met false :unmet [] :idle true}
+                    (grade goals (working-state ctx role worktree (get input "last_assistant_message"))))
           facts {:terminal? (terminal-inbound? ctx role)
                  :sent? (handoff-sent? ctx role worktree)
                  :repo? (boolean (:repo row))
+                 :idle idle
                  :blocks (blocks-so-far ctx role session-id)}
           decision (decide verdict facts)]
       (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
       (spit (str (verdict-file ctx role))
             (json/generate-string (merge verdict {:role role :at (handoff-lib/timestamp) :session session-id
+                                                  :exhausted (boolean (:exhausted decision))
                                                   :decision (if (:block? decision) "block" "allow") :reason (:reason decision)})
                                   {:pretty true}))
       (escalate! ctx role verdict previous)

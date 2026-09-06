@@ -142,12 +142,12 @@
         (testing "roles.tsv carries the declaration, first column is the role, optional tokens in any order"
           (let [rows (tsv-rows dir)]
             (is (= ["implement" "review" "brainstorm"] (mapv first rows)))
-            (is (= ["implement" "claude" src (str (fs/path dir "worktrees" "implement")) "task" "kimi" "--model sonnet"]
+            (is (= ["implement" "claude" src (str (fs/path dir "worktrees" "implement")) "task" "kimi" "none" "--model sonnet"]
                    (first rows)))
-            (is (= ["review" "claude" src (str (fs/path dir "worktrees" "review")) "batch" "deepseek" ""]
+            (is (= ["review" "claude" src (str (fs/path dir "worktrees" "review")) "batch" "deepseek" "none" ""]
                    (second rows))
                 "`model=deepseek batch` parses the same as `batch model=deepseek`")
-            (is (= ["brainstorm" "claude" "none" (str dir) "task" "anthropic" ""]
+            (is (= ["brainstorm" "claude" "none" (str dir) "task" "anthropic" "none" ""]
                    (nth rows 2))
                 "a role without a repo works in the task folder and says `none`, never an empty cell")))
         (testing "the three bullet files exist and are empty; only the dirs this stage fills exist"
@@ -223,11 +223,73 @@
           (is (str/includes? (prepare-fails h "basename collision" "t-twin"
                                             (str "a claude " src "\nb claude " twin "\n"))
                              "share the basename"))))
-      (testing "a shallow source is refused with a reason"
-        (let [shallow (str (fs/path sandbox "src" "shallow"))]
+      (testing "branch= pins the clone to that branch, and a branch the checkout lacks is refused"
+        (let [other (str (fs/path sandbox "src" "branched"))
+              home (get env "SWARMKHAZAD_HOME")]
+          (make-source-repo! other)
+          (run {:dir other} "git" "checkout" "-q" "-b" "feature")
+          (write! (fs/path other "feature.txt") "f\n")
+          (run {:dir other} "git" "add" "feature.txt")
+          (run {:dir other} "git" "commit" "-q" "-m" "on feature")
+          (run {:dir other} "git" "checkout" "-q" "main")
+          (run {:env env} cli "new" "t-branch")
+          (spit (str (fs/path home "tasks" "t-branch" "roles")) (str "a claude " other " task branch=feature\n"))
+          (is (zero? (:exit (run {:env env :ok? false} cli "prepare" "t-branch"))))
+          (let [wt (str (fs/path home "tasks" "t-branch" "worktrees" "a"))]
+            (is (fs/exists? (fs/path wt "feature.txt")) "the clone is pinned to the named branch, not the default")
+            (is (= "feature" (str/trim (:out (run {:dir (str (fs/path home "tasks" "t-branch" "repos" "branched"))}
+                                                  "git" "rev-parse" "--abbrev-ref" "HEAD"))))))
+          (is (= "feature" (nth (first (tsv-rows (fs/path home "tasks" "t-branch"))) 6))
+              "the branch is in roles.tsv's seventh column")
+          (is (str/includes? (prepare-fails h "ghost branch" "t-ghost" (str "a claude " other " task branch=ghost\n"))
+                             "has no branch ghost"))
+          (is (str/includes? (prepare-fails h "branch disagreement" "t-disagree"
+                                            (str "a claude " other " task branch=feature\nb claude " other " task branch=main\n"))
+                             "roles disagree on the branch"))
+          (is (str/includes? (prepare-fails h "branch vs default" "t-mixed"
+                                            (str "a claude " other " task branch=feature\nb claude " other " task\n"))
+                             "roles disagree on the branch")
+              "a role naming no branch wants the default, which disagrees with a sibling's branch=")))
+      (testing "a pin the clone never received falls back to the branch tip it holds"
+        ;; The real shape, from lothlorien: the source's origin/main names a
+        ;; commit the source itself does not hold — a shallow checkout whose
+        ;; remote ref points past its own boundary. Pinning the clone to that
+        ;; sha died with "nonexistent object". (A plain local clone copies every
+        ;; object, so a merely-unmerged commit would not reproduce it.)
+        (let [ahead (str (fs/path sandbox "src" "ahead"))
+              home (get env "SWARMKHAZAD_HOME")]
+          (make-source-repo! ahead)
+          (let [c1 (str/trim (:out (run {:dir ahead} "git" "rev-parse" "HEAD")))]
+            (write! (fs/path ahead ".git" "refs" "remotes" "origin" "main")
+                    "c31eff2d2d5a5cee31e529a6df5df548cc3813dd\n")
+            (run {:env env} cli "new" "t-ahead")
+            (spit (str (fs/path home "tasks" "t-ahead" "roles")) (str "a claude " ahead " task\n"))
+            (let [r (run {:env env :ok? false} cli "prepare" "t-ahead")]
+              (is (zero? (:exit r)) (str "must not die with \"nonexistent object\": " (:err r)))
+              (is (= c1 (str/trim (:out (run {:dir (str (fs/path home "tasks" "t-ahead" "repos" "ahead"))}
+                                             "git" "rev-parse" "HEAD"))))
+                  "pinned to what the clone holds, not to the commit the source's ref named")))))
+      (testing "a shallow source is prepared, with a note that its objects are copied"
+        (let [shallow (str (fs/path sandbox "src" "shallow"))
+              home (get env "SWARMKHAZAD_HOME")]
           (run {} "git" "clone" "-q" "--depth" "1" (str "file://" src) shallow)
-          (is (str/includes? (prepare-fails h "shallow" "t-shallow" (str "a claude " shallow "\n"))
-                             "shallow"))))
+          (run {:env env} cli "new" "t-shallow")
+          (spit (str (fs/path home "tasks" "t-shallow" "roles")) (str "a claude " shallow "\n"))
+          (let [r (run {:env env :ok? false} cli "prepare" "t-shallow")]
+            (is (zero? (:exit r)) (str "a shallow source must still prepare: " (:err r)))
+            (is (str/includes? (:err r) "is shallow; its clone copies objects"))
+            (is (fs/directory? (fs/path home "tasks" "t-shallow" "worktrees" "a"))))
+          (testing "and a commit in that worktree merges by bare SHA into a sibling — the thing the old refusal claimed was impossible"
+            (let [wt (str (fs/path home "tasks" "t-shallow" "worktrees" "a"))
+                  clone (str (fs/path home "tasks" "t-shallow" "repos" "shallow"))]
+              (spit (str (fs/path wt "probe.txt")) "x\n")
+              (run {:dir wt} "git" "add" "probe.txt")
+              (run {:dir wt} "git" "commit" "-q" "-m" "probe")
+              (let [sha (str/trim (:out (run {:dir wt} "git" "rev-parse" "--short=10" "HEAD")))
+                    sib (str (fs/path sandbox "sibling"))]
+                (run {:dir clone} "git" "worktree" "add" "-q" "-B" "sk/t/b" sib "HEAD")
+                (is (zero? (:exit (run {:dir sib :ok? false} "git" "merge" "--no-edit" sha))))
+                (is (fs/exists? (fs/path sib "probe.txt"))))))))
       (testing "nothing escaped the sandbox on any rejected declaration"
         (is (not (fs/exists? "/tmp/pwn")))
         (is (not (fs/exists? (fs/path (get env "SWARMKHAZAD_HOME") "x"))))))))

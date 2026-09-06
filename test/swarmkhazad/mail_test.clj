@@ -117,6 +117,12 @@
 (deftest swarm-handoff-queues-a-note-and-refuses-git-handoffs-it-cannot-honour
   (with-task
     (fn [{:keys [dir helper src]}]
+      (testing "`to: all` is every other role — what the last role's broadcast needs"
+        (let [r (helper "a" "swarm_handoff.bb" (draft! dir "all.txt" "type: note\nto: all\npriority: 50\nmessage: hi\n"))]
+          (is (zero? (:exit r)) (:err r))
+          (let [h (headers (first (handoffs (fs/path dir "mail" "a" "outbox"))))]
+            (is (= "b,c" (get h "to")) "every declared role except the sender, in declaration order")))
+        (doseq [f (handoffs (fs/path dir "mail" "a" "outbox"))] (fs/delete f)))
       (testing "a valid note lands in the sender's outbox with the generated headers, and the draft is consumed"
         (let [draft (draft! dir "n1.txt" "type: note\nto: b,c\npriority: 07\nmessage: hello there\n")
               r (helper "a" "swarm_handoff.bb" draft)]

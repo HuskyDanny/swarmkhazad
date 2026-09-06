@@ -69,7 +69,13 @@
 
 (defn validate-recipients [ctx sender to]
   ;; -1 keeps trailing empties, so `to: b,` is an empty recipient, not a quiet `b`.
-  (let [recipients (if (str/blank? to) [] (mapv str/trim (str/split to #"," -1)))]
+  ;; `to: all` is every other role — the shape the last role's terminal broadcast
+  ;; needs, and the one a role reaches for first (the live fixture's run role
+  ;; wrote it and was refused, then had to list its siblings by hand).
+  (let [recipients (cond
+                     (str/blank? to) []
+                     (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/role-names ctx)))
+                     :else (mapv str/trim (str/split to #"," -1)))]
     [recipients
      (cond-> []
        (str/blank? to) (conj "Missing required header 'to'.")
@@ -139,7 +145,7 @@
         (do (Thread/sleep 1) (recur))
         s))))
 
-(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base]}]
+(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet]}]
   (let [out (handoff-lib/outbox-dir ctx sender)
         stamp (fresh-stamp out sender)
         type (get headers "type")
@@ -158,6 +164,7 @@
             (= type "git_handoff") (assoc "role" sender "commit" commit "artifacts" (str/join "," artifacts))
             (and (= type "git_handoff") base) (assoc "task_base_commit" base)
             non-forwarding? (assoc "non-forwarding" "true")
+            (seq unmet) (assoc "unmet" (str/join "; " unmet))
             (= type "note") (assoc "message" (get headers "message")))]
     (fs/create-dirs (fs/path out "tmp"))
     (spit (str tmp) (handoff-lib/render-message h (body-text type sender commit (get headers "message"))))
@@ -180,6 +187,15 @@
       (cond
         (nil? v)
         (exit! 1 (str "No goal-judge verdict yet for role " sender ". End your turn so the Stop hook grades your work; hand off after it says met."))
+        ;; The budget is the escape hatch. The judge has told this role the same
+        ;; thing max-blocks times and it still cannot meet the bar; refusing
+        ;; forever would wedge the whole task on one role, which is worse than
+        ;; forwarding work that says plainly what is unfinished. Never silent:
+        ;; the unmet items ride on the handoff and are already in escalation.md.
+        (and (not (:met v)) (:exhausted v))
+        (binding [*out* *err*]
+          (println (str "Goal judge still says unmet for role " sender " after " (count (:unmet v))
+                        " item(s), but its block budget is spent — forwarding, with the gap named on the handoff.")))
         (not (:met v))
         (exit! 1 (str "Goal judge says unmet for role " sender ": " (str/join "; " (:unmet v))
                       ". A git_handoff is refused until the verdict is met. Address the items, end your turn to be re-graded, or write the block to escalation.md."))))))
@@ -231,8 +247,12 @@
           (exit! 1 (str "Result commit " commit " changes no files" (when base (str " since task base " base)) "; commit your work first.")))
         (when-let [dup (and git? (duplicate-active ctx sender recipients commit))]
           (exit! 1 (str "Duplicate active handoff for the same from/to/commit: " dup)))
-        (let [final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
-                                         :commit commit :artifacts artifacts :base base
+        (let [verdict (when git? (judge-verdict ctx sender))
+              ;; Forwarded past a spent budget: the recipient reads what is
+              ;; unfinished on the handoff itself, not only in a file.
+              unmet (when (and verdict (not (:met verdict)) (:exhausted verdict)) (:unmet verdict))
+              final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
+                                         :commit commit :artifacts artifacts :base base :unmet unmet
                                          :non-forwarding? (and git? (handoff-lib/last-role? ctx sender))})]
           (fs/delete draft)
           (println "HANDOFF QUEUED:" (str final))

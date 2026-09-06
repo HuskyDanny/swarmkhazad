@@ -95,6 +95,12 @@
               (is (str/includes? body "run 1"))
               (is (str/includes? body "<span class=\"status unmet\">exit 7") "a non-zero measure reads as unmet, not met")
               (is (str/includes? body "EVIDENCE-FAILED")))
+            (testing "a background open that died is surfaced, not left in a log nobody reads"
+              (write! (fs/path dir "state" "portal-open.log") "swarmkhazad: role a: repo /nope is not a git checkout\n")
+              (let [b (:body (request env :get (str "/tasks/" id)))]
+                (is (str/includes? b "the swarm never started"))
+                (is (str/includes? b "/nope is not a git checkout")))
+              (fs/delete (fs/path dir "state" "portal-open.log")))
             (testing "attention lists everything a human must see"
               (is (str/includes? body "needs Allen"))
               (is (str/includes? body "mail/run/failed/50_x_from_run_to_nobody.handoff"))
