@@ -11,9 +11,12 @@
 
 (def usage-text
   (str "Usage:\n"
-       "  swarmkhazad new <task-id> [--repo <path>]...   scaffold goal.md, metrics.md, roles\n"
+       "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]\n"
+       "                                                 scaffold goal.md, metrics.md, roles\n"
        "  swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
+       "  swarmkhazad open --linear <KEY> [--repo <path>]...\n"
+       "                                                 scaffold from a Linear issue, then open\n"
        "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"
@@ -36,17 +39,32 @@
        "## Quantitative\n- <metric> — bar: <threshold> — measure: `<command>`\n\n"
        "## Qualitative\n- <property> — bar: <what passing looks like> — judged by: Allen\n"))
 
-(defn new! [task-id args]
-  (let [repos (->> (partition 2 1 (cons nil args))
-                   (keep (fn [[flag value]] (when (= flag "--repo") value))))
+(defn flag-values [args flag]
+  (->> (partition 2 1 (cons nil args))
+       (keep (fn [[f value]] (when (= f flag) value)))))
+
+(defn new!
+  "Scaffold a task folder. With --linear <KEY> the goal comes from the issue
+   instead of the template, and `roles` is one implement role."
+  [task-id args]
+  (let [repos (flag-values args "--repo")
+        issue-key (first (flag-values args "--linear"))
         ctx (task-lib/task-ctx task-id)]
     (when (fs/exists? (:task-dir ctx))
       (task-lib/fail! (str "task already exists: " (:task-dir ctx))))
-    (fs/create-dirs (:task-dir ctx))
-    (spit (str (:goal-file ctx)) (goal-template task-id))
-    (spit (str (:metrics-file ctx)) (metrics-template task-id))
-    (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
-    (println (str (:task-dir ctx)))))
+    ;; Fetch before creating anything: a fetch that fails must leave no folder
+    ;; behind, or the retry hits "task already exists" on a template goal.
+    (let [issue (when issue-key
+                  (load-file (str (fs/path script-dir "linear_intake.bb")))
+                  ((resolve 'linear-intake/fetch-issue) issue-key))]
+      (fs/create-dirs (:task-dir ctx))
+      (spit (str (:metrics-file ctx)) (metrics-template task-id))
+      (if issue
+        (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos)
+            (println (str "linear: " (:identifier issue) " " (:title issue))))
+        (do (spit (str (:goal-file ctx)) (goal-template task-id))
+            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))))
+      (println (str (:task-dir ctx))))))
 
 (defn prepare! [task-id]
   (let [result (task-lib/prepare! (task-lib/task-ctx task-id))]
@@ -67,6 +85,22 @@
     (doseq [{:keys [role harness model worktree-path]} (:roles ctx)]
       (println (str "  " (task-lib/session-name role) "  " harness " model=" model "  " worktree-path)))
     (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>"))))
+
+(defn open-cmd!
+  "`open <task-id>`, or `open --linear <KEY> [--repo <path>]...`, which scaffolds
+   the task from the issue first — the task id is the key, lowercased, unless one
+   is given. An existing task folder is opened as it stands: intake never
+   overwrites a goal someone has already edited."
+  [args]
+  (let [issue-key (first (flag-values args "--linear"))
+        named (first (remove #(str/starts-with? % "-") args))
+        task-id (or named (when issue-key
+                            (load-file (str (fs/path script-dir "linear_intake.bb")))
+                            ((resolve 'linear-intake/task-id-for) issue-key)))]
+    (when-not task-id (usage!))
+    (when (and issue-key (not (fs/exists? (:task-dir (task-lib/task-ctx task-id)))))
+      (new! task-id args))
+    (open! task-id)))
 
 (defn close! [task-id]
   (swarm-lib/close! task-id)
@@ -89,7 +123,7 @@
     (case (first args)
       "new" (if (second args) (new! (second args) (drop 2 args)) (usage!))
       "prepare" (if (second args) (prepare! (second args)) (usage!))
-      "open" (if (second args) (open! (second args)) (usage!))
+      "open" (open-cmd! (rest args))
       "close" (if (second args) (close! (second args)) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))

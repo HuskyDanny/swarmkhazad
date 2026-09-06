@@ -43,9 +43,12 @@ The clone is pinned to the source checkout's `origin/<default>` at open time (`o
 ## Commands
 
 ```
-swarmkhazad new <task-id> [--repo <path>]...   scaffold goal.md, metrics.md, roles
+swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]
+                                               scaffold goal.md, metrics.md, roles
 swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv — no agents yet
 swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
+swarmkhazad open --linear <KEY> [--repo <path>]...
+                                               scaffold from a Linear issue, then open
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
 swarmkhazad paths <task-id>                    print the path map
 swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
@@ -88,6 +91,12 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 - `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
 - `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
 - `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`allowed-doc?`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
+
+## Intake from Linear
+
+`swarmkhazad open --linear MITH-3437` (or `new --linear`) writes the task from the issue: the title becomes the heading, each acceptance or "Done when" line becomes one unticked `Goal` checkbox, the description is kept whole under `## From the issue`, the issue URL is the first Hint, and `roles` is one `implement` role (one per `--repo`, else `none`). `Not-goal` is left for the operator — intake never invents one. With no task id given, the id is the issue key lowercased.
+
+The fetch is a headless `claude -p` with exactly one MCP server and exactly one tool (`mcp__linear-server__get_issue`), schema-forced to `{found, identifier, title, description, url, state, acceptance}`. There is no Linear API key of our own and no second auth path: the operator's own Linear MCP config is the credential. A fetch that does not return the issue — missing, forbidden, the wrong issue, a dead server — fails before the task folder is created, so a retry is not blocked by a half-scaffolded task. An existing task folder is opened as it stands; intake never overwrites a goal someone has edited.
 
 ## Telemetry
 
