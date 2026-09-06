@@ -81,8 +81,8 @@
 
 (defn working-state [ctx role worktree last-message]
   (let [draft (fs/path (:task-dir ctx) (str "draft-" role ".md"))
-        evidence (when (fs/directory? (fs/path (:task-dir ctx) "evidence"))
-                   (->> (fs/list-dir (fs/path (:task-dir ctx) "evidence")) (filter fs/regular-file?) (sort-by str)))]
+        evidence (when (fs/directory? (:evidence-dir ctx))
+                   (->> (fs/list-dir (:evidence-dir ctx)) (filter fs/regular-file?) (sort-by str)))]
     (str "role: " role "\n\n"
          (or (git-state worktree) "### repo\n(this role has no repo)\n") "\n"
          (if (fs/regular-file? draft)

@@ -153,7 +153,7 @@
         (testing "the three bullet files exist and are empty; only the dirs this stage fills exist"
           (doseq [f ["decision.md" "gotcha.md" "escalation.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
-          (is (= #{"decision.md" "escalation.md" "goal.md" "gotcha.md" "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
+          (is (= #{"decision.md" "escalation.md" "evidence" "goal.md" "gotcha.md" "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
                  (set (map fs/file-name (fs/list-dir dir))))))
         (testing "nothing under the source checkout changed"
           (is (= before (snapshot src)))
