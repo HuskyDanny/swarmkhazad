@@ -67,7 +67,8 @@
       {:headers headers :errors errors})))
 
 (defn validate-recipients [ctx sender to]
-  (let [recipients (if (str/blank? to) [] (mapv str/trim (str/split to #",")))]
+  ;; -1 keeps trailing empties, so `to: b,` is an empty recipient, not a quiet `b`.
+  (let [recipients (if (str/blank? to) [] (mapv str/trim (str/split to #"," -1)))]
     [recipients
      (cond-> []
        (str/blank? to) (conj "Missing required header 'to'.")
