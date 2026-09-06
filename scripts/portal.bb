@@ -132,6 +132,16 @@
 (defn roles [ctx]
   (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
 
+(defn pane-state
+  "Whether the pane the rail shows is a running tmux session, the capture taken
+   when the task closed, or nothing yet. A closed task still has a terminal to
+   read — that is the whole point of archiving it at close."
+  [ctx role]
+  (cond
+    (not-empty (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))) :live
+    (text (fs/path (:sessions-dir ctx) role "pane.txt")) :archived
+    :else :none))
+
 (defn pane-text
   "The live pane when the task's tmux server is up, else the archived capture."
   [ctx role]
@@ -313,6 +323,19 @@
      border-radius:10px;padding:.6rem 1.2rem;cursor:pointer;white-space:nowrap;flex:none}
    .err{color:var(--red);font-size:.9rem;margin:0 0 .5rem}
    .empty{color:var(--muted);font-size:.9rem;padding:.6rem 0}
+   main.wide{max-width:1560px}
+   .split{display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,600px);gap:1.6rem;
+     align-items:start}
+   .rail{position:sticky;top:1.4rem}
+   .tabs{display:flex;gap:.3rem;margin-bottom:.5rem;flex-wrap:wrap}
+   .tab{font-size:.82rem;color:var(--muted);text-decoration:none;padding:.28rem .7rem;
+     border:1px solid var(--line);border-radius:999px;white-space:nowrap}
+   .tab.on{color:var(--ink);background:var(--row);border-color:var(--row)}
+   .railhead{display:flex;align-items:baseline;gap:.75rem;margin-bottom:.35rem}
+   .railhead .status{flex:1;min-width:0}
+   .rail pre{margin:0;max-height:72vh;min-height:320px}
+   @media(max-width:1100px){.split{grid-template-columns:minmax(0,1fr)}
+     .rail{position:static;margin-top:1.6rem}}
    .project{margin:0 0 2.4rem}
    .project-head{display:flex;align-items:baseline;gap:.75rem;margin:0 0 .7rem}
    .pname{font-size:1.05rem;font-weight:600;color:var(--ink);margin:0;letter-spacing:-.01em}
@@ -353,11 +376,26 @@
    .card-top{display:flex;align-items:center;justify-content:space-between}
    .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}")
 
+(def poll-script
+  "Two loops. The pane is appended to every two seconds and keeps its scroll
+   unless the reader had it at the bottom; the detail column is re-fetched every
+   five and swapped whole. They never touch each other's DOM, which is why the
+   terminal survives a page that is still live."
+  (str "const P=()=>document.getElementById('pane');"
+       "setInterval(async()=>{const p=P();if(!p)return;"
+       "const r=await fetch('/tasks/'+encodeURIComponent(p.dataset.task)+'/roles/'+encodeURIComponent(p.dataset.role)+'/pane');"
+       "if(!r.ok)return;const stick=p.scrollTop+p.clientHeight>=p.scrollHeight-8;"
+       "p.textContent=await r.text();if(stick)p.scrollTop=p.scrollHeight;},2000);"
+       "setInterval(async()=>{const d=document.getElementById('detail');if(!d)return;"
+       "const r=await fetch(location.href);if(!r.ok)return;"
+       "const n=new DOMParser().parseFromString(await r.text(),'text/html').getElementById('detail');"
+       "if(n)d.replaceWith(n);},5000);"))
+
 (defn page
   "One shell: an accent mark, the product name linking home, and a crumb —
    no nav bar, because there are only three kinds of page. The composer is a
    plain child; being position:fixed it needs no help from here."
-  [{:keys [crumb title refresh]} & body]
+  [{:keys [crumb title refresh rail wide poll]} & body]
   (str "<!doctype html>"
        (h/html [:html [:head [:meta {:charset "utf-8"}]
                        [:meta {:name "viewport" :content "width=device-width,initial-scale=1"}]
@@ -365,10 +403,13 @@
                        [:title (str title " · swarmkhazad")]
                        [:style (h/raw css)]]
                 [:body
-                 [:main
+                 [:main {:class (when wide "wide")}
                   [:h1.title [:span.mark "✳"] [:a {:href "/"} "swarmkhazad"]
                    (when crumb [:span.sub crumb])]
-                  body]]])))
+                  (if rail
+                    [:div.split [:div#detail body] rail]
+                    body)]
+                 (when poll [:script (h/raw poll-script)])]])))
 
 (defn html [status & body] {:status status :headers {"Content-Type" "text/html; charset=utf-8"} :body (apply str body)})
 (defn plain [status s] {:status status :headers {"Content-Type" "text/plain; charset=utf-8"} :body (str s)})
@@ -526,9 +567,38 @@
              (get params "bars")]]]
           [:div.go [:button {:type "submit"} "Open the swarm"]]]]))
 
-(defn task-page [ctx]
+(defn pane-rail
+  "The task's terminal, beside the task. `watching` is a role name; the tabs are
+   plain links carrying it in the query string, so which pane you are on is in
+   the URL and survives a reload rather than living in a variable."
+  [ctx watching]
+  (let [id (:task-id ctx)
+        names (map :role (roles ctx))
+        watching (or (some #{watching} names) (first names))
+        state (when watching (pane-state ctx watching))]
+    [:aside.rail
+     [:div.tabs
+      (for [r names]
+        [:a.tab {:href (str "/tasks/" id "?pane=" r) :class (when (= r watching) "on")} r])]
+     (if-not watching
+       [:p.empty "no roles declared"]
+       (list
+        [:div.railhead
+         [:span.status {:class (case state :live "met" :archived "pending" "unmet")}
+          (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
+         [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
+        [:pre#pane {:data-task id :data-role watching} (pane-text ctx watching)]
+        [:p.muted "attach: " [:code (str "tmux -S " (:tmux-socket ctx) " attach -t " (task-lib/session-name watching))]]))]))
+
+(defn task-page [ctx watching]
   (let [id (:task-id ctx) vs (verdicts ctx) l (lane ctx) att (attention ctx)]
-    (page {:title id :crumb id :refresh 5}
+    (page {:title id :crumb id :wide true
+           ;; No meta refresh here. A full reload every five seconds throws away
+           ;; the terminal's scroll position and any text being selected in it,
+           ;; which is exactly what this page now exists to show. The script at
+           ;; the foot polls the pane and swaps the detail column instead.
+           :rail (pane-rail ctx watching)
+           :poll id}
           [:section
            [:div.row.head
             [:div.grow [:div.name "Board"]
@@ -643,7 +713,9 @@
              (html 400 (new-task-page project (:error result) params))))
          (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)" uri))]
-       (if-let [ctx (ctx-for id)] (html 200 (task-page ctx)) (not-found)))
+       (if-let [ctx (ctx-for id)]
+         (html 200 (task-page ctx (query-value query-string "pane")))
+         (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)/doc" uri))]
        (let [ctx (ctx-for id) rel (query-value query-string "path")]
          (if-let [f (and ctx (doc-file ctx rel))] (plain 200 (slurp (str f))) (not-found))))

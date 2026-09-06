@@ -89,9 +89,10 @@
             (is (str/includes? (:body r) "harnesses: claude, codex, copilot, grok"))))
         (testing "the task page: checkboxes follow the verdicts, never the file"
           (let [body (:body (request env :get (str "/tasks/" id)))]
-            (is (str/includes? body "http-equiv=\"refresh\""))
-            (is (< (str/index-of body "http-equiv=\"refresh\"") (str/index-of body "<body"))
-                "the refresh meta belongs in <head>; <meta> is not valid flow content inside <main>")
+            (is (not (str/includes? body "http-equiv=\"refresh\""))
+                "no full-page reload: it would throw away the terminal's scroll and selection every 5s")
+            (is (str/includes? body "id=\"detail\"") "the detail column is swapped by the poller instead")
+            (is (str/includes? body "d.replaceWith(n)") "which is what the poller does")
             (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> implement — the route returns 200 <span class=\"status pending\">pending" body)
                 "no verdict names it, and review's met does not carry the line while implement's and run's are unmet → pending, unchecked")
             (is (re-find #"tests green <span class=\"status unmet\">unmet: implement" body))
@@ -157,6 +158,22 @@
           (is (= 404 (:status (request env :get (str "/tasks/" id "/doc") {:query "path=nope.md"}))))
           (fs/create-sym-link (fs/path dir "leak.md") (fs/path sandbox "src" "fixture" "README.md"))
           (is (= 404 (:status (request env :get (str "/tasks/" id "/doc") {:query "path=leak.md"}))) "a symlink out of the folder is outside"))
+        (testing "the pane rail puts the task's terminal beside the task"
+          (let [body (:body (request env :get (str "/tasks/" id)))]
+            (is (str/includes? body "class=\"rail\""))
+            (is (str/includes? body "PANE-MARK") "the pane's content is on the task page, not only on the role page")
+            (is (str/includes? body "data-role=\"implement\" data-task=\"t-portal\"")
+                "and the first role is what it watches by default")
+            (is (str/includes? body (str "class=\"tab on\" href=\"/tasks/" id "?pane=implement\""))
+                "the tabs are links, so which pane you are on lives in the URL")
+            (is (str/includes? body "session closed — archived pane")
+                "a closed task still has a terminal to read back"))
+          (let [body (:body (request env :get (str "/tasks/" id) {:query "pane=run"}))]
+            (is (str/includes? body "data-role=\"run\"") "?pane= picks the role")
+            (is (str/includes? body (str "class=\"tab on\" href=\"/tasks/" id "?pane=run\""))))
+          (let [body (:body (request env :get (str "/tasks/" id) {:query "pane=nobody"}))]
+            (is (str/includes? body "data-role=\"implement\"")
+                "an unknown role in the query falls back to the first, it does not 500 or render an empty rail")))
         (testing "unknown task ids and routes are 404, including traversal in the id"
           (is (= 404 (:status (request env :get "/tasks/nope"))))
           (is (= 404 (:status (request env :get "/tasks/..%2F..%2Fetc"))))
