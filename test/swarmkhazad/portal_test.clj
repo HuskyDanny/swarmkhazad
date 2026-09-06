@@ -59,13 +59,15 @@
       (let [dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles")) (str "implement claude " src " task model=kimi\nrun claude " src " task\nreview claude " src " task\n"))
         (spit (str (fs/path dir "goal.md")) "# t-portal\n\n## Goal\n- [ ] implement — the route returns 200\n- [ ] run — tests green\n- [x] control — already ticked\n\n## Not-goal\n- [ ] not a goal box\n")
-        (spit (str (fs/path dir "metrics.md")) "## Quantitative\n- every role called — bar: each ≥ 1 — measure: `echo x`\n- wall clock — bar: < 30 min — measure: `echo y`\n")
+        (spit (str (fs/path dir "metrics.md")) "## Quantitative\n- every role called — bar: each ≥ 1 — measure: `echo x`\n- wall clock — bar: < 30 min — measure: `echo y`\n- notes only — bar: n/a — measure: `echo z`\n- silent measure — bar: n/a — measure: `echo -n`\n")
         (run {:env env} cli "prepare" id)
         (write! (fs/path dir "state" "judge" "implement.json") "{\"met\":false,\"unmet\":[\"run — tests green\"],\"decision\":\"block\"}")
         (write! (fs/path dir "state" "judge" "run.json") "{\"met\":false,\"unmet\":[\"judge_unavailable\"],\"down\":true}")
         (write! (fs/path dir "state" "judge" "review.json") "{\"met\":true,\"unmet\":[]}")
         (write! (fs/path dir "evidence" "every-role-called.txt") "bar: every role called\ncommand: echo x\nexit: 0\nstarted_at: 2026-09-06T00:00:00Z\n--- output ---\nimplement 1\nrun 1\n")
         (write! (fs/path dir "evidence" "wall-clock.txt") "bar: wall clock\ncommand: echo y\nexit: 7\nstarted_at: 2026-09-06T00:01:00Z\n--- output ---\nEVIDENCE-FAILED\n")
+        (write! (fs/path dir "evidence" "notes-only.txt") "a note the run role wrote by hand\nHAND-WRITTEN-TAIL\n")
+        (write! (fs/path dir "evidence" "silent-measure.txt") "bar: silent measure\ncommand: echo -n\nexit: 0\nstarted_at: 2026-09-06T00:02:00Z\n--- output ---\n")
         (write! (fs/path dir "escalation.md") "- **needs Allen** — a bar cannot be met\n")
         (write! (fs/path dir "gotcha.md") "- **PATH is rebuilt by tmux** — resolve binaries first\n")
         (write! (fs/path dir "mail" "run" "failed" "50_x_from_run_to_nobody.handoff") "id: x\n")
@@ -78,12 +80,15 @@
             (is (str/includes? (:body r) "href=\"/tasks/t-portal\""))
             (is (str/includes? (:body r) "not opened"))
             (is (str/includes? (:body r) "implement, run, review"))
-            (is (re-find #"unmet\">4<" (:body r)) "escalation + failed mail + denials + judge down = 4 attention items")
+            (is (re-find #"unmet\">4 needs you<" (:body r)) "escalation + failed mail + denials + judge down = 4 attention items")
             (is (str/includes? (:body r) "action=\"/tasks\"") "the kickstart form is on the index")
+            (is (str/includes? (:body r) "<details class=\"composer\">") "the composer starts collapsed when there is nothing to report")
             (is (str/includes? (:body r) "harnesses: claude, codex, copilot, grok"))))
         (testing "the task page: checkboxes follow the verdicts, never the file"
           (let [body (:body (request env :get (str "/tasks/" id)))]
             (is (str/includes? body "http-equiv=\"refresh\""))
+            (is (< (str/index-of body "http-equiv=\"refresh\"") (str/index-of body "<body"))
+                "the refresh meta belongs in <head>; <meta> is not valid flow content inside <main>")
             (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> implement — the route returns 200 <span class=\"status pending\">pending" body)
                 "no verdict names it, and review's met does not carry the line while implement's and run's are unmet → pending, unchecked")
             (is (re-find #"tests green <span class=\"status unmet\">unmet: implement" body))
@@ -94,7 +99,13 @@
               (is (str/includes? body "<span class=\"status met\">exit 0"))
               (is (str/includes? body "run 1"))
               (is (str/includes? body "<span class=\"status unmet\">exit 7") "a non-zero measure reads as unmet, not met")
-              (is (str/includes? body "EVIDENCE-FAILED")))
+              (is (str/includes? body "EVIDENCE-FAILED"))
+              (is (str/includes? body "<span class=\"status pending\">no exit recorded")
+                  "an evidence file with no exit header is pending, never a red pill with no number")
+              (is (str/includes? body "HAND-WRITTEN-TAIL")
+                  "and its tail still shows, marker or no marker")
+              (is (not (str/includes? body "<pre></pre>"))
+                  "a measure that printed nothing gets no empty output box"))
             (testing "a background open that died is surfaced, not left in a log nobody reads"
               (write! (fs/path dir "state" "portal-open.log") "swarmkhazad: role a: repo /nope is not a git checkout\n")
               (let [b (:body (request env :get (str "/tasks/" id)))]
@@ -105,7 +116,9 @@
               (is (str/includes? body "needs Allen"))
               (is (str/includes? body "mail/run/failed/50_x_from_run_to_nobody.handoff"))
               (is (str/includes? body "2 tool call(s) denied"))
-              (is (str/includes? body "role run: the goal judge was unavailable")))
+              (is (str/includes? body "role run: the goal judge was unavailable"))
+              (is (str/includes? body "<details class=\"item\">")
+                  "each attention item collapses to one line; the full text stays in the page"))
             (testing "bullets, drafts, role cards"
               (is (str/includes? body "PATH is rebuilt by tmux"))
               (is (str/includes? body "href=\"/tasks/t-portal/doc?path=draft-implement.md\""))
@@ -114,13 +127,16 @@
               (is (str/includes? body "unmet: run — tests green"))
               (is (str/includes? body "PANE-MARK") "the card shows the pane's last line"))))
         (testing "the role page and the pane route serve the archived pane when no server is up"
-          (is (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement"))) "PANE-MARK"))
+          (let [body (:body (request env :get (str "/tasks/" id "/roles/implement")))]
+            (is (str/includes? body "PANE-MARK"))
+            (is (re-find (re-pattern (str "class=\"sub\"><span><a href=\"/tasks/" id "\">" id "</a> · implement")) body)
+                "the crumb links back to the task, which is the only way off the role page"))
           (let [r (request env :get (str "/tasks/" id "/roles/implement/pane"))]
             (is (= 200 (:status r)))
             (is (= "text/plain; charset=utf-8" (get (:headers r) "Content-Type")))
             (is (= "line one\nlast pane line PANE-MARK" (:body r))))
           (is (= 404 (:status (request env :get (str "/tasks/" id "/roles/nobody/pane"))))))
-        (testing "allowed-doc?: inside the task folder, text, never the clones or worktrees or outside"
+        (testing "doc-file: inside the task folder, text, never the clones or worktrees or outside"
           (is (= 200 (:status (request env :get (str "/tasks/" id "/doc") {:query "path=goal.md"}))))
           (is (str/includes? (:body (request env :get (str "/tasks/" id "/doc") {:query "path=draft-implement.md"})) "DRAFT-MARK"))
           (is (= 200 (:status (request env :get (str "/tasks/" id "/doc") {:query "path=state%2Fjudge%2Frun.json"}))))
@@ -154,7 +170,10 @@
       (testing "bad input is a 400 with the form and the reason, and nothing is created"
         (let [r (request env :post "/tasks" {:body "task-id=bad%2Fid&repos=&roles=a+claude+none"})]
           (is (= 400 (:status r)))
-          (is (str/includes? (:body r) "invalid task id")))
+          (is (str/includes? (:body r) "invalid task id"))
+          (is (str/includes? (:body r) "open=\"open\"") "a rejection forces the composer open, or the reason is hidden inside it")
+          (is (str/includes? (:body r) "value=\"bad/id\"") "and keeps the id that was typed")
+          (is (str/includes? (:body r) "a claude none") "and the roles that were typed, not the placeholder three"))
         (let [r (request env :post "/tasks" {:body (str "task-id=" id "&repos=" src "&roles=")})]
           (is (= 400 (:status r)))
           (is (str/includes? (:body r) "declare at least one role")))
