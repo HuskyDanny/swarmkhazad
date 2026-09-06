@@ -4,6 +4,72 @@ A local, goal-driven swarm: SwarmForge's runtime, the `.claude` goal contract, a
 
 One runtime dependency: [Babashka](https://babashka.org) (`bb`). `git` and `tmux` are assumed present.
 
+## Quick start
+
+```bash
+brew install babashka tmux                    # bb is the only runtime dependency
+brew services start victoriametrics           # optional, for telemetry — see the warning below
+git clone https://github.com/HuskyDanny/swarmkhazad && cd swarmkhazad
+
+./swarmkhazad new my-task --repo ~/repos/some-project
+```
+
+That scaffolds `~/.swarmkhazad/tasks/my-task/`. Three files there are yours to write before you open the swarm.
+
+**`goal.md`** — what done means. Every checkbox names the role that owns it:
+
+```markdown
+## Goal
+- [ ] implement — the guest-token route returns { uuid, schema }
+- [ ] review — every Acceptance line is checked against the diff, in draft-review.md
+- [ ] run — the repo's own test command exits 0
+- [ ] the diff stays inside src/api/ and its README
+
+## Not-goal
+- Anything in the database layer — that is a separate ticket.
+
+## Hints
+- /abs/path/to/the/file.ts — where the change goes
+```
+
+The `<role> — ` prefix is load-bearing: the goal judge grades each role against **its own lines plus the lines naming no role**, so a line owned by someone else never blocks a role that cannot act on it. A checkbox with no role prefix belongs to everyone.
+
+**`metrics.md`** — how done is measured. The `run` role executes every `measure:` command verbatim, from its worktree, and writes each result to `evidence/<bar>.txt`:
+
+```markdown
+## Quantitative
+- resolveTenantUuid is gone — bar: no matches — measure: `! rg -q resolveTenantUuid src/api/ && echo gone`
+- repo tests — bar: exits 0 — measure: `bun run test src/api/`
+
+## Qualitative
+- the diff stays inside src/api/ — judged by: Allen
+```
+
+**`roles`** — one line per agent, in pipeline order. The first role gets the opening note; the last one broadcasts to the rest and ends the task:
+
+```
+implement claude ~/repos/some-project task branch=feat/x --model sonnet
+review    claude ~/repos/some-project task --model sonnet
+run       claude ~/repos/some-project task --model haiku
+```
+
+Then run it:
+
+```bash
+./swarmkhazad open my-task        # spawns the swarm and returns; no windows open
+./swarmkhazad portal              # http://127.0.0.1:8765 — watch it work
+./swarmkhazad telemetry my-task   # cost, tokens and sessions per role
+./swarmkhazad close my-task       # archive the panes, stop the daemon
+```
+
+Attach to any role directly: `tmux -S /tmp/swarmkhazad-$USER/my-task.sock attach -t sk-implement`.
+
+### Three things that bite
+
+- **Start VictoriaMetrics before `open`.** An OTLP export to a closed port is dropped, not queued — that task simply has no telemetry, and nothing tells you so.
+- **A `measure:` command must be the repo's own.** `bun test` is Bun's native runner, not your `test` script: pointed at a Vitest suite it fails every file, while `bun run test` passes. Detection gets this right; a hand-written bar can still get it wrong.
+- **Roles run unattended under `bypassPermissions`.** They commit, run your test suite, and can read your other checkouts. Point them at a repo you are willing to have touched.
+
 ## Where things live
 
 Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is written under `~/repos/` or `~/.claude/`.
@@ -73,11 +139,11 @@ Roles report by appending one-line bullets to `decision.md`, `gotcha.md`, `escal
 
 ### The goal judge
 
-The same settings file wires `scripts/goal_judge.bb` on `Stop` — khazad's `GoalJudgeModel` as a hook. When a claude role ends a turn, the hook summarises the role's working state (git status, commits and diff since the pinned base, `draft-<role>.md`, every file under `evidence/`, the last message) and grades it against `goal.md` with a cheap model through the role's own shim environment: `claude -p --model haiku --json-schema {met, unmet}`, thinking off, output bounded, no tools, no MCP. The verdict lands in `state/judge/<role>.json` and drives khazad's `decide_stop`: unmet blocks the stop with the items named (three blocks per session, then the stop is allowed but the verdict stands); met without a git_handoff for the current HEAD blocks once more to ask for it; met and handed off allows; a terminal broadcast in the inbox allows. A judge that fails — process error, timeout, no JSON — yields `met=false, unmet=[judge_unavailable]`: the stop is allowed so an infra fault cannot wedge the role, but nothing passes. `swarm_handoff.bb` refuses a `git_handoff` from a claude role unless the latest verdict says met. Every distinct unmet verdict appends one line to `escalation.md`.
+The same settings file wires `scripts/goal_judge.bb` on `Stop` — khazad's `GoalJudgeModel` as a hook. When a claude role ends a turn, the hook summarises the role's working state (git status, commits and diff since the pinned base, `draft-<role>.md`, every file under `evidence/`, the last message) and grades it against `goal.md` with a cheap model through the role's own shim environment: `claude -p --model haiku --json-schema {met, unmet}`, thinking off, output bounded, no tools, no MCP. A role is graded on **its own goal lines only** — the `- [ ] <role> — <outcome>` prefix decides ownership, lines naming no role belong to everyone, and the rest are handed to the model under a heading saying they are not this role's to grade. Graded whole instead, every role of a multi-role task is unmet until the last one finishes. The verdict lands in `state/judge/<role>.json` and drives khazad's `decide_stop`: unmet blocks the stop with the items named (three blocks per session, then the stop is allowed but the verdict stands); met without a git_handoff for the current HEAD blocks once more to ask for it; met and handed off allows; a terminal broadcast in the inbox allows. A role with nothing in its inbox and an untouched worktree is **idle** and is not graded at all — `open` mails only the first role, so grading the others against a task they were never handed is how a swarm greets itself with a wall of false unmet lines. A judge that fails — process error, timeout, no JSON — yields `met=false, unmet=[judge_unavailable]`: the stop is allowed so an infra fault cannot wedge the role, but nothing passes. `swarm_handoff.bb` refuses a `git_handoff` from a claude role unless the latest verdict says met. Every distinct unmet verdict appends one line to `escalation.md`.
 
 ### Run-stage evidence
 
-The `run` role does not judge; it measures. `run_evidence.bb`, run from its worktree, executes the repo's own test command (detected from the worktree: `package.json` → `npm`/`pnpm`/`yarn`/`bun test`, `bb.edn` → `bb test`, `pyproject.toml` → `pytest`, `go.mod`, `Cargo.toml`, a `Makefile` `test:` target) and every `measure:` command in `metrics.md`'s Quantitative section (`- <name> — bar: <threshold> — measure: \`<command>\``; `<id>` and `<task-id>` in a command become the task id, `<task-dir>` the task folder). Each lands as `evidence/<bar>.txt` with the command, cwd, threshold, start time, duration, exit code and the interleaved output (clipped at 64 KiB; a command past the 20-minute timeout records exit 124). The goal judge reads every file in `evidence/` at each Stop, so a bar is met when its file says so. Local only: `SWARMKHAZAD_RUN_REMOTE` is the seam for a later remote runner and refuses to run while set.
+The `run` role does not judge; it measures. `run_evidence.bb`, run from its worktree, executes the repo's own test command (detected from the worktree: `package.json` → `npm test`, or the lockfile's manager running that same script — `pnpm`/`yarn`/`bun run test`, never `bun test`, which is Bun's own runner and fails a Vitest suite outright; `bb.edn` → `bb test`, `pyproject.toml` → `pytest`, `go.mod`, `Cargo.toml`, a `Makefile` `test:` target) and every `measure:` command in `metrics.md`'s Quantitative section (`- <name> — bar: <threshold> — measure: \`<command>\``; `<id>` and `<task-id>` in a command become the task id, `<task-dir>` the task folder). Each lands as `evidence/<bar>.txt` with the command, cwd, threshold, start time, duration, exit code and the interleaved output (clipped at 64 KiB; a command past the 20-minute timeout records exit 124). The goal judge reads every file in `evidence/` at each Stop, so a bar is met when its file says so. Local only: `SWARMKHAZAD_RUN_REMOTE` is the seam for a later remote runner and refuses to run while set.
 
 `swarmkhazad smoke <task-id>` proves each declared role callable without a swarm: in parallel, it runs each role's shim in print mode with the role's prompt, asking it to read `goal.md`, write a note draft addressed to itself and run `swarm_handoff.bb`; it reports per role the exit code, whether the note reached the outbox, the model the run reported (checked against the vendor's pin — another model is a collision, not a pass), cost and turns. The smoke notes are removed afterwards.
 
@@ -106,11 +172,13 @@ Claude Code's own OpenTelemetry export is the source; the shim turns it on for e
 brew install victoriametrics && brew services start victoriametrics
 ```
 
-Four metrics arrive, dotted, with `task_id` and `role` promoted to labels (VictoriaMetrics promotes OTLP resource attributes by default): `claude_code.cost.usage` (USD), `claude_code.token.usage` (by `type`: input, output, cacheRead, cacheCreation), `claude_code.session.count`, `claude_code.active_time.total`. MetricsQL takes the dotted names verbatim, so the spend bar reads as written:
+Four metrics arrive, dotted, with `task_id` and `role` promoted to labels (VictoriaMetrics promotes OTLP resource attributes by default): `claude_code.cost.usage` (USD), `claude_code.token.usage` (by `type`: input, output, cacheRead, cacheCreation), `claude_code.session.count`, `claude_code.active_time.total`. MetricsQL takes the dotted names verbatim. They are **delta** counters — each sample is the increment since the previous export, so a live series rises and falls — which means a task's total is a sum over a window, never an instant read:
 
 ```
-sum(claude_code.cost.usage{task_id="<id>"})
+sum(sum_over_time(claude_code.cost.usage{task_id="<id>"}[7d]))
 ```
+
+Measured on a three-role task: that form gave $3.01 against the three sessions' own reported $3.03, while an instant `sum(...)` gave $0.40 — one export interval's increment. The window does a second job too: an instant query stops seeing a series five minutes after its last sample, so a finished task read back later reports nothing at all.
 
 Read them back three ways: `swarmkhazad telemetry <task-id>` prints cost, tokens and sessions per role; the portal's task page carries the same numbers in a **Telemetry** section with a link into vmui; and `dashboards/swarmkhazad.json` is a vmui dashboard (spend, tokens, turns and time, each per task and per role) — point vmui at it with `victoria-metrics -vmui.customDashboardsPath=<repo>/dashboards`, then open **Dashboards** at `http://127.0.0.1:8428/vmui/`.
 

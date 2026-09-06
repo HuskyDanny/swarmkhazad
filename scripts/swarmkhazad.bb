@@ -24,7 +24,9 @@
        "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"))
 
 (defn usage! []
-  (binding [*out* *err*] (print usage-text))
+  ;; flush before exit: `print` leaves the text in the buffer and System/exit
+  ;; discards it, so `swarmkhazad` with no arguments printed nothing at all.
+  (binding [*out* *err*] (print usage-text) (flush))
   (System/exit 1))
 
 (defn goal-template [task-id]
