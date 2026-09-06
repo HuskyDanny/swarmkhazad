@@ -1,0 +1,5 @@
+{:paths ["scripts" "test"]
+ :tasks
+ {test {:doc "Run the swarmkhazad test suite (bb test [ns-substring])"
+        :requires ([run-tests])
+        :task (run-tests/-main *command-line-args*)}}}
