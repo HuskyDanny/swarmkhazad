@@ -243,6 +243,26 @@
         (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
           (is (= "block" (:decision (decision r)))))))))
 
+(deftest a-role-is-graded-on-its-own-goal-lines-not-the-whole-task
+  (with-task
+    (fn [{:keys [dir stop!]}]
+      (fs/set-posix-file-permissions (fs/path dir "goal.md") "rw-r--r--")
+      (spit (str (fs/path dir "goal.md"))
+            "# t\n\n## Goal\n- [ ] a — MINE-ONE\n- [ ] b — THEIRS\n- [ ] MINE-SHARED with no role named\n\n## Not-goal\n- none\n")
+      (stop! "a" "{\"met\":false,\"unmet\":[\"MINE-ONE\"]}")
+      (let [prompt (slurp (str (fs/path dir "tmp" "judge-a.argv")))
+            goals (subs prompt (str/index-of prompt "<goals_md>") (str/index-of prompt "</goals_md>"))]
+        (testing "the Goal section carries this role's lines and the unowned one"
+          (is (str/includes? goals "- [ ] a — MINE-ONE"))
+          (is (str/includes? goals "- [ ] MINE-SHARED with no role named")))
+        (testing "another role's line is moved out of the Goal section and labelled"
+          (is (str/includes? goals "## Not yours — other roles own these; do not grade them\n- [ ] b — THEIRS"))
+          (is (< (str/index-of goals "- [ ] a — MINE-ONE") (str/index-of goals "Not yours"))
+              "a role's own lines come first; the others are context after them"))
+        (testing "graded whole, every role of a multi-role task is unmet until the last one finishes"
+          (is (= 1 (count (re-seq #"- \[ \] b — THEIRS" goals)))
+              "b's line appears once, only in the not-yours block"))))))
+
 (deftest the-hook-is-inert-outside-a-role-and-on-other-events
   (let [r (process/sh {:continue true :in "{\"hook_event_name\":\"Stop\"}" :extra-env {"SWARMKHAZAD_TASK_DIR" "" "SWARMFORGE_ROLE" ""}}
                       "bb" (str (fs/path scripts "goal_judge.bb")))]

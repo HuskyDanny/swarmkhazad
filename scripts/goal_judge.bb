@@ -49,8 +49,29 @@
   (str "You are a goal-completion judge for one role of an agent swarm. You are given goal.md — the task's "
        "contract — and a summary of the role's working state: its commits and diff, its draft write-up, and any "
        "measurement evidence. Decide whether EVERY goal and acceptance line that this role is responsible for is "
-       "met by the state as shown. Judge only from the evidence given; a claim in the draft without a matching "
+       "met by the state as shown. A goal.md checkbox reads `- [ ] <role> — <outcome>`; grade ONLY the lines naming "
+       "this role or naming none, and never a line under a heading that says the lines are not this role's. "
+       "Judge only from the evidence given; a claim in the draft without a matching "
        "commit, file or measurement is not met. Be strict and literal. Report through the structured output only."))
+
+(defn goals-for-role
+  "goal.md, with the Goal checkboxes split into this role's and the others'.
+
+   The convention is `- [ ] <role> — <outcome>`, so a three-role task's goal.md
+   names work no single role can do. Graded whole, every role is unmet until the
+   last one finishes — measured on the fixture: implement met all seven of its
+   own lines and was blocked on `run —` and `review —`. A line naming no role
+   belongs to everyone."
+  [goals-md role]
+  (let [lines (str/split-lines (or goals-md ""))
+        box? #(re-matches #"\s*- \[[ xX]\]\s*.*" %)
+        mine? (fn [l] (let [[_ named] (re-matches #"\s*- \[[ xX]\]\s*([A-Za-z0-9][A-Za-z0-9.-]*)\s+—.*" l)]
+                        (or (nil? named) (= named role))))
+        [mine others] [(filter #(and (box? %) (mine? %)) lines)
+                       (filter #(and (box? %) (not (mine? %))) lines)]]
+    {:mine (vec mine)
+     :others (vec others)
+     :whole (str/join "\n" (remove #(and (box? %) (not (mine? %))) lines))}))
 
 (defn clip [s]
   (let [s (str s)]
@@ -215,7 +236,12 @@
           row (task-lib/role-row ctx role)
           worktree (when (:repo row) (:worktree-path row))
           session-id (or (get input "session_id") "unknown")
-          goals (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
+          goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
+          split (goals-for-role goals-md role)
+          goals (str (:whole split)
+                     (when (seq (:others split))
+                       (str "\n\n## Not yours — other roles own these; do not grade them\n"
+                            (str/join "\n" (:others split)) "\n")))
           previous (read-json (verdict-file ctx role))
           idle (idle? ctx role worktree)
           ;; An idle role is not graded at all: there is nothing to grade, and a
