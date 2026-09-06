@@ -252,15 +252,18 @@
 
 (defn read-roles-tsv
   "roles.tsv → vector of role maps keyed by roles-tsv-columns, in declaration
-   order. A `none` repo reads back as nil so `(when (:repo row) …)` is honest."
+   order. A `none` repo or branch reads back as nil so `(when (:branch row) …)`
+   is honest — the file writes the literal `none` for an absent value, and a
+   reader that skips this sees the string and treats it as a real branch."
   [ctx]
   (let [file (:roles-tsv ctx)]
     (if (fs/regular-file? file)
       (->> (str/split-lines (slurp (str file)))
            (remove str/blank?)
            (mapv (fn [line]
-                   (let [row (zipmap roles-tsv-columns (concat (str/split line #"\t" -1) (repeat "")))]
-                     (update row :repo #(when-not (= "none" %) (not-empty %)))))))
+                   (let [row (zipmap roles-tsv-columns (concat (str/split line #"\t" -1) (repeat "")))
+                         un-none #(when-not (= "none" %) (not-empty %))]
+                     (-> row (update :repo un-none) (update :branch un-none))))))
       [])))
 
 (defn role-row [ctx role]
@@ -395,12 +398,17 @@
    clone, so they must agree on the branch it is pinned to."
   [ctx roles]
   (let [with-repo (filter :repo roles)
-        branches (->> with-repo (group-by :repo)
-                      (map (fn [[repo rows]] [repo (distinct (keep :branch rows))])))]
+        ;; Group by the canonical path — ~/x and /abs/x are one clone, so they
+        ;; must be one group or a real disagreement hides between the spellings.
+        ;; And keep the nils: a role that names no branch is asking for the
+        ;; default, which disagrees with a sibling's branch= just as loudly as
+        ;; a second branch name would.
+        branches (->> with-repo (group-by #(str (fs/canonicalize (fs/path (:repo %)))))
+                      (map (fn [[repo rows]] [repo (distinct (map :branch rows))])))]
     (doseq [[repo bs] branches
             :when (> (count bs) 1)]
       (throw (ex-info (format "roles disagree on the branch for %s: %s — one clone cannot be two branches"
-                              repo (str/join ", " (sort bs))) {})))
+                              repo (str/join ", " (sort (map #(or % "<the repo's default>") bs)))) {})))
     (->> branches
          (mapv (fn [[repo bs]] (clone-repo! ctx repo (first bs)))))))
 

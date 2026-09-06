@@ -130,7 +130,13 @@
   (let [prompt-text (str "<goals_md>\n" goals-md "\n</goals_md>\n\n<working_state>\n" state "\n</working_state>")
         p (process/process (judge-argv prompt-text)
                            {:out :string :err :string
-                            :extra-env {"MAX_THINKING_TOKENS" "0" "CLAUDE_CODE_MAX_OUTPUT_TOKENS" "600"}})
+                            :extra-env {"MAX_THINKING_TOKENS" "0" "CLAUDE_CODE_MAX_OUTPUT_TOKENS" "600"
+                                        ;; The judge runs through the role's shim and would otherwise
+                                        ;; export its own spend and session count under the role's own
+                                        ;; labels — measured on the fixture, where three roles reported
+                                        ;; 5, 4 and 3 sessions for one session each plus their gradings.
+                                        "OTEL_RESOURCE_ATTRIBUTES" (str "task_id=" (System/getenv "SWARMKHAZAD_TASK_ID")
+                                                                        ",role=" (System/getenv "SWARMFORGE_ROLE") "-judge")}})
         done (deref p judge-timeout-ms nil)
         _ (when-not done (process/destroy-tree p))
         result (if done @p {:exit -1 :out "" :err "timed out"})
@@ -180,6 +186,16 @@
                  (concat (handoff-lib/in-process-files ctx role)
                          (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role))))))
 
+(defn base-ref
+  "The ref a role's work is counted against. `origin/HEAD` is the usual answer,
+   but a source checkout with no upstream has its origin removed at clone time,
+   and then origin/HEAD does not exist at all — fall back to the clone's own
+   default branch, which every worktree branched from."
+  [worktree]
+  (let [ok? (fn [r] (zero? (:exit (process/sh {:continue true :dir (str worktree)}
+                                              "git" "rev-parse" "--verify" "--quiet" r))))]
+    (first (filter ok? ["origin/HEAD" "main" "master"]))))
+
 (defn untouched?
   "The worktree holds no work: nothing committed past the clone's base and
    nothing uncommitted. A failure to answer counts as touched — never claim a
@@ -187,10 +203,12 @@
   [worktree]
   (if (nil? worktree)
     true
-    (let [count (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" "origin/HEAD..HEAD")
-          dirty (process/sh {:continue true :dir (str worktree)} "git" "status" "--porcelain")]
-      (and (zero? (:exit count)) (= "0" (str/trim (:out count)))
-           (zero? (:exit dirty)) (str/blank? (:out dirty))))))
+    (if-let [base (base-ref worktree)]
+      (let [count (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" (str base "..HEAD"))
+            dirty (process/sh {:continue true :dir (str worktree)} "git" "status" "--porcelain")]
+        (and (zero? (:exit count)) (= "0" (str/trim (:out count)))
+             (zero? (:exit dirty)) (str/blank? (:out dirty))))
+      false)))
 
 (defn idle?
   "The role has never had work: no mail has ever reached it and its worktree is
@@ -199,8 +217,14 @@
    greets itself with a wall of false unmet lines."
   [ctx role worktree]
   (and (empty? (handoff-lib/in-process-files ctx role))
+       ;; inbox/new too: handoffd delivers there first, so mail the role has not
+       ;; accepted yet is still mail. Without this, a role whose turn ended
+       ;; between delivery and ready_for_next is told "nothing has reached your
+       ;; inbox" while a handoff — a terminal broadcast, even — sits in it.
+       (empty? (handoff-lib/handoff-files (handoff-lib/new-dir ctx role)))
        (empty? (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role)))
        (empty? (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role)))
+       (empty? (handoff-lib/handoff-files (fs/path (handoff-lib/mail-dir ctx role) "sent")))
        (untouched? worktree)))
 
 (defn decide

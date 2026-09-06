@@ -247,12 +247,36 @@
         (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
           (is (= "block" (:decision (decision r))))
           (is (str/includes? (:reason (decision r)) "goals unmet: GOAL-X"))))
-      (testing "a role that has committed is never idle, even with an empty inbox"
-        (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "a") "add" "x.txt")
-        (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
-        (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
-          (is (= "block" (:decision (decision r)))))))))
+      (testing "mail delivered but not yet accepted is still mail — handoffd writes to inbox/new first"
+        (write! (fs/path dir "mail" "b" "inbox" "new" "50_y_from_a_to_b.handoff")
+                "id: y\nfrom: a\nto: b\npriority: 50\ntype: git_handoff\ncommit: 0000000000\nnon-forwarding: true\n\nmerge me\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-new"})]
+          (is (= "block" (:decision (decision r)))
+              "otherwise a terminal broadcast can sit undelivered while its recipient is told nothing has arrived")))
+      (testing "a role with an empty inbox that has COMMITTED is graded — the worktree half of idle?"
+        ;; b, not a: a's fixture seeds mail, so a would be non-idle for that
+        ;; reason alone and this case would pass with untouched? deleted.
+        (doseq [f (concat (fs/glob (fs/path dir "mail" "b" "inbox" "new") "*.handoff")
+                          (fs/glob (fs/path dir "mail" "b" "inbox" "in_process") "*.handoff"))]
+          (fs/delete f))
+        (write! (fs/path dir "worktrees" "b" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "b") "add" "x.txt")
+        (git (fs/path dir "worktrees" "b") "commit" "-q" "-m" "x")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-commit"})]
+          (is (= "block" (:decision (decision r))))
+          (is (not (:idle (verdict-file dir "b"))))))
+      (testing "an uncommitted change also counts as touched"
+        (git (fs/path dir "worktrees" "b") "reset" "-q" "--hard" "HEAD~1")
+        (write! (fs/path dir "worktrees" "b" "dirty.txt") "d\n")
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-dirty"})]
+          (is (= "block" (:decision (decision r))))
+          (is (not (:idle (verdict-file dir "b"))))))
+      (testing "a git that cannot answer counts as touched, never as idle"
+        (fs/delete-tree (fs/path dir "worktrees" "b" "dirty.txt"))
+        (fs/delete-if-exists (fs/path dir "worktrees" "b" ".git"))
+        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-broken"})]
+          (is (= "block" (:decision (decision r)))
+              "a broken worktree must be graded, not silently excused as having no task"))))))
 
 (deftest a-role-is-graded-on-its-own-goal-lines-not-the-whole-task
   (with-task

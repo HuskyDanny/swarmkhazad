@@ -93,7 +93,15 @@
    overwrites a goal someone has already edited."
   [args]
   (let [issue-key (first (flag-values args "--linear"))
-        named (first (remove #(str/starts-with? % "-") args))
+        ;; A flag's VALUE is not the task id. Dropping every `--flag value` pair
+        ;; first is the difference between `open --linear MITH-3437` scaffolding
+        ;; `mith-3437` and scaffolding a task literally named `MITH-3437`.
+        positional (loop [[a & more :as all] (vec args) out []]
+                     (cond
+                       (empty? all) out
+                       (str/starts-with? a "-") (recur (rest more) out)
+                       :else (recur more (conj out a))))
+        named (first positional)
         task-id (or named (when issue-key
                             (load-file (str (fs/path script-dir "linear_intake.bb")))
                             ((resolve 'linear-intake/task-id-for) issue-key)))]

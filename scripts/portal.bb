@@ -111,13 +111,19 @@
                  (->> (fs/glob (:mail-dir ctx) "*/failed/*.handoff") (map #(str (fs/relativize (:task-dir ctx) %)))))
         denials (count (nonblank-lines (text (fs/path (:state-dir ctx) "denials.jsonl"))))
         down (for [[role v] (verdicts ctx) :when (:down v)] role)
-        dead (and (opened? ctx) (false? (daemon-alive? ctx)))]
+        dead (and (opened? ctx) (false? (daemon-alive? ctx)))
+        ;; kickstart runs `open` in the background; when it dies, its output is
+        ;; the only record, and nothing rendered it. A task that never reached a
+        ;; tmux socket but left a log is a failed open, not a quiet one.
+        open-log (when-not (opened? ctx) (text (fs/path (:state-dir ctx) "portal-open.log")))]
     (vec (concat
           (map (fn [l] {:kind "escalation" :text (str/replace l #"^- " "")}) esc)
           (map (fn [f] {:kind "failed mail" :text f}) failed)
           (when (pos? denials) [{:kind "denials" :text (str denials " tool call(s) denied by the contract hook — state/denials.jsonl")}])
           (map (fn [r] {:kind "judge down" :text (str "role " r ": the goal judge was unavailable at its last stop")}) down)
-          (when dead [{:kind "daemon" :text "handoffd is not running; mail is not being delivered"}])))))
+          (when dead [{:kind "daemon" :text "handoffd is not running; mail is not being delivered"}])
+          (when-not (str/blank? open-log)
+            [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
 
 (defn roles [ctx]
   (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
