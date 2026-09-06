@@ -6,6 +6,10 @@
 - Scratch and handoff drafts go under the task folder's `tmp/`. Never write under the human's `~/repos`; your worktree is the only repo you touch.
 - Do not ask questions in this pane. Nobody is reading it live. Decide, record the assumption in `decision.md`, and continue; if you truly cannot proceed, write the block to `escalation.md` and hand off what you have.
 
+## The judge
+
+- Every time you end a turn, a goal judge grades your working state (commits, diff, `draft-<role>.md`, `evidence/`) against goal.md. If it finds goals unmet it tells you which and keeps your turn open: address them, then stop again. If it finds them met but you have not queued a git_handoff for your current HEAD, it asks for that. A `git_handoff` is refused until the latest verdict says met. What you cannot meet goes to `escalation.md`; the judge writes its own line there too.
+
 ## Mail
 
 - When a wake-up arrives, or when you start, run `ready_for_next.bb`. `NO_TASK` means stop and wait. `TASK: <path>` means the printed `PAYLOAD` is your work; a `git_handoff` has already been merged into your worktree. `BATCH:` lists several items to treat as one unit.

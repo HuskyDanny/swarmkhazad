@@ -8,6 +8,23 @@
 set -u
 T="$SWARMKHAZAD_TASK_DIR"
 R="$SWARMFORGE_ROLE"
+
+# `--json-schema` = the goal judge asking for a verdict (a nested call from inside
+# the role's own session, so it must not overwrite the launch record below).
+# SWARMKHAZAD_STUB_VERDICT is the JSON to return as structured_output; `down`
+# makes the judge fail.
+if printf ' %s ' "$@" | grep -q ' --json-schema '; then
+  case "${SWARMKHAZAD_STUB_VERDICT:-}" in
+    down) echo "stub judge is down" >&2; exit 1 ;;
+    garbage) echo "not json at all"; exit 0 ;;
+    "") verdict='{"met":true,"unmet":[]}' ;;
+    *) verdict="$SWARMKHAZAD_STUB_VERDICT" ;;
+  esac
+  printf '%s\n' "$@" > "$T/tmp/judge-$R.argv"
+  printf '{"type":"result","is_error":false,"num_turns":1,"total_cost_usd":0.02,"structured_output":%s,"modelUsage":{"claude-haiku-stub":{}}}\n' "$verdict"
+  exit 0
+fi
+
 printf '%s\n' "$@" > "$T/tmp/launch-$R.argv"
 env | grep -E '^(ANTHROPIC_|OTEL_|CLAUDE_CODE_|API_TIMEOUT)' | sort > "$T/tmp/launch-$R.env"
 
@@ -39,6 +56,9 @@ case "$R" in
     echo "from a" > a.txt && git add a.txt && git commit -q -m "a: add a.txt
 
 By a." || exit 1
+    # A real role reaches this point by ending its turn: the Stop hook grades it and
+    # writes the verdict a git_handoff needs. Play that turn end here.
+    printf '{"hook_event_name":"Stop","session_id":"stub-a","stop_hook_active":false}' | goal_judge.bb > "$T/tmp/a-judge.txt" 2>&1
     printf 'type: git_handoff\nto: b\npriority: 50\n' > "$T/tmp/a-draft.txt"
     swarm_handoff.bb "$T/tmp/a-draft.txt" > "$T/tmp/a-handoff.txt" 2>&1 || { cat "$T/tmp/a-handoff.txt" >&2; exit 1; }
     ;;
@@ -48,6 +68,7 @@ By a." || exit 1
     echo "from b" > b.txt && git add b.txt && git commit -q -m "b: add b.txt
 
 By b." || exit 1
+    printf '{"hook_event_name":"Stop","session_id":"stub-b","stop_hook_active":false}' | goal_judge.bb > "$T/tmp/b-judge.txt" 2>&1
     printf 'type: git_handoff\nto: a\npriority: 50\n' > "$T/tmp/b-draft.txt"
     swarm_handoff.bb "$T/tmp/b-draft.txt" > "$T/tmp/b-handoff.txt" 2>&1 || { cat "$T/tmp/b-handoff.txt" >&2; exit 1; }
     ;;

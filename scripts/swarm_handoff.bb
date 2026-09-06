@@ -20,6 +20,7 @@
 (ns swarm-handoff
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
+            [cheshire.core]
             [clojure.string :as str]))
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
@@ -163,6 +164,26 @@
     (fs/move tmp final)
     final))
 
+;; ---------------------------------------------------------------- judge gate
+
+(defn judge-verdict [ctx sender]
+  (let [f (fs/path (:state-dir ctx) "judge" (str sender ".json"))]
+    (when (fs/regular-file? f)
+      (try (cheshire.core/parse-string (slurp (str f)) true) (catch Exception _ nil)))))
+
+(defn require-met-verdict!
+  "A git_handoff needs the goal judge's latest verdict for this role to say met.
+   Only claude roles have the Stop hook that produces one; other harnesses pass."
+  [ctx row sender]
+  (when (= "claude" (:harness row))
+    (let [v (judge-verdict ctx sender)]
+      (cond
+        (nil? v)
+        (exit! 1 (str "No goal-judge verdict yet for role " sender ". End your turn so the Stop hook grades your work; hand off after it says met."))
+        (not (:met v))
+        (exit! 1 (str "Goal judge says unmet for role " sender ": " (str/join "; " (:unmet v))
+                      ". A git_handoff is refused until the verdict is met. Address the items, end your turn to be re-graded, or write the block to escalation.md."))))))
+
 (defn complete-current! [ctx sender]
   (when (seq (in-process-files ctx sender))
     (let [result (process/sh {:continue true} "bb" (str (fs/path script-dir "done_with_current.bb")))]
@@ -200,6 +221,7 @@
                 (exit! 1 (str "Role " sender " has no repo; it can send notes, not git handoffs.")))
             _ (when (and git? (inbound-non-forwarding? ctx sender))
                 (exit! 1 "Current inbound handoff is non-forwarding (terminal); merge it and run done_with_current.bb, do not send a git_handoff."))
+            _ (when git? (require-met-verdict! ctx row sender))
             commit (when git? (git worktree "rev-parse" "--short=10" "HEAD"))
             base (when git? (task-base ctx sender))
             files (when git? (changed-files worktree base commit))

@@ -186,12 +186,16 @@
     (when (fs/exists? f)
       (fs/set-posix-file-permissions f "r--r--r--"))))
 
+(def goal-judge (str (fs/path script-dir "goal_judge.bb")))
+
 (def hook-settings
   "The settings a claude role loads via --settings: the contract hook on
-   SessionStart (startup, resume, compact) and on every file or shell tool."
+   SessionStart (startup, resume, compact) and on every file or shell tool, and
+   the goal judge on Stop."
   {:hooks {:SessionStart [{:hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :PreToolUse [{:matcher "Edit|Write|MultiEdit|NotebookEdit|Bash"
-                         :hooks [{:type "command" :command contract-hook :timeout 10}]}]}})
+                         :hooks [{:type "command" :command contract-hook :timeout 10}]}]
+           :Stop [{:hooks [{:type "command" :command goal-judge :timeout 180}]}]}})
 
 (defn write-hook-settings! [ctx row]
   (fs/create-dirs (:hooks-dir ctx))
