@@ -442,6 +442,9 @@
      [:div.project-head
       [:h2.pname (:name project)]
       [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
+      (let [idle (project-lib/unused-repos project)]
+        (when (seq idle)
+          [:span.status.unmet "no role opens " (str/join ", " (map task-lib/repo-name idle))]))
       [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
      [:div.scroll
       [:div.swim

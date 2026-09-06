@@ -191,7 +191,14 @@
               "but not the plain directory holding it")
           (is (str/includes? body "name=\"role:implement\"") "and every stage prompt is a role card")
           (is (str/includes? body "checked=\"checked\" name=\"role:implement\"") "with the default lineup ticked")
-          (is (not (str/includes? body "checked=\"checked\" name=\"role:brainstorm\"")) "and nothing else")))
+          (is (not (str/includes? body "checked=\"checked\" name=\"role:brainstorm\"")) "and nothing else")
+          (is (not (str/includes? body "name=\"role:constitution\""))
+              "constitution is the preamble every role carries, not a role")
+          (is (not (str/includes? body "name=\"role:default\""))
+              "and default is the fallback for a role with no prompt of its own")
+          (is (apply < (map #(str/index-of body (str "name=\"role:" % "\""))
+                            ["specifier" "implement" "review" "hardener" "qa"]))
+              "the cards run in pipeline order, because that order becomes the swimlane's columns")))
       (testing "a project is refused without a name, a checkout or a role, and nothing is written"
         (let [r (request env :post "/projects" {:body (str "name=bad%2Fid&repo%3A" src "=on&role%3Aimplement=on")})]
           (is (= 400 (:status r)))
@@ -234,7 +241,18 @@
           (is (str/includes? body "class=\"colname\">run"))
           (is (str/includes? body "class=\"colname\">done") "done is always the last column")
           (is (not (str/includes? body "class=\"colname\">review")) "a role that was not picked is not a column")
-          (is (str/includes? body (str "href=\"/projects/" project "/new\"")) "New task goes to the project's own form")))
+          (is (str/includes? body (str "href=\"/projects/" project "/new\"")) "New task goes to the project's own form")
+          (is (not (str/includes? body "no role opens"))
+              "every checkout in this project has a role in it"))
+        ;; every role card defaults to the first checkout, so ticking three and
+        ;; leaving the cards alone clones two that nobody ever opens.
+        (let [r (request env :post "/projects"
+                         {:body (str "name=p-idle&repo%3A" src "=on&repo%3A" nested "=on"
+                                     "&role%3Aimplement=on&model%3Aimplement=anthropic")})]
+          (is (= 303 (:status r))))
+        (let [body (:body (request env :get "/"))]
+          (is (str/includes? body "no role opens nested")
+              "a checkout no role works in is named on the swimlane, where the mistake was made")))
       (testing "the task form shows the swarm and the checkouts but never asks for them"
         (let [body (:body (request env :get (str "/projects/" project "/new")))]
           (is (str/includes? body "implement (anthropic) in fixture"))

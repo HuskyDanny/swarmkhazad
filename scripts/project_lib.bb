@@ -103,15 +103,32 @@
 
 ;; ---------------------------------------------------------------- role cards
 
+(def not-a-role
+  "Two prompts on disk are not roles. `constitution.prompt` is the preamble
+   every role's prompt carries, and `default.prompt` is what a role with no
+   prompt of its own falls back to. Offering either as a role card invents a
+   role that does no work."
+  #{"constitution" "default"})
+
+(def pipeline-order
+  "The order roles run in, which is the order the cards are shown and therefore
+   the order the swimlane's columns take. Filesystem order would be
+   alphabetical, and `architect, brainstorm, cleaner, hardener…` is not a
+   pipeline. A prompt not listed here is appended alphabetically."
+  ["brainstorm" "specifier" "implement" "refactorer" "cleaner"
+   "review" "architect" "hardener" "run" "qa"])
+
 (defn stage-prompts
   "The stage prompts on disk — the roles a project can be built from. The name
    of the prompt is the name of the role, which is what makes a role card a
    choice rather than a free-text field."
   []
-  (->> (fs/glob (fs/path (fs/parent script-dir) "prompts") "*.prompt")
-       (map #(str/replace (fs/file-name %) #"\.prompt$" ""))
-       sort
-       vec))
+  (let [on-disk (->> (fs/glob (fs/path (fs/parent script-dir) "prompts") "*.prompt")
+                     (map #(str/replace (fs/file-name %) #"\.prompt$" ""))
+                     (remove not-a-role)
+                     set)
+        known (filterv on-disk pipeline-order)]
+    (into known (sort (remove (set pipeline-order) on-disk)))))
 
 (def default-roles
   [{:role "implement" :harness "claude" :model "anthropic"}
