@@ -174,6 +174,31 @@
                (stage-prompt (:role row))))
     file))
 
+;; ---------------------------------------------------------------- hooks
+
+(def contract-hook (str (fs/path script-dir "hooks" "run-contract.sh")))
+
+(defn lock-truth!
+  "goal.md and metrics.md are read-only from the moment a swarm opens. The
+   SessionStart hook repeats this per role; the PreToolUse hook stops the chmod."
+  [ctx]
+  (doseq [f [(:goal-file ctx) (:metrics-file ctx)]]
+    (when (fs/exists? f)
+      (fs/set-posix-file-permissions f "r--r--r--"))))
+
+(def hook-settings
+  "The settings a claude role loads via --settings: the contract hook on
+   SessionStart (startup, resume, compact) and on every file or shell tool."
+  {:hooks {:SessionStart [{:hooks [{:type "command" :command contract-hook :timeout 10}]}]
+           :PreToolUse [{:matcher "Edit|Write|MultiEdit|NotebookEdit|Bash"
+                         :hooks [{:type "command" :command contract-hook :timeout 10}]}]}})
+
+(defn write-hook-settings! [ctx row]
+  (fs/create-dirs (:hooks-dir ctx))
+  (let [file (fs/path (:hooks-dir ctx) (str (:role row) ".settings.json"))]
+    (spit (str file) (json/generate-string hook-settings {:pretty true}))
+    file))
+
 (defn start-text [ctx row]
   (str "You are role " (:role row) " in task " (:task-id ctx) ". Read " (:goal-file ctx) " and " (:metrics-file ctx)
        ", then run ready_for_next.bb and follow its output."))
@@ -201,7 +226,9 @@
      (case (:harness row)
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
-                        ["--append-system-prompt-file" (str prompt) "--permission-mode" "bypassPermissions"]
+                        ["--append-system-prompt-file" (str prompt)
+                         "--settings" (str (write-hook-settings! ctx row))
+                         "--permission-mode" "bypassPermissions"]
                         (when (= mode :interactive) ["-n" name])
                         extra
                         ["--" message])
@@ -304,6 +331,7 @@
     (kill-server! ctx)
     (boot-sessions! ctx roles)
     (write-shims! ctx)
+    (lock-truth! ctx)
     (trust-worktrees! ctx roles)
     (when-not (board-lib/card-lane ctx task-id)
       (board-lib/create-card! ctx task-id (:role (first roles)))

@@ -4,6 +4,7 @@
    between two role worktrees, board card to done, then teardown."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
+            [cheshire.core :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
 
@@ -142,6 +143,13 @@
             (testing "the harness was launched with the role prompt, bypass permissions, and the declared extra args"
               (let [argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-a.argv"))))]
                 (is (some #{"--append-system-prompt-file"} argv))
+                (is (= (str (fs/path dir "hooks" "a.settings.json"))
+                       (second (drop-while #(not= "--settings" %) argv)))
+                    "the role loads its contract hooks via --settings")
+                (let [settings (json/parse-string (slurp (str (fs/path dir "hooks" "a.settings.json"))))]
+                  (is (str/ends-with? (get-in settings ["hooks" "SessionStart" 0 "hooks" 0 "command"]) "hooks/run-contract.sh"))
+                  (is (= "Edit|Write|MultiEdit|NotebookEdit|Bash" (get-in settings ["hooks" "PreToolUse" 0 "matcher"]))))
+                (is (= "444" (str/trim (:out (process/sh "stat" "-f" "%Lp" (str (fs/path dir "goal.md")))))) "open locked goal.md")
                 (is (some #{"--permission-mode"} argv))
                 (is (some #{"bypassPermissions"} argv))
                 (is (= ["--model" "sonnet"] (filterv #{"--model" "sonnet"} argv)))
