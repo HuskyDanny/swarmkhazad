@@ -83,6 +83,17 @@
 (defn decision [r]
   (when-not (str/blank? (:out r)) (json/parse-string (:out r) true)))
 
+(defn handoffs [dir]
+  (if (fs/directory? dir)
+    (->> (concat (fs/glob dir "*.handoff") (fs/glob dir "**/*.handoff")) (filter fs/regular-file?) distinct (sort-by str) vec)
+    []))
+
+(defn headers [file]
+  (into {} (for [line (take-while (complement str/blank?) (str/split-lines (slurp (str file))))
+                 :let [[k v] (str/split line #": " 2)]
+                 :when (and k v)]
+             [k v])))
+
 (defn verdict-file [dir role]
   (json/parse-string (slurp (str (fs/path dir "state" "judge" (str role ".json")))) true))
 
@@ -262,6 +273,26 @@
         (testing "graded whole, every role of a multi-role task is unmet until the last one finishes"
           (is (= 1 (count (re-seq #"- \[ \] b — THEIRS" goals)))
               "b's line appears once, only in the not-yours block"))))))
+
+(deftest a-spent-block-budget-lets-the-handoff-through-carrying-the-gap
+  (with-task
+    (fn [{:keys [dir stop! helper]}]
+      (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
+      (git (fs/path dir "worktrees" "a") "add" "x.txt")
+      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+      (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
+      (testing "while blocks remain, an unmet role is refused"
+        (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")
+        (is (= 1 (:exit (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))))))
+      (testing "after the budget is spent, it goes through — refusing forever would wedge the task on one role"
+        (dotimes [_ 3] (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"))
+        (is (true? (:exhausted (verdict-file dir "a"))))
+        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
+          (is (zero? (:exit r)) (:err r))
+          (is (str/includes? (:err r) "block budget is spent"))))
+      (testing "and the handoff names the gap, so the recipient is never told the work is clean"
+        (let [h (headers (first (handoffs (fs/path dir "mail" "a" "outbox"))))]
+          (is (= "GOAL-X" (get h "unmet"))))))))
 
 (deftest the-hook-is-inert-outside-a-role-and-on-other-events
   (let [r (process/sh {:continue true :in "{\"hook_event_name\":\"Stop\"}" :extra-env {"SWARMKHAZAD_TASK_DIR" "" "SWARMFORGE_ROLE" ""}}

@@ -209,7 +209,8 @@
   (cond
     idle {:block? false :reason "no task yet: nothing has reached this role's inbox and it has committed nothing. Waiting is correct."}
     terminal? {:block? false :reason "terminal broadcast received; merge and stop"}
-    (>= blocks max-blocks) {:block? false :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
+    (>= blocks max-blocks) {:block? false :exhausted true
+                            :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
     down {:block? false :reason "judge unavailable; verdict is met=false until it returns"}
     (not met) {:block? true :reason (str "goals unmet: " (str/join "; " unmet) ". Keep working on these, then stop again. A bar you cannot meet is an escalation.md line.")}
     (and repo? (not sent?)) {:block? true :reason "goals met, but no git_handoff for your current HEAD has been queued. Commit if needed, then run swarm_handoff.bb on a git_handoff draft, then stop."}
@@ -258,6 +259,7 @@
       (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
       (spit (str (verdict-file ctx role))
             (json/generate-string (merge verdict {:role role :at (handoff-lib/timestamp) :session session-id
+                                                  :exhausted (boolean (:exhausted decision))
                                                   :decision (if (:block? decision) "block" "allow") :reason (:reason decision)})
                                   {:pretty true}))
       (escalate! ctx role verdict previous)
