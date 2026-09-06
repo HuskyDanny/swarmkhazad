@@ -145,8 +145,9 @@
                      (str/trim (:out (process/sh "bb" "-e" (str "(load-file \"" scripts "/run_evidence.bb\") (print (run-evidence/detect-test-command \"" d "\"))"))))
                      (finally (fs/delete-tree d)))))]
     (is (= "pnpm test" (detect {"package.json" "{}" "pnpm-lock.yaml" ""})))
-    (is (= "bun test" (detect {"package.json" "{}" "bun.lockb" ""})))
-    (is (= "bun test" (detect {"package.json" "{}" "bun.lock" ""})) "bun's current text lockfile, which lothlorien carries")
+    (is (= "bun run test" (detect {"package.json" "{}" "bun.lockb" ""})))
+    (is (= "bun run test" (detect {"package.json" "{}" "bun.lock" ""}))
+        "bun's current text lockfile, and `run test` — `bun test` is Bun's own runner, which fails a Vitest suite outright")
     (is (= "npm test" (detect {"package.json" "{}"})))
     (is (= "pytest" (detect {"pyproject.toml" ""})))
     (is (= "go test ./..." (detect {"go.mod" ""})))

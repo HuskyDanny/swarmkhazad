@@ -23,6 +23,7 @@ priority: 50
 ```
 
   and run `swarm_handoff.bb <draft>`. The helper fills the commit (your worktree HEAD) and the artifacts; never type a SHA. It also completes your current inbound item.
+- If you are the last role, `to: all` addresses every other role — that is the terminal broadcast, and the helper marks it `non-forwarding` for you.
 - A `note` is a short message (`type: note`, `to:`, `priority:`, `message: <one line>`). After acting on an inbound note, run `done_with_current.bb`.
 - A `non-forwarding` inbound git_handoff is the terminal broadcast from the last role: merge it (ready_for_next already did), run `done_with_current.bb`, and stop. Do not forward it.
 - If a merge conflicts, resolve every conflicted file, `git add` them, and commit. Then continue.

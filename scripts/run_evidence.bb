@@ -88,8 +88,11 @@
     (cond
       (and (has? "package.json") (has? "pnpm-lock.yaml")) "pnpm test"
       (and (has? "package.json") (has? "yarn.lock")) "yarn test"
-      ;; bun writes bun.lockb (binary) or bun.lock (text, the current default).
-      (and (has? "package.json") (or (has? "bun.lockb") (has? "bun.lock"))) "bun test"
+      ;; `bun test` is Bun's OWN runner, not the repo's `test` script — a Vitest
+      ;; suite run that way fails on every file (measured on lothlorien: 0 pass,
+      ;; 33 fail on `vi.unstubAllGlobals`, all 33 green under `bun run test`).
+      ;; So bun runs the script, like every other manager.
+      (and (has? "package.json") (or (has? "bun.lockb") (has? "bun.lock"))) "bun run test"
       (has? "package.json") "npm test"
       (has? "bb.edn") "bb test"
       (or (has? "pyproject.toml") (has? "pytest.ini") (has? "setup.py")) "pytest"

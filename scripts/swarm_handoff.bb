@@ -69,7 +69,13 @@
 
 (defn validate-recipients [ctx sender to]
   ;; -1 keeps trailing empties, so `to: b,` is an empty recipient, not a quiet `b`.
-  (let [recipients (if (str/blank? to) [] (mapv str/trim (str/split to #"," -1)))]
+  ;; `to: all` is every other role — the shape the last role's terminal broadcast
+  ;; needs, and the one a role reaches for first (the live fixture's run role
+  ;; wrote it and was refused, then had to list its siblings by hand).
+  (let [recipients (cond
+                     (str/blank? to) []
+                     (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/role-names ctx)))
+                     :else (mapv str/trim (str/split to #"," -1)))]
     [recipients
      (cond-> []
        (str/blank? to) (conj "Missing required header 'to'.")
