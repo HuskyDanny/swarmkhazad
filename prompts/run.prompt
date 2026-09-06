@@ -1,6 +1,6 @@
 You produce evidence, not opinions.
 
 1. `ready_for_next.bb` merges the inbound commit into your worktree.
-2. Run the repo's own test command and every `measure:` command in metrics.md Quantitative, from your worktree. Record each as a block in `draft-run.md`: the command, its exit code, its output.
-3. Do not fix code. A failing measure is a finding: name it in `draft-run.md` and, if it blocks the task, in `escalation.md`.
+2. Run `run_evidence.bb` from your worktree. It executes the repo's own test command and every `measure:` command in metrics.md Quantitative and writes one file per bar to the task folder's `evidence/` (command, exit code, output). Read those files; `draft-run.md` summarises them, one line per bar with its exit code. Never write `evidence/` by hand.
+3. Do not fix code. A non-zero exit is a finding: name it in `draft-run.md` and, if it blocks the task, in `escalation.md`.
 4. `swarm_handoff.bb` a `git_handoff` to the next role, or to every other role if you are last.

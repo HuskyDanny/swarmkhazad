@@ -84,6 +84,7 @@
 (deftest unmet-blocks-the-stop-writes-the-verdict-and-escalates-once-per-distinct-verdict
   (with-task
     (fn [{:keys [dir stop!]}]
+      (write! (fs/path dir "evidence" "repo-tests.txt") "bar: repo tests\nexit: 1\n--- output ---\n2 failed EVIDENCE-MARK\n")
       (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\",\"tests\"]}")]
         (is (zero? (:exit r)) (:err r))
         (is (= "block" (:decision (decision r))))
@@ -106,6 +107,8 @@
           (is (str/includes? prompt "GOAL-X"))
           (is (str/includes? prompt "### git status"))
           (is (str/includes? prompt "(not written)") "the missing draft is reported, not invented")
+          (is (str/includes? prompt "--- repo-tests.txt\nbar: repo tests\nexit: 1") "the run role's evidence reaches the judge")
+          (is (str/includes? prompt "EVIDENCE-MARK"))
           (is (str/includes? prompt "### role's last message\ndone"))))
       (testing "escalation.md got one line naming the unmet items"
         (let [esc (slurp (str (fs/path dir "escalation.md")))]

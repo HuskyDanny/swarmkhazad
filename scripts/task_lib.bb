@@ -96,6 +96,7 @@
      :decision-file (fs/path task-dir "decision.md")
      :gotcha-file (fs/path task-dir "gotcha.md")
      :escalation-file (fs/path task-dir "escalation.md")
+     :evidence-dir (fs/path task-dir "evidence")
      :repos-dir (fs/path task-dir "repos")
      :worktrees-dir (fs/path task-dir "worktrees")
      :mail-dir (fs/path task-dir "mail")
@@ -401,7 +402,7 @@
 
 (defn create-layout! [ctx]
   (doseq [k [:repos-dir :worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
-             :board-dir :daemon-dir :sessions-dir]]
+             :evidence-dir :board-dir :daemon-dir :sessions-dir]]
     (fs/create-dirs (get ctx k)))
   (doseq [k [:decision-file :gotcha-file :escalation-file]]
     (when-not (fs/exists? (get ctx k))
