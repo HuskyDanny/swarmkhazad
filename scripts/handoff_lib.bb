@@ -194,6 +194,9 @@
     (println "PRIORITY:" (or (get h "priority") "50"))
     (when-let [t (get h "task")] (println "TASK_NAME:" t))
     (when-let [t (get h "task_id")] (println "TASK_ID:" t))
+    ;; Only set past one repo, and the recipient may have no session there —
+    ;; a review with no superset goal line still needs to know superset moved.
+    (when-let [r (get h "origin_repo")] (println "ORIGIN_REPO:" r))
     (when-let [a (get h "artifacts")] (println "ARTIFACTS:" a))
     (println "PAYLOAD:")
     (print (body file))

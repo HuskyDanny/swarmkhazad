@@ -67,21 +67,36 @@
               :else (recur (next lines) line-no (assoc headers field (str/trim value)) errors)))))
       {:headers headers :errors errors})))
 
+(defn expand-recipient
+  "A name in `to` is a session or a role. A role expands to every session it
+   has, so `to: review` reaches the reviewer in all three repos without the
+   sender knowing how many there are — and the sender's own sessions drop out,
+   the same rule `to: all` already follows. In a one-repo task the session and
+   the role are the same string and this is a no-op."
+  [ctx sender name]
+  (if (handoff-lib/session-known? ctx name)
+    [name]
+    (let [sender-role (:role (task-lib/session-row ctx sender))]
+      (->> (task-lib/role-sessions ctx name)
+           (remove #(= sender-role (:role %)))
+           (mapv :session)))))
+
 (defn validate-recipients [ctx sender to]
   ;; -1 keeps trailing empties, so `to: b,` is an empty recipient, not a quiet `b`.
-  ;; `to: all` is every other role — the shape the last role's terminal broadcast
-  ;; needs, and the one a role reaches for first (the live fixture's run role
-  ;; wrote it and was refused, then had to list its siblings by hand).
-  (let [recipients (cond
-                     (str/blank? to) []
-                     (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/session-names ctx)))
-                     :else (mapv str/trim (str/split to #"," -1)))]
+  ;; `to: all` is every other session — the shape the last role's terminal
+  ;; broadcast needs, and the one a role reaches for first (the live fixture's
+  ;; run role wrote it and was refused, then had to list its siblings by hand).
+  (let [named (cond
+                (str/blank? to) []
+                (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/session-names ctx)))
+                :else (mapv str/trim (str/split to #"," -1)))
+        recipients (vec (distinct (mapcat #(expand-recipient ctx sender %) named)))]
     [recipients
      (cond-> []
        (str/blank? to) (conj "Missing required header 'to'.")
-       (some str/blank? recipients) (conj "Header 'to' contains an empty recipient.")
-       (not= (count recipients) (count (distinct recipients))) (conj "Duplicate recipient in 'to'.")
-       :always (into (for [r recipients :when (and (not (str/blank? r)) (not (handoff-lib/session-known? ctx r)))]
+       (some str/blank? named) (conj "Header 'to' contains an empty recipient.")
+       (not= (count named) (count (distinct named))) (conj "Duplicate recipient in 'to'.")
+       :always (into (for [r named :when (and (not (str/blank? r)) (empty? (expand-recipient ctx sender r)))]
                        (format "Unknown recipient role '%s'." r))))]))
 
 (defn base-errors [{:strs [type priority message]}]
@@ -147,7 +162,15 @@
         (do (Thread/sleep 1) (recur))
         s))))
 
-(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet]}]
+(defn origin-repo
+  "The repo the sender worked in, but only when the task holds more than one.
+   A recipient with no session in that repo still has to be told which tree
+   moved; a one-repo task would be stamping the same answer on every handoff."
+  [ctx row]
+  (let [repos (distinct (keep :repo (task-lib/read-sessions-tsv ctx)))]
+    (when (> (count repos) 1) (:repo row))))
+
+(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet repo]}]
   (let [out (handoff-lib/outbox-dir ctx sender)
         stamp (fresh-stamp out sender)
         type (get headers "type")
@@ -164,6 +187,7 @@
                    "task" (:task-id ctx)
                    "created_at" (handoff-lib/timestamp)}
             (= type "git_handoff") (assoc "role" sender "commit" commit "artifacts" (str/join "," artifacts))
+            (and (= type "git_handoff") repo) (assoc "origin_repo" repo)
             (and (= type "git_handoff") base) (assoc "task_base_commit" base)
             non-forwarding? (assoc "non-forwarding" "true")
             (seq unmet) (assoc "unmet" (str/join "; " unmet))
@@ -297,6 +321,7 @@
               unmet (when (and verdict (not (:met verdict))) (:unmet verdict))
               final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
                                          :commit commit :artifacts artifacts :base base :unmet unmet
+                                         :repo (when git? (origin-repo ctx row))
                                          :non-forwarding? (and git? (handoff-lib/last-session? ctx sender))})]
           (fs/delete draft)
           ;; The budget is about one piece of work. Once it is handed over the

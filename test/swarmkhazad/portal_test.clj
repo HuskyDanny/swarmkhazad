@@ -104,10 +104,14 @@
                 "an unchanged column is not swapped at all, so a text selection survives")
             (is (str/includes? body "if(open.has(K(x)))x.open=true")
                 "and an escalation the reader expanded is re-opened after a swap")
-            (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> implement — the route returns 200 <span class=\"status pending\">pending" body)
+            (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> <span class=\"muted\">implement — </span>the route returns 200 <span class=\"status pending\">pending" body)
                 "no verdict names it, and review's met does not carry the line while implement's and run's are unmet → pending, unchecked")
             (is (re-find #"tests green <span class=\"status unmet\">unmet: implement" body))
-            (is (re-find #"<input checked=\"checked\" disabled=\"disabled\" type=\"checkbox\" /> control — already ticked <span class=\"status ticked\">ticked" body))
+            (is (re-find #"<input checked=\"checked\" disabled=\"disabled\" type=\"checkbox\" /> <span class=\"muted\">control — </span>already ticked <span class=\"status ticked\">ticked" body))
+            (is (not (str/includes? body "<h3 class=\"repo\">"))
+                "one repo, so the goals are one list — a heading over every line is noise")
+            (is (str/includes? body "<span class=\"lane\">not opened</span>")
+                "and no fraction: `implement 1/1` is the same sentence as `implement`")
             (is (not (str/includes? body "not a goal box")) "only the Goal section's boxes")
             (testing "metrics bars with the latest evidence"
               (is (str/includes? body "every role called"))
@@ -194,7 +198,14 @@
         (testing "unknown task ids and routes are 404, including traversal in the id"
           (is (= 404 (:status (request env :get "/tasks/nope"))))
           (is (= 404 (:status (request env :get "/tasks/..%2F..%2Fetc"))))
-          (is (= 404 (:status (request env :get "/nothing"))))))
+          (is (= 404 (:status (request env :get "/nothing")))))
+        ;; Last, because it puts the task in a lane and every assertion above
+        ;; reads the lane as `not opened`.
+        (testing "a lane whose role holds one repo shows no fraction"
+          (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                         "(board-lib/create-card! (task-lib/task-ctx \"" id "\") \"" id "\" \"implement\")"))
+          (is (str/includes? (:body (request env :get (str "/tasks/" id))) "<span class=\"lane\">implement</span>")
+              "`implement 1/1` is the same sentence as `implement`, and the fraction is then noise on every card")))
       (finally
         (fs/delete-tree sandbox)))))
 
@@ -603,6 +614,15 @@
           (is (str/includes? body (str "href=\"/projects/" project "/new\"")) "New task goes to the project's own form")
           (is (not (str/includes? body "repo-of:"))
               "no role names a checkout: every role can work in every repo the project holds")))
+      (testing "a second project with the same name is refused, and the first is untouched"
+        (let [r (request env :post "/projects"
+                         {:body (str "name=" project "&repo%3A" src "=on&role%3Areview=on")})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) (str "project already exists: " project))))
+        (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
+          (is (= [{:role "implement" :harness "claude" :model "anthropic"}
+                  {:role "run" :harness "claude" :model "kimi"}] (:roles stored))
+              "create is not a silent edit — that is what /projects/<name> is for")))
       (testing "the task form shows the swarm and the checkouts but never asks for them"
         (let [body (:body (request env :get (str "/projects/" project "/new")))]
           (is (str/includes? body "implement (anthropic)"))
@@ -690,6 +710,72 @@
                           (< (System/currentTimeMillis) deadline))
                 (Thread/sleep 500)))
             (is (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement_fixture/pane"))) "launch.sh")))
+          (testing "two repos, so the goal list is grouped under the repo each line names"
+            (let [body (:body (request env :get (str "/tasks/" id)))]
+              (is (str/includes? body "<h3 class=\"repo\">every repo</h3>")
+                  "nothing is tagged yet, and an untagged line belongs to all of them"))
+            ;; goal.md is 444 on purpose. Rewriting it here is the test standing
+            ;; in for the human who writes the tags, not the portal reaching in.
+            (fs/set-posix-file-permissions (fs/path dir "goal.md") "rw-r--r--")
+            (spit (str (fs/path dir "goal.md"))
+                  (str "# " id "\n\n## Goal\n"
+                       "- [ ] implement @fixture — the route returns 200\n"
+                       "- [ ] implement @nested — the exporter is wired\n"
+                       "- [ ] run — tests green\n"))
+            (let [body (:body (request env :get (str "/tasks/" id)))]
+              (is (str/includes? body "<h3 class=\"repo\">fixture</h3>"))
+              (is (str/includes? body "<h3 class=\"repo\">nested</h3>"))
+              (is (str/includes? body "<h3 class=\"repo\">every repo</h3>"))
+              (is (< (str/index-of body "the route returns 200")
+                     (str/index-of body "the exporter is wired")
+                     (str/index-of body "tests green"))
+                  "each line under its own repo, and the untagged one last")
+              (is (= 1 (count (re-seq #"the route returns 200" body)))
+                  "under its own repo and nowhere else — a line repeated per repo is a line graded twice")
+              (is (= 1 (count (re-seq #"the exporter is wired" body))))))
+          (testing "the lane says how much of the role is done, not which repos it holds"
+            (run {:env env} "bb" "-e"
+                 (str "(load-file \"" scripts "/board_lib.bb\") "
+                      "(let [ctx (task-lib/task-ctx \"" id "\")] "
+                      "(board-lib/hand-off! ctx \"" id "\" \"implement_fixture\" \"run\" "
+                      "{\"implement\" [\"implement_fixture\" \"implement_nested\"]}))"))
+            (is (str/includes? (:body (request env :get (str "/tasks/" id))) "implement 1/2")
+                "one of implement's two repos has handed off; the lane has not moved")
+            (is (str/includes? (:body (request env :get "/")) "<span class=\"muted\">1/2</span>")
+                "and the swimlane card carries the same fraction beside its status"))
           (run {:env env} cli "close" id)))
+      (testing "a project is editable: the form comes back filled in, and saving rewrites it"
+        (let [body (:body (request env :get (str "/projects/" project "/edit")))]
+          (is (str/includes? body (str "checked=\"checked\" name=\"repo:" src "\"")))
+          (is (str/includes? body (str "checked=\"checked\" name=\"repo:" nested "\"")))
+          (is (str/includes? body "checked=\"checked\" name=\"role:implement\""))
+          (is (str/includes? body "checked=\"checked\" name=\"role:run\""))
+          (is (not (str/includes? body "checked=\"checked\" name=\"role:review\"")))
+          (is (str/includes? body "readonly=\"readonly\"")
+              "the name is fixed: a task points at its project by name, so a rename orphans it")
+          (is (str/includes? body "Save project"))
+          (is (str/includes? body "Delete project")))
+        (is (= 404 (:status (request env :get "/projects/nope/edit"))))
+        (let [r (request env :post (str "/projects/" project)
+                         {:body (str "repo%3A" src "=on&role%3Aimplement=on&model%3Aimplement=kimi")})]
+          (is (= 303 (:status r)))
+          (is (= "/" (get (:headers r) "Location"))))
+        (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
+          (is (= [src] (:repos stored)) "a checkout can be dropped")
+          (is (= [{:role "implement" :harness "claude" :model "kimi"}] (:roles stored))
+              "and a role, and a role's vendor, all in one save"))
+        (testing "a bad edit is refused and the project on disk is untouched"
+          (let [r (request env :post (str "/projects/" project) {:body "role%3Aimplement=on"})]
+            (is (= 400 (:status r)))
+            (is (str/includes? (:body r) "pick at least one checkout")))
+          (is (= [src] (:repos (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn"))))))))))
+      (testing "and deletable: the lineup goes, the task it opened does not"
+        (is (= 303 (:status (request env :post (str "/projects/" project "/delete")))))
+        (is (not (fs/exists? (fs/path home "projects" (str project ".edn")))))
+        (is (fs/directory? (fs/path home "tasks" id)) "the work survives its project")
+        (let [body (:body (request env :get "/"))]
+          (is (str/includes? body "Tasks outside a project"))
+          (is (str/includes? body (str "href=\"/tasks/" id "\"")) "and the task is still reachable"))
+        (is (= 404 (:status (request env :post (str "/projects/" project "/delete"))))))
       (finally
         (fs/delete-tree sandbox)))))

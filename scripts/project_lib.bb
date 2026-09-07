@@ -70,6 +70,15 @@
     (spit (str f) (with-out-str (pprint/pprint {:repos (vec repos) :roles (vec roles)})))
     (read-project name)))
 
+(defn delete-project!
+  "Remove the project. Its tasks are not touched — they keep their own repos and
+   roles, snapshotted at scaffold time, and the index lists them again under
+   `Tasks outside a project`. Deleting a project is forgetting a lineup, never
+   deleting work."
+  [name]
+  (when-let [f (project-file name)]
+    (fs/delete-if-exists f)))
+
 ;; ---------------------------------------------------------------- repo scan
 
 (defn scan-repos

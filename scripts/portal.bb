@@ -54,15 +54,30 @@
   (->> (str/split-lines (or s "")) (map str/trim) (remove str/blank?) vec))
 
 (defn goal-lines
-  "The checkbox lines of goal.md's Goal section: {:text :ticked}."
+  "The checkbox lines of goal.md's Goal section: {:text :ticked :role :repos}.
+   Parsed by the same function the judge uses, so the portal and the grader
+   never disagree about which repo a line belongs to."
   [goal-md]
   (->> (str/split-lines (or goal-md ""))
        (drop-while #(not (re-matches #"(?i)##\s+goal\s*" (str/trim %))))
        rest
        (take-while #(not (str/starts-with? (str/trim %) "## ")))
-       (keep #(when-let [[_ box body] (re-matches #"\s*- \[([ xX])\]\s*(.*)" %)]
-                {:text (str/trim body) :ticked (not= " " box)}))
+       (keep task-lib/goal-line)
        vec))
+
+(defn goals-by-repo
+  "The goal lines grouped under the repo each one names, in the task's own repo
+   order, with the untagged lines last under `every repo` — a line that never
+   said belongs to all of them. Returns nil when the task has one repo: there
+   is nothing to group by and a heading over every line is noise."
+  [repos goals]
+  (when (> (count repos) 1)
+    (concat (for [r repos
+                  :let [mine (filter #(some #{r} (:repos %)) goals)]
+                  :when (seq mine)]
+              [r mine])
+            (when-let [untagged (seq (remove #(seq (:repos %)) goals))]
+              [["every repo" untagged]]))))
 
 (defn verdicts
   "role → the latest judge verdict, from state/judge/<role>.json."
@@ -274,6 +289,23 @@
   (or (try (board-lib/card-lane ctx (:task-id ctx)) (catch Exception _ nil))
       (if (opened? ctx) "?" "not opened")))
 
+(defn lane-progress
+  "How much of the current lane is done — `2/3` when the role holds three repos
+   and two have handed off. nil when the role holds one repo: `implement 1/1`
+   is the same sentence as `implement`."
+  [ctx]
+  (let [total (count (filter #(= (lane ctx) (:role %)) (sessions ctx)))]
+    (when (> total 1)
+      (let [row (try (board-lib/card-row ctx (:task-id ctx)) (catch Exception _ nil))]
+        (str (count (board-lib/handed row)) "/" total)))))
+
+(defn lane-label
+  "The lane, plus how much of it is done. Three repo names do not fit in a 190px
+   card, and the fraction is the part a reader is actually asking for."
+  [ctx]
+  (let [name (lane ctx)]
+    (if-let [p (lane-progress ctx)] (str name " " p) name)))
+
 (defn doc-file
   "The canonical path of a file inside the task folder, or nil — never the
    clones or the worktrees, never anything a relative path can reach outside.
@@ -299,10 +331,12 @@
                  :let [[k v] (str/split pair #"=" 2)]]
              [(java.net.URLDecoder/decode k "UTF-8") (java.net.URLDecoder/decode (or v "") "UTF-8")])))
 
-(defn create-project!
-  "Write a project from the form. Repos come from the checkbox list plus any
-   typed paths; roles come from the cards that were ticked, in the order the
-   stage prompts are listed, which is the order the swimlane columns take."
+(defn project-from-form
+  "A project map from the form, or {:error}. Repos come from the checkbox list
+   plus any typed paths; roles come from the cards that were ticked, in the
+   order the stage prompts are listed, which is the order the swimlane columns
+   take. Everything here is true of a new project and of an edited one; only
+   whether the name may already exist differs, and that is the caller's."
   [{:strs [name extra-repos] :as params}]
   (let [nm (str/trim (or name ""))
         picked (->> (keys params)
@@ -316,14 +350,34 @@
                       :model (or (get params (str "model:" stage)) "anthropic")}))]
     (cond
       (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
-      (project-lib/read-project nm) {:error (str "project already exists: " nm)}
       (empty? repos) {:error "pick at least one checkout"}
       (empty? roles) {:error "pick at least one role"}
       (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
                                                               (first (remove task-lib/git-checkout? repos)))}
       (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
-      :else (do (project-lib/write-project! {:name nm :repos repos :roles roles})
-                {:ok nm}))))
+      :else {:name nm :repos repos :roles roles})))
+
+(defn create-project! [params]
+  (let [p (project-from-form params)]
+    (cond
+      (:error p) p
+      (project-lib/read-project (:name p)) {:error (str "project already exists: " (:name p))}
+      :else (do (project-lib/write-project! p) {:ok (:name p)}))))
+
+(defn update-project!
+  "Rewrite an existing project. The name is fixed: a task points at its project
+   by name, so a rename would orphan every task already scaffolded from it.
+
+   Tasks already open are untouched — `repos` and `roles` were snapshotted into
+   the task folder at scaffold time, which is what makes an edit here safe while
+   a swarm is running."
+  [name params]
+  (if-not (project-lib/read-project name)
+    {:error (str "no such project: " name)}
+    (let [p (project-from-form (assoc params "name" name))]
+      (if (:error p)
+        p
+        (do (project-lib/write-project! p) {:ok name})))))
 
 (defn kickstart-project!
   "A task inside a project: the repos and the role lineup come from the project,
@@ -383,6 +437,8 @@
    .title a{color:inherit;text-decoration:none}
    .title .sub{color:var(--muted);font-weight:400}
    h2{font-size:.9rem;font-weight:500;color:var(--muted);margin:2rem 0 .6rem;letter-spacing:.01em}
+   h3.repo{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;
+     font-weight:500;color:var(--blue);margin:1.2rem 0 .3rem}
    section{margin:0 0 1.6rem}
    .row{display:flex;align-items:center;gap:.75rem;background:var(--row);border-radius:12px;
      padding:.85rem 1.1rem;margin-bottom:.4rem;text-decoration:none;color:inherit;
@@ -437,6 +493,9 @@
    .composer{position:fixed;left:0;right:0;bottom:0;background:var(--paper);
      border-top:1px solid var(--line);padding:1rem 2rem 1.3rem}
    .composer .inner{max-width:1040px;margin:0 auto;max-height:60vh;overflow-y:auto}
+   /* On its own page there is nothing to dock to the foot of. */
+   .composer.own{position:static;padding:0;border-top:0}
+   .composer.own .inner{max-height:none;overflow:visible}
    .composer .fields{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem}
    input[type=text],textarea{font:inherit;color:inherit;background:var(--surface);
      border:1px solid var(--line);border-radius:10px;padding:.6rem .85rem;width:100%}
@@ -446,6 +505,9 @@
    .composer .go{display:flex;gap:.6rem;align-items:center}
    button{font:inherit;font-weight:500;color:#fff;background:var(--accent);border:0;
      border-radius:10px;padding:.6rem 1.2rem;cursor:pointer;white-space:nowrap;flex:none}
+   .danger{display:flex;gap:.6rem;align-items:center;margin-top:1.4rem;
+     padding-top:1rem;border-top:1px solid var(--line);font-size:.85rem}
+   button.linky{color:var(--red);background:none;padding:0;text-decoration:underline}
    .err{color:var(--red);font-size:.9rem;margin:0 0 .5rem}
    .empty{color:var(--muted);font-size:.9rem;padding:.6rem 0}
    main.wide{max-width:1560px}
@@ -499,6 +561,7 @@
      padding:.6rem .7rem;margin-bottom:.4rem;text-decoration:none;color:inherit}
    .tcard:hover{background:var(--row)}
    .tcard .name{font-weight:600;font-size:.92rem;margin-bottom:.15rem}
+   .tcard .status+.muted{margin-left:.45rem;font-size:.85rem}
    .picklist{max-height:210px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;
      background:var(--surface);padding:.35rem .5rem;margin-top:.25rem}
    .pick{display:flex;align-items:center;gap:.5rem;padding:.18rem 0;font-size:.85rem;color:var(--ink)}
@@ -576,50 +639,72 @@
 (def default-roles
   "implement claude <repo-path> task\nreview claude <repo-path> task\nrun claude <repo-path> task")
 
+(defn project-params
+  "A saved project as the form's own params, so one form renders both new and
+   edit and there is no second layout to drift."
+  [{:keys [name repos roles]}]
+  (into {"name" name}
+        (concat (for [r repos] [(str "repo:" r) "on"])
+                (mapcat (fn [{:keys [role model]}]
+                          [[(str "role:" role) "on"] [(str "model:" role) model]])
+                        roles))))
+
 (defn project-form
-  "New project: a name, the checkouts found under the repo roots, and the role
-   cards. The roles are picked once here so no task ever asks for them again."
-  [error params]
-  (let [available (project-lib/available-repos)
-        picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
-        first-run? (empty? params)
-        default (set (map :role project-lib/default-roles))]
-    [:details.composer {:open (boolean error)}
-     [:summary "New project — the checkouts and the swarm, set once"]
-     [:div.inner
-      (when error [:p.err error])
-      [:form {:method "post" :action "/projects"}
-       [:div.fields
-        [:label "project name"
-         [:input {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
-                  :value (get params "name" "")}]]
-        [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
-         [:div.picklist
-          (if (seq available)
-            (for [r available]
-              [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
-                                    :checked (contains? picked r)}]
-               [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
-            [:p.empty "no git checkouts found — type a path below"])]]
-        [:label "or paths not under those roots, one per line"
-         [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
-          (get params "extra-repos")]]]
-       [:p.muted "roles — the swimlane's columns, in this order"]
-       [:div.cards.rolepick
-        (for [stage (project-lib/stage-prompts)
-              :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
-          [:label.card.rolecard
-           [:div.card-top [:span.name stage]
-            [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
-           [:select {:name (str "model:" stage)}
-            (for [v (sort task-lib/known-vendors)]
-              [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
-           ;; No checkout picker: a role works in every repo the project holds,
-           ;; and a task narrows that with `@repo` tags on its goal lines.
-           ])]
-       [:div.go
-        [:button {:type "submit"} "Create project"]
-        [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]]]))
+  "A project: a name, the checkouts found under the repo roots, and the role
+   cards. The roles are picked once here so no task ever asks for them again.
+   With `project` it edits that one instead, posting to its own URL."
+  ([error params] (project-form error params nil))
+  ([error params project]
+   (let [available (distinct (concat (project-lib/available-repos) (:repos project)))
+         picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
+         first-run? (empty? params)
+         default (set (map :role project-lib/default-roles))]
+     [:details.composer {:class (when project "own") :open (boolean (or error project))}
+      [:summary (if project
+                  (str "Edit " (:name project) " — its checkouts and its swarm")
+                  "New project — the checkouts and the swarm, set once")]
+      [:div.inner
+       (when error [:p.err error])
+       [:form {:method "post" :action (if project (str "/projects/" (:name project)) "/projects")}
+        [:div.fields
+         [:label "project name"
+          ;; Fixed once written: a task points at its project by name, so a
+          ;; rename would orphan every task already scaffolded from it.
+          [:input (cond-> {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
+                           :value (get params "name" "")}
+                    project (assoc :readonly true))]]
+         [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
+          [:div.picklist
+           (if (seq available)
+             (for [r available]
+               [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
+                                     :checked (contains? picked r)}]
+                [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
+             [:p.empty "no git checkouts found — type a path below"])]]
+         [:label "or paths not under those roots, one per line"
+          [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
+           (get params "extra-repos")]]]
+        [:p.muted "roles — the swimlane's columns, in this order"]
+        [:div.cards.rolepick
+         (for [stage (project-lib/stage-prompts)
+               :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
+           [:label.card.rolecard
+            [:div.card-top [:span.name stage]
+             [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
+            [:select {:name (str "model:" stage)}
+             (for [v (sort task-lib/known-vendors)]
+               [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
+            ;; No checkout picker: a role works in every repo the project holds,
+            ;; and a task narrows that with `@repo` tags on its goal lines.
+            ])]
+        [:div.go
+         [:button {:type "submit"} (if project "Save project" "Create project")]
+         [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]
+       ;; Its own form, so Enter in the name field can never reach it.
+       (when project
+         [:form.danger {:method "post" :action (str "/projects/" (:name project) "/delete")}
+          [:button.linky {:type "submit"} "Delete project"]
+          [:span.muted "the lineup only — its tasks keep their own repos and roles, and are listed outside a project"]])]])))
 
 (defn project-section
   "One project: its role lanes as columns, its tasks as cards in the lane each
@@ -629,13 +714,15 @@
   (let [columns (conj (mapv :role (:roles project)) "done")
         cards (for [id (project-lib/tasks-for (:name project))
                     :let [ctx (task-lib/task-ctx id)]]
-                {:id id :lane (lane ctx) :attention (count (open-attention ctx))})
+                {:id id :lane (lane ctx) :progress (lane-progress ctx)
+                 :attention (count (open-attention ctx))})
         placed (set (map :lane cards))
         stray (remove #(contains? (set columns) (:lane %)) cards)]
     [:section.project
      [:div.project-head
       [:h2.pname (:name project)]
       [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
+      [:a.doc {:href (str "/projects/" (:name project) "/edit")} "edit"]
       [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
      [:div.scroll
       [:div.swim
@@ -648,7 +735,11 @@
               [:div.name.trunc (:id c)]
               (if (pos? (:attention c))
                 [:span.status.unmet (:attention c) " needs you"]
-                [:span.status.met "clear"])])]])]]
+                [:span.status.met "clear"])
+              ;; The column already names the role; the card says how much of it
+              ;; is done, which is what three repo names would have said in a
+              ;; space that fits none of them.
+              (when-let [p (:progress c)] [:span.muted p])])]])]]
      (when (seq stray)
        [:p.muted "not in a lane yet: "
         (interpose ", " (for [c stray] [:a {:href (str "/tasks/" (:id c))} (:id c) " (" (:lane c) ")"]))])]))
@@ -671,7 +762,7 @@
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
                   [:span.status.met "clear"])
-                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane ctx)]
+                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane-label ctx)]
                 [:span.chev "›"]])])
           ;; a plain child: .composer is position:fixed, so it needs no help
           ;; from the shell to sit at the bottom of the viewport.
@@ -824,7 +915,7 @@
              [:div.muted "goal.md and metrics.md are read-only here — the checkboxes show the judge's latest verdicts, never an edit"]]
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
-            [:span.lane {:class (when (= "done" l) "done")} l]]]
+            [:span.lane {:class (when (= "done" l) "done")} (lane-label ctx)]]]
           (let [done (handled ctx)
                 keyed (for [a att] (assoc a :key (attention-key a) :done (get done (attention-key a))))
                 ;; crossed-off items sink to the bottom and stop counting, the
@@ -856,11 +947,18 @@
                    [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
                    [:div.full (:text a)]]])
                [:p.empty "nothing needs a human"])])
-          [:section [:h2 "Goal"]
-           [:ul.plain
-            (for [g (goal-lines (text (:goal-file ctx))) :let [{:keys [status roles]} (goal-status g vs)]]
-              [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}] " " (:text g) " "
-               [:span.status {:class (name status)} (name status) (when (seq roles) (str ": " (str/join ", " roles)))]])]]
+          (let [goals (goal-lines (text (:goal-file ctx)))
+                item (fn [g]
+                       (let [{:keys [status roles]} (goal-status g vs)]
+                         [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}]
+                          " " (when (:role g) [:span.muted (:role g) " — "]) (:text g) " "
+                          [:span.status {:class (name status)} (name status)
+                           (when (seq roles) (str ": " (str/join ", " roles)))]]))]
+            [:section [:h2 "Goal"]
+             (if-let [grouped (goals-by-repo (distinct (keep :repo (sessions ctx))) goals)]
+               (for [[repo mine] grouped]
+                 (list [:h3.repo repo] [:ul.plain (map item mine)]))
+               [:ul.plain (map item goals)])])
           [:section [:h2 "Metrics bars"]
            [:div.scroll
             [:table.bars [:tr [:th "bar"] [:th "threshold"] [:th "latest evidence"]]
@@ -962,6 +1060,25 @@
          (if (:ok result)
            {:status 303 :headers {"Location" "/"} :body ""}
            (html 400 (index-page (:error result) params)))))
+     (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/edit" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (html 200 (page {:title (str name " · edit") :crumb name}
+                         (project-form nil (project-params project) project)))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               result (update-project! name params)]
+           (if (:ok result)
+             {:status 303 :headers {"Location" "/"} :body ""}
+             (html 400 (page {:title (str name " · edit") :crumb name}
+                             (project-form (:error result) (assoc params "name" name) project)))))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/delete" uri))]
+       (if (project-lib/read-project name)
+         (do (project-lib/delete-project! name)
+             {:status 303 :headers {"Location" "/"} :body ""})
+         (not-found)))
      (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/new" uri))]
        (if-let [project (project-lib/read-project name)]
          (html 200 (new-task-page project nil {}))

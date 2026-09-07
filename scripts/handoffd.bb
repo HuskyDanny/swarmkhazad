@@ -50,11 +50,22 @@
     (fs/move path target)
     (spit (str target ".error") (str reason "\n"))))
 
+(defn role->sessions [ctx]
+  (into {} (for [[role rows] (group-by :role (task-lib/read-sessions-tsv ctx))]
+             [role (mapv :session rows)])))
+
 (defn update-board! [ctx headers recipients]
   (when (= "git_handoff" (get headers "type"))
-    (board-lib/set-lane! ctx
-                         (or (handoff-lib/task-key headers) (:task-id ctx))
-                         (if (= "true" (get headers "non-forwarding")) "done" (first recipients)))))
+    ;; The lane a card moves INTO is the recipient's role, not the session that
+    ;; happens to be first in `to`. A role with three repos is one column.
+    (let [next-lane (if (= "true" (get headers "non-forwarding"))
+                      "done"
+                      (or (:role (task-lib/session-row ctx (first recipients))) (first recipients)))]
+      (board-lib/hand-off! ctx
+                           (or (handoff-lib/task-key headers) (:task-id ctx))
+                           (get headers "from")
+                           next-lane
+                           (role->sessions ctx)))))
 
 (defn phantom? [from] (boolean (re-matches #"\(.+\)" (or from ""))))
 

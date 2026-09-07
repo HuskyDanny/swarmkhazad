@@ -282,7 +282,9 @@
     (fn [{:keys [dir commit! handoff!]}]
       (commit! "fixture" "x.txt")
       (is (zero? (:exit (handoff! "a_fixture" "fixture" "a_other" "{\"met\":true,\"unmet\":[]}"))))
-      (let [prompt (slurp (str (fs/path dir "tmp" "judge-a.argv")))
+      ;; judge-<session>, not judge-<role>: a role with two repos grades twice,
+      ;; and one file per role would have the second overwrite the first.
+      (let [prompt (slurp (str (fs/path dir "tmp" "judge-a_fixture.argv")))
             goals (subs prompt (str/index-of prompt "<goals_md>") (str/index-of prompt "</goals_md>"))
             mine (str/replace goals #"(?s)## Not yours.*" "")]
         (testing "this session's own repo line is graded, and so is the untagged one"

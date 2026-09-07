@@ -211,6 +211,8 @@
                  (set (map #(str/trim (slurp (str % ".error"))) failed)))))
         (is (empty? (handoffs (fs/path dir "mail" "a" "outbox"))) "outbox drained")
         (is (= 1 (count (handoffs (fs/path dir "mail" "a" "sent")))))
+        (is (nil? (get (headers (first (handoffs (fs/path dir "mail" "a" "sent")))) "origin_repo"))
+            "one repo, so there is nothing to disambiguate and every handoff would carry the same answer")
         (let [arrived (handoffs (fs/path dir "mail" "b" "inbox" "new"))]
           (is (= 1 (count arrived)))
           (is (= "b" (get (headers (first arrived)) "recipient")))
@@ -389,3 +391,96 @@
       (let [r (run {:env env :ok? false} cli "close" "t-mail")]
         (is (zero? (:exit r)) (:err r))
         (is (str/includes? (:out r) "swarm closed"))))))
+
+(defn with-two-repo-task
+  "A prepared task over two repos with roles implement and review, so every
+   role has two sessions and every session id is `<role>_<repo>`. This is the
+   shape the one-repo fixture above cannot express: the role and the session
+   stop being the same string."
+  [f]
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-two."})
+        home (str (fs/path sandbox "home"))
+        gobel (str (fs/path sandbox "src" "gobel"))
+        cirdan (str (fs/path sandbox "src" "cirdan"))
+        stubdir (str (fs/path sandbox "stubbin"))
+        id "t-two"
+        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" id
+             "PATH" (str stubdir ":" (System/getenv "PATH"))}]
+    (try
+      (make-source-repo! gobel)
+      (make-source-repo! cirdan)
+      (fs/create-dirs stubdir)
+      (fs/copy (fs/path repo-root "test" "fixtures" "stub-claude.sh") (fs/path stubdir "claude"))
+      (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
+      (run {:env env} cli "new" id "--repo" gobel "--repo" cirdan)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles")) "implement claude\nreview claude\n")
+        (spit (str (fs/path dir "repos")) (str gobel "\n" cirdan "\n"))
+        (spit (str (fs/path dir "goal.md"))
+              (str "# t-two\n\n## Goal\n"
+                   "- [ ] implement @gobel — repoint the upstreams\n"
+                   "- [ ] implement @cirdan — pin the image\n"
+                   "- [ ] review — both diffs read clean\n"))
+        (run {:env env} cli "prepare" id)
+        (letfn [(helper [session repo script & args]
+                  (apply run {:dir (str (fs/path dir "worktrees" repo))
+                              :env (assoc env "SWARMKHAZAD_SESSION" session
+                                          "SWARMKHAZAD_TASK_DIR" (str dir))
+                              :ok? false}
+                         "bb" (str (fs/path scripts script)) args))
+                (commit! [repo name]
+                  (write! (fs/path dir "worktrees" repo name) "x\n")
+                  (git (fs/path dir "worktrees" repo) "add" name)
+                  (git (fs/path dir "worktrees" repo) "commit" "-q" "-m" name))
+                ;; Not trimmed: the tally is the last column, and an empty one
+                ;; is a trailing tab that str/trim would eat.
+                (card [] (first (str/split-lines (slurp (str (fs/path dir "state" "board" "tasks.tsv"))))))]
+          (f {:dir dir :env env :helper helper :commit! commit! :card card})))
+      (finally
+        (fs/delete-tree sandbox)))))
+
+(deftest a-role-hands-off-as-a-whole-not-one-repo-at-a-time
+  (with-two-repo-task
+    (fn [{:keys [dir env helper commit! card]}]
+      (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                     "(board-lib/create-card! (task-lib/task-ctx \"t-two\") \"t-two\" \"implement\")"))
+      (commit! "gobel" "a.txt")
+      (commit! "cirdan" "b.txt")
+      (testing "`to: review` names a role, and reaches every session that role has"
+        (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                        (draft! dir "one.txt" "type: git_handoff\nto: review\npriority: 50\n"))]
+          (is (zero? (:exit r)) (str (:out r) (:err r))))
+        (let [h (headers (first (handoffs (fs/path dir "mail" "implement_gobel" "outbox"))))]
+          (is (= "review_gobel,review_cirdan" (get h "to"))
+              "the sender only knows the name `review`; how many repos it holds is the table's business")
+          (is (= "gobel" (get h "origin_repo"))
+              "past one repo a recipient has to be told which tree moved — it may have no session there")))
+      (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+      (testing "one repo of two: the card records the handoff and stays put"
+        (is (str/starts-with? (card) "t-two\timplement\t") (card))
+        (is (str/ends-with? (card) "\timplement_gobel")
+            "a review that started here would be reading a tree that is still moving"))
+      (testing "the other repo's sibling moves it"
+        (is (zero? (:exit (helper "implement_cirdan" "cirdan" "swarm_handoff.bb"
+                                  (draft! dir "two.txt" "type: git_handoff\nto: review\npriority: 50\n")))))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (str/starts-with? (card) "t-two\treview\t") (card))
+        (is (str/ends-with? (card) "\t") "and the tally clears for the lane that just started"))
+      (testing "each review session hears about BOTH repos, its own and the one it has no session in"
+        (is (= #{"gobel" "cirdan"}
+               (set (keep #(get (headers %) "origin_repo")
+                          (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))))))
+      (testing "both review sessions have the work, and implement's sibling was never a recipient"
+        (is (= 2 (count (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))))
+        (is (= 2 (count (handoffs (fs/path dir "mail" "review_cirdan" "inbox" "new")))))
+        (is (empty? (handoffs (fs/path dir "mail" "implement_cirdan" "inbox" "new"))))))))
+
+(deftest a-role-addressing-its-own-name-does-not-hand-off-to-itself
+  (with-two-repo-task
+    (fn [{:keys [dir helper commit!]}]
+      (commit! "gobel" "a.txt")
+      (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                      (draft! dir "self.txt" "type: git_handoff\nto: implement\npriority: 50\n"))]
+        (is (= 2 (:exit r)) (:out r))
+        (is (str/includes? (:err r) "Unknown recipient role 'implement'")
+            "its own sibling drops out of the expansion, which leaves nobody — refused, not silently sent to itself")))))

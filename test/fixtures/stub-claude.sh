@@ -7,7 +7,11 @@
 #      (b is the last session, so that is the terminal broadcast)
 set -u
 T="$SWARMKHAZAD_TASK_DIR"
-R="$SWARMFORGE_ROLE"
+# The session, not the role: past one repo a role has several sessions, and
+# keying these files by role would have two of them writing the same argv file.
+# In a one-repo task the two names are the same string.
+R="${SWARMKHAZAD_SESSION:-${SWARMFORGE_ROLE:-}}"
+[ -n "$R" ] || { echo "stub-claude: neither SWARMKHAZAD_SESSION nor SWARMFORGE_ROLE is set" >&2; exit 1; }
 
 # `--json-schema` = the goal judge asking for a verdict (a nested call from inside
 # the role's own session, so it must not overwrite the launch record below).
