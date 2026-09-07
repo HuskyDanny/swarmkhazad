@@ -210,7 +210,16 @@
              (render (str "a" E "[31m<b>&c" E "[0m"))))
       (is (str/includes? (render (str E "[32m</pre><script>alert(1)</script>"))
                          "&lt;/pre&gt;&lt;script&gt;")
-          "markup inside a coloured run is escaped like any other text"))))
+          "markup inside a coloured run is escaped like any other text"))
+    (testing "a cursor move is dropped like any other non-SGR escape"
+      (is (= (list "ab") (f (str "a" E "[2Kb")))))
+    (testing "a long plain run does not overflow the stack"
+      ;; A regex that also matched the text between escapes recursed once per
+      ;; character, so a pane spinning on a long error 500'd the whole page.
+      (let [long-line (apply str (repeat 200000 "x"))]
+        (is (= (list long-line) (f long-line)))
+        (is (= (list [:span {:class "f1"} long-line])
+               (f (str E "[31m" long-line))))))))
 
 (deftest a-project-supplies-the-repos-and-the-roles-so-a-task-only-brings-a-goal
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-k."})

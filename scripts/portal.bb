@@ -147,29 +147,42 @@
    nothing inside a <pre>. The text itself is never touched, so hiccup escapes
    it exactly as it escapes any other string.
 
+   Walks the string with a Matcher rather than a regex that also matches the
+   text between escapes. A pattern like `(?:[^\u001b]|...)+` recurses once per
+   character in Java's engine, so a pane holding a few thousand plain characters
+   threw StackOverflowError and the whole page 500'd — which is what a task
+   whose panes are spinning on an error looks like, i.e. exactly the page you
+   most want to load.
+
    Returns a SEQ, not a vector — hiccup reads a vector as an element, so
    returning one renders the first child as a tag name."
   [s]
   (let [s (str/replace (or s "") #"\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)" "")
-        parts (re-seq #"(?s)\u001b\[([0-9;]*)m|((?:[^\u001b]|\u001b(?!\[[0-9;]*m))+)" s)]
-    (loop [parts parts active #{} out []]
-      (if-let [[_ codes text] (first parts)]
-        (cond
-          codes (recur (rest parts)
-                       (reduce (fn [acc c]
-                                 (cond
-                                   (contains? #{"" "0"} c) #{}
-                                   (contains? sgr-class c) (conj acc (sgr-class c))
-                                   :else acc))
-                               active
-                               (str/split codes #";"))
-                       out)
-          (seq text) (recur (rest parts) active
-                            (conj out (if (seq active)
-                                        [:span {:class (str/join " " (sort active))} text]
-                                        text)))
-          :else (recur (rest parts) active out))
-        (seq out)))))
+        m (re-matcher #"\u001b\[([0-9;]*)m" s)
+        clean #(str/replace % #"\u001b\[[0-9;?]*[@-~]" "")]
+    (loop [pos 0 active #{} out []]
+      (if (.find m)
+        (let [text (clean (subs s pos (.start m)))
+              out (if (seq text)
+                    (conj out (if (seq active)
+                                [:span {:class (str/join " " (sort active))} text]
+                                text))
+                    out)]
+          (recur (.end m)
+                 (reduce (fn [acc c]
+                           (cond
+                             (contains? #{"" "0"} c) #{}
+                             (contains? sgr-class c) (conj acc (sgr-class c))
+                             :else acc))
+                         active
+                         (str/split (.group m 1) #";"))
+                 out))
+        (let [text (clean (subs s pos))]
+          (seq (if (seq text)
+                 (conj out (if (seq active)
+                             [:span {:class (str/join " " (sort active))} text]
+                             text))
+                 out)))))))
 
 (defn pane-state
   "Whether the pane the rail shows is a running tmux session, the capture taken
