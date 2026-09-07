@@ -138,6 +138,8 @@ There is no clone. Each repo gets one worktree, added from the checkout itself, 
 
 The cost of not cloning is that `git worktree add` registers the worktree and the branch **in the source checkout**. Nothing else there is touched: the working tree stays clean and on its own branch.
 
+`close` clears both. `swarmkhazad reap` is for the tasks whose close never ran — it prunes stale registrations and deletes every `sk/<task-id>` branch whose task folder is gone, across the checkouts under `SWARMKHAZAD_REPO_ROOTS` (default `~/repos`). A branch holding commits is listed with what deleting it would lose and left alone until `--force`, because an orphaned branch is also what an unmerged, unpushed day of work looks like. Live tasks and anything a checkout currently has checked out are never candidates.
+
 ## Commands
 
 ```
@@ -148,6 +150,7 @@ swarmkhazad open <task-id>                     prepare, then spawn exactly the d
 swarmkhazad open --linear <KEY> [--repo <path>]...
                                                scaffold from a Linear issue, then open
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
+swarmkhazad reap [--force]                     prune stale worktrees, delete orphaned sk/* branches from your checkouts
 swarmkhazad paths <task-id>                    print the path map
 swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
 

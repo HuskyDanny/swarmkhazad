@@ -299,6 +299,55 @@
         (is (not (fs/exists? "/tmp/pwn")))
         (is (not (fs/exists? (fs/path (get env "SWARMKHAZAD_HOME") "x"))))))))
 
+(deftest reap-clears-what-a-task-leaves-in-your-own-checkouts
+  (with-home
+    (fn [{:keys [env src sandbox] :as h}]
+      (let [reap (fn [& args]
+                   (apply run {:env (assoc env "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src")))
+                               :ok? false}
+                          cli "reap" args))
+            branches #(->> (git src "for-each-ref" "--format=%(refname:short)" "refs/heads/")
+                           str/split-lines (remove str/blank?) sort vec)]
+        (doseq [id ["t-live" "t-empty" "t-work"]]
+          (scaffold-task! h id "a claude\n")
+          (run {:env env} cli "prepare" id))
+        (git src "branch" "keepme")
+        (testing "one worktree registration per task, and one branch each"
+          (is (= ["keepme" "main" "scratch" "sk/t-empty" "sk/t-live" "sk/t-work"] (branches)))
+          (is (= 3 (count (fs/list-dir (fs/path src ".git" "worktrees"))))))
+        (let [wt (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-work" "worktrees" "fixture")]
+          (write! (fs/path wt "work.txt") "a day of work\n")
+          (run {:dir (str wt)} "git" "add" "work.txt")
+          (run {:dir (str wt)} "git" "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "work"))
+        (fs/delete-tree (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-empty"))
+        (fs/delete-tree (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-work"))
+        (testing "an orphan holding nothing is deleted; one holding work is not"
+          (let [out (:out (reap))]
+            (is (str/includes? out "deleted") out)
+            (is (str/includes? out "sk/t-empty"))
+            (is (str/includes? out "it holds 1 commit(s); --force to delete anyway"))
+            (is (str/includes? out "sk/t-live") "and a live task's branch says why it was kept")
+            (is (str/includes? out "its task folder is still there"))
+            (is (str/includes? out "1 deleted, 2 kept")
+                "the summary is the whole answer for anyone who does not read the rows"))
+          (is (= ["keepme" "main" "scratch" "sk/t-live" "sk/t-work"] (branches))))
+        (testing "the stale registrations are pruned, the live one is not"
+          (is (= 1 (count (fs/list-dir (fs/path src ".git" "worktrees"))))))
+        (testing "a branch the checkout has checked out is left alone, not failed on"
+          ;; The stale registration was pruned on the run above, which is the
+          ;; only reason the source can check this branch out at all.
+          (run {:dir src} "git" "checkout" "-q" "sk/t-work")
+          (let [r (reap "--force")]
+            (is (zero? (:exit r)) (:err r))
+            (is (str/includes? (:out r) "the checkout has it checked out"))
+            (is (some #{"sk/t-work"} (branches))
+                "git refuses the delete anyway; saying so beats an error nobody can act on"))
+          (run {:dir src} "git" "checkout" "-q" "main"))
+        (testing "--force takes the one holding work, and nothing else"
+          (is (str/includes? (:out (reap "--force")) "sk/t-work"))
+          (is (= ["keepme" "main" "scratch" "sk/t-live"] (branches))
+              "a branch that is not sk/<task-id> is never a candidate, forced or not"))))))
+
 (deftest a-task-opened-before-sessions-tsv-existed-still-reads
   ;; roles.tsv was the runtime table until sessions.tsv replaced it. Tasks
   ;; written under the old shape are still running, and every helper they call

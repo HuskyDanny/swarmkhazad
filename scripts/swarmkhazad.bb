@@ -13,7 +13,7 @@
   (str "Usage:\n"
        "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]\n"
        "                                                 scaffold goal.md, metrics.md, roles\n"
-       "  swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv\n"
+       "  swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
        "  swarmkhazad open --linear <KEY> [--repo <path>]...\n"
        "                                                 scaffold from a Linear issue, then open\n"
@@ -21,7 +21,8 @@
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"
        "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"
-       "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"))
+       "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"
+       "  swarmkhazad reap [--force]                     prune stale worktrees and delete orphaned sk/* branches from your checkouts\n"))
 
 (defn usage! []
   ;; flush before exit: `print` leaves the text in the buffer and System/exit
@@ -150,6 +151,8 @@
                    (apply (resolve 'portal/-main) (rest args)))
       "telemetry" (do (load-file (str (fs/path script-dir "telemetry.bb")))
                       (apply (resolve 'telemetry/-main) (rest args)))
+      "reap" (do (load-file (str (fs/path script-dir "reap.bb")))
+                 (apply (resolve 'reap/-main) (rest args)))
       (usage!))
     (catch clojure.lang.ExceptionInfo e
       (task-lib/fail! (str "swarmkhazad: " (ex-message e))))))
