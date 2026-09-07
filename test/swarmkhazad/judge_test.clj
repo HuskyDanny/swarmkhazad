@@ -295,3 +295,21 @@
               "gobel's judge called a task partially met by grading three repos as one"))
         (testing "and another role's line is never this one's to grade"
           (is (not (str/includes? mine "THEIRS"))))))))
+
+(deftest the-judge-s-own-escalation-goes-through-note-bb-like-everyone-else
+  ;; "note.bb is the only writer of the bullet files" was true of the roles —
+  ;; the hook denies them — and false of the tool: the judge appended straight
+  ;; to escalation.md, and its line was the only one in a three-repo task that
+  ;; did not say which repo it was about.
+  (with-task {:repo-names ["fixture" "other"]
+              :goal (str "# t-judge\n\n## Goal\n- [ ] a @fixture — GOAL-X\n\n## Not-goal\n- none\n")}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (is (= 1 (:exit (handoff! "a_fixture" "fixture" "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"))))
+      (let [line (str/trim (slurp (str (fs/path dir "escalation.md"))))]
+        (is (str/starts-with? line "- [fixture] **")
+            (str "the repo tag every other bullet carries, and note.bb's format: " line))
+        (is (str/includes? line "a_fixture: goal judge says unmet — GOAL-X"))
+        (is (str/includes? line "** — at ") "claim and why, split where every reader splits them")
+        (is (= 1 (count (str/split-lines line))) "one line, so the file stays parseable")))))
+

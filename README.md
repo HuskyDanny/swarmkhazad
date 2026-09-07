@@ -181,7 +181,7 @@ swarmkhazad telemetry <task-id>                cost, tokens and sessions per rol
 
 Every claude role loads `<task>/hooks/<role>.settings.json` (via `--settings`), which wires `scripts/hooks/run-contract.sh` on `SessionStart` and on every file or shell tool. At `open` the truth is locked (`chmod 444 goal.md metrics.md`). On session start, resume and compact the hook re-locks it and injects the contract, `goal.md` and `metrics.md` verbatim, the bullets so far and the role's own `draft-<role>.md`, so a role that has lost its context gets the truth back without being told to re-read anything. Before any Edit/Write on those two files, or any Bash command that names them (or the task folder itself) with a mutating verb or as a redirect target, the hook denies with a reason that says what to do instead; reads pass. Denials are appended to `state/denials.jsonl`.
 
-Roles report by appending one-line bullets to `decision.md`, `gotcha.md`, `escalation.md` and by writing `draft-<session>.md` (the prompts name it for them); a git handoff's `artifacts:` names that draft.
+Roles report by appending one-line bullets to `decision.md`, `gotcha.md`, `escalation.md` and by writing `draft-<session>.md` (the prompts name it for them); a git handoff's `artifacts:` names that draft. Every bullet goes through `note.bb` — the hook denies a role writing those four files directly, and the tool's own writers (the goal judge, the PR poll) call it too rather than appending themselves, so the `[repo]` tag and the bullet format are one implementation and not a convention each writer has to remember. It appends with `O_APPEND` and takes no lock: one short line is atomic, and a lock here would be ceremony.
 
 ### The goal judge
 

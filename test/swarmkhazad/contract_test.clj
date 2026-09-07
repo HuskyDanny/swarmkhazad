@@ -164,3 +164,66 @@
             (is (some #(str/includes? % "note.bb") reasons) "and so are the bullet-file ones")
             (is (some #(= "Bash" (get % "tool")) entries))
             (is (some #(= "Edit" (get % "tool")) entries))))))))
+
+(deftest the-truth-lock-holds-against-the-three-ways-round-it
+  ;; `chmod 444` alone only stops a plain write; this hook is what stops the
+  ;; chmod. Each case below defeated it, and each is what a role that cannot
+  ;; meet a bar is most motivated to try.
+  (with-task
+    (fn [task sandbox]
+      (session-start task)
+      (testing "a name split by quotes is the name the shell will open"
+        ;; The pre-filter and the match both read the raw word, so `go""al.md`
+        ;; was a file the guard had never heard of. One word to the shell.
+        (doseq [cmd ["chmod 644 go\"\"al.md"
+                     "chmod 644 'goal'.md"
+                     ;; Relative, so the command names neither the task dir nor
+                     ;; any spelling the pre-filter recognises — the only thing
+                     ;; standing between this and the file is the pre-filter
+                     ;; reading the command with its quotes removed.
+                     (str "chmod 644 " task "/go\"\"al.md")
+                     (str "chmod 644 " task "/'goal'.md")
+                     (str "rm -f " task "/met\"\"rics.md")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a tool the denylist never heard of is not therefore a reader"
+        ;; patch, ed, ex, sh — none were on the mutating-verb list, and all of
+        ;; them rewrite a file. The list is an allowlist of READERS now, so the
+        ;; next tool nobody thought of denies instead of passing.
+        (doseq [cmd [(str "patch " task "/goal.md < /tmp/p.diff")
+                     (str "printf '1d\nw\n' | ed -s " task "/goal.md")
+                     (str "ex -sc '1d|x' " task "/goal.md")
+                     (str "sh -c 'echo x > " task "/goal.md'")
+                     (str "install -m 644 /dev/null " task "/metrics.md")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a symlink beside the truth is the truth"
+        ;; Only the DIRECTORY was canonicalized, so `notes.md -> goal.md` was an
+        ;; unknown name in a trusted directory. Three allowed operations —
+        ;; chmod the link, write the link — rewrote the acceptance criteria.
+        (let [link (str task "/notes.md")]
+          (fs/create-sym-link link (str task "/goal.md"))
+          (is (denied? (bash task task (str "chmod 644 " link))))
+          (is (denied? (bash task task (str "printf zzz > " link))))
+          (is (denied? (edit task "Write" link)))
+          (is (denied? (edit task "Edit" "notes.md")) "relative to the tool cwd, too")
+          (fs/delete link))
+        (let [link (str task "/notes.md")]
+          (fs/create-sym-link link (str task "/decision.md"))
+          (is (denied? (edit task "Write" link))
+              "the bullet files are note.bb's to write, by whatever name they are reached")
+          (fs/delete link)))
+      (testing "and the reads the contract promises still pass"
+        ;; The failure mode of an allowlist is over-denial, and a guard that
+        ;; denies `grep bar metrics.md` is a guard someone switches off. Tested
+        ;; on the arguments that look most like commands: a grep pattern and a
+        ;; sed range.
+        (doseq [cmd [(str "grep -n 'bar:' " task "/metrics.md")
+                     (str "sed -n '1,5p' " task "/goal.md")
+                     (str "awk '/Goal/{print}' " task "/goal.md")
+                     (str "cat " task "/goal.md | wc -l")
+                     (str "diff " task "/goal.md " task "/metrics.md")
+                     (str "head -20 " task "/goal.md")
+                     "note.bb escalation 'a claim' 'a why'"]]
+          (is (allowed? (bash task task cmd)) cmd))
+        (is (allowed? (bash task sandbox "patch elsewhere/goal.md < /tmp/p.diff"))
+            "and a goal.md outside the task is still not ours")))))
+

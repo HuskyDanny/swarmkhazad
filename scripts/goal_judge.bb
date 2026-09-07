@@ -249,15 +249,25 @@
 (defn escalate!
   "One escalation line per DISTINCT unmet verdict. Graded once per handoff
    attempt now, so a repeat only happens when the role tried again and still
-   fell short on something new."
+   fell short on something new.
+
+   Through note.bb, like every other writer. Appending here directly made the
+   contract's `note.bb is the only writer` true of the roles — the hook denies
+   them — and false of the tool itself, and the line it wrote carried no
+   `[repo]` tag: in a task with three repos, the judge's own verdicts were the
+   only escalations that did not say which one they were about."
   [ctx session verdict previous]
   (when (and (not (:met verdict))
              (seq (:unmet verdict))
              (not= (set (:unmet verdict)) (set (:unmet previous))))
-    (spit (str (:escalation-file ctx))
-          (str "- **" session ": goal judge says unmet — " (str/join "; " (:unmet verdict)) "** — at "
-               (handoff-lib/timestamp) (when (:down verdict) (str "; judge unavailable: " (:error verdict))) "\n")
-          :append true)))
+    (process/sh {:continue true
+                 :extra-env {"SWARMKHAZAD_SESSION" session
+                             "SWARMKHAZAD_TASK_ID" (:task-id ctx)
+                             "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))}}
+                "bb" (str (fs/path script-dir "note.bb")) "escalation"
+                (str session ": goal judge says unmet — " (str/join "; " (:unmet verdict)))
+                (str "at " (handoff-lib/timestamp)
+                     (when (:down verdict) (str "; judge unavailable: " (:error verdict)))))))
 
 ;; ---------------------------------------------------------------- entry
 

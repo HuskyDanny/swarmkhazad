@@ -117,9 +117,26 @@ deny() {
 # inside a variable is a LITERAL in a case pattern, not an alternation, so that
 # form matches nothing and the guard silently stops denying. Caught by the
 # suite, which is what it is for.
+# follow_link <path>: <path> with a symlinked FINAL component resolved, up to
+# ten hops. Bounded rather than while-true: a symlink loop must not hang a hook
+# that every tool call waits on. `readlink -f` is not portable enough to rely on
+# here — the BSD one only grew it recently.
+follow_link() {
+  local p="$1" t n=0
+  while [ -L "$p" ] && [ "$n" -lt 10 ]; do
+    t=$(readlink "$p") || break
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+    n=$((n + 1))
+  done
+  printf '%s' "$p"
+}
+
 task_file() {
   local p="$1" cwd="$2" want="$3" base dir real f hit=1
-  p="${p#\"}"; p="${p%\"}"; p="${p#\'}"; p="${p%\'}"
+  # Every quote, not just the outer pair. `chmod 644 go""al.md` is one word to
+  # the shell and the file it names is goal.md; matching on the raw word saw
+  # `go""al.md`, matched nothing, and allowed the chmod. RAN.
+  p="${p//\"/}"; p="${p//\'/}"
   p="${p//\$\{SWARMKHAZAD_TASK_DIR\}/$task_dir}"; p="${p//\$SWARMKHAZAD_TASK_DIR/$task_dir}"
   case "$p" in "~"|"~/"*) p="$HOME${p#\~}" ;; esac
   [ -n "$p" ] || return 1
@@ -128,6 +145,12 @@ task_file() {
   if [ "$want" = "$TRUTH_FILES" ]; then
     real=$(cd "$p" 2>/dev/null && pwd -P) && { [ "$real" = "$TASK_REAL" ]; return; }
   fi
+  # Resolve the final component before asking what it is called. Only the
+  # DIRECTORY was canonicalized, so `notes.md -> goal.md` beside goal.md was a
+  # name the guard had never heard of, in a directory it trusted: three allowed
+  # operations — chmod the link, write the link — rewrote the acceptance
+  # criteria the whole contract exists to keep still. RAN.
+  p=$(follow_link "$p")
   base=$(basename "$p")
   for f in $want; do [ "$base" = "$f" ] && { hit=0; break; }; done
   [ "$hit" -eq 0 ] || return 1
@@ -171,8 +194,11 @@ pre_tool_use() {
     Bash)
       cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null) || exit 0
       [ -n "$cmd" ] || exit 0
-      # Cheap pre-filter: nothing here can be about the truth files.
-      case "$cmd" in
+      # Cheap pre-filter: nothing here can be about the truth files. Tested on
+      # the command with its quotes removed, because that is the name the shell
+      # will open — `go""al.md` passed this untouched.
+      bare=${cmd//\"/}; bare=${bare//\'/}
+      case "$bare" in
         *goal.md*|*metrics.md*|*decision.md*|*gotcha.md*|*finding.md*|*escalation.md*|\
         *"$task_dir"*|*SWARMKHAZAD_TASK_DIR*) ;;
         *) exit 0 ;;
@@ -205,6 +231,40 @@ pre_tool_use() {
       if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)([^[:alnum:]_]|$)'; then
         mutating=1
       fi
+      # And anything else. The list above is a denylist, so every tool nobody
+      # thought of walked past it: `patch goal.md < p.diff` and
+      # `printf '1d\nw\n' | ed -s goal.md` both rewrite the file and neither is
+      # named there. RAN. A command that NAMES the truth is held to an ALLOWLIST
+      # of readers instead, so a tool this file has never heard of denies rather
+      # than passes.
+      #
+      # The head of each pipeline segment only. Every word is not a command:
+      # tested that way, `grep -n 'bar:' metrics.md` denied on the pattern and
+      # `sed -n '1,5p' goal.md` on the range — reads the contract explicitly
+      # allows, and the kind of over-denial that gets a guard switched off.
+      # `|| [ -n "$seg" ]`: printf writes no trailing newline, so a command with
+      # no pipe is one unterminated line — read fills seg and returns 1, and a
+      # bare `while read` drops it. The loop then examined nothing at all and
+      # every unknown tool passed, which is the bug this block exists to fix.
+      while IFS= read -r seg || [ -n "$seg" ]; do
+        read -r -a segw <<< "$seg"
+        [ "${#segw[@]}" -gt 0 ] || continue
+        head_word=""
+        for hw in "${segw[@]}"; do
+          case "$hw" in
+            *=*) continue ;;                          # VAR=x prefixes
+            sudo|command|nohup|time|env|builtin) continue ;;
+            *) head_word=$(basename "$hw"); break ;;
+          esac
+        done
+        [ -n "$head_word" ] || continue
+        case "$head_word" in
+          cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|find|\
+          awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
+          readlink|md5|shasum|git|bb|open|true|false|xargs|nl|column|note.bb) ;;
+          *) mutating=1; break ;;
+        esac
+      done < <(printf '%s' "$bare" | tr '|;&\n' '\n\n\n\n')
       if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])(sed|perl)[[:space:]]+(-[[:alnum:]]*i|--in-place)'; then
         mutating=1
       fi
