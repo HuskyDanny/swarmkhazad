@@ -227,3 +227,55 @@
         (is (allowed? (bash task sandbox "patch elsewhere/goal.md < /tmp/p.diff"))
             "and a goal.md outside the task is still not ours")))))
 
+(deftest the-truth-lock-holds-against-three-more-found-by-probing-for-them
+  ;; sec3's three were not the whole set. These came from asking what else
+  ;; reaches a file without spelling its name the way the guard expects.
+  (with-task
+    (fn [task sandbox]
+      (session-start task)
+      (testing "every spelling of the variable the shell would expand"
+        ;; Only `$SWARMKHAZAD_TASK_DIR` and `${SWARMKHAZAD_TASK_DIR}` were
+        ;; substituted, so the default- and error-forms — which expand to the
+        ;; same directory — resolved to a path outside the task. RAN, allowed.
+        (doseq [cmd ["chmod 644 ${SWARMKHAZAD_TASK_DIR:-}/goal.md"
+                     "chmod 644 ${SWARMKHAZAD_TASK_DIR:?}/metrics.md"
+                     "rm -f ${SWARMKHAZAD_TASK_DIR}/goal.md"
+                     "rm -f $SWARMKHAZAD_TASK_DIR/goal.md"]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a path this cannot see until the shell builds it"
+        ;; The substitution has not run, so the word scan sees `/goal.md` — not
+        ;; a path in the task dir — and nothing matched. A command that reaches
+        ;; into the task folder AND builds a path is treated as naming the truth
+        ;; rather than assumed innocent.
+        (doseq [cmd [(str "chmod 644 $(echo " task ")/goal.md")
+                     (str "chmod 644 `echo " task "`/goal.md")
+                     "rm -f $(printf %s ${SWARMKHAZAD_TASK_DIR})/metrics.md"]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "tools that can write are not readers, however ordinary they look"
+        ;; `git` and `bb` were on the reader allowlist and both write:
+        ;; `git checkout -- goal.md` restores the file over itself.
+        (doseq [cmd [(str "git -C " task " checkout -- goal.md")
+                     (str "bb -e '(spit \"" task "/goal.md\" \"x\")'")
+                     (str "echo " task "/goal.md | xargs chmod 644")
+                     (str "find " task " -name goal.md -exec chmod 644 {} +")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "and the work a role actually does is untouched"
+        ;; The whole risk of an allowlist is over-denial, and scratch under
+        ;; tmp/ plus the role's own draft are what a role writes all day.
+        (doseq [cmd ["printf x > $SWARMKHAZAD_TASK_DIR/tmp/draft.txt"
+                     "rm -rf $SWARMKHAZAD_TASK_DIR/tmp/draft.txt"
+                     (str "mkdir -p " task "/tmp/work")
+                     (str "printf x > " task "/draft-implement.md")
+                     (str "git -C " sandbox " status --short")]]
+          (is (allowed? (bash task task cmd)) cmd)))
+      (testing "and a hard link cannot be made in the first place"
+        ;; A hard link is the one reach `follow_link` cannot see — it is not a
+        ;; symlink, and finding it means stat-ing every path-shaped word of
+        ;; every Bash command, on a hook every tool call waits for. It is closed
+        ;; at the other end instead: nothing inside a task can create one.
+        (doseq [cmd [(str "ln " task "/goal.md " task "/hard.md")
+                     "ln goal.md hard.md"
+                     (str "cp -l " task "/goal.md " task "/hard.md")
+                     (str "link " task "/metrics.md " task "/hard.md")]]
+          (is (denied? (bash task task cmd)) cmd))))))
+

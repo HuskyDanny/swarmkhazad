@@ -137,7 +137,11 @@ task_file() {
   # the shell and the file it names is goal.md; matching on the raw word saw
   # `go""al.md`, matched nothing, and allowed the chmod. RAN.
   p="${p//\"/}"; p="${p//\'/}"
-  p="${p//\$\{SWARMKHAZAD_TASK_DIR\}/$task_dir}"; p="${p//\$SWARMKHAZAD_TASK_DIR/$task_dir}"
+  # Every `${SWARMKHAZAD_TASK_DIR...}` form, not just the bare pair: the shell
+  # expands `${SWARMKHAZAD_TASK_DIR:-}` and `${SWARMKHAZAD_TASK_DIR:?}` to the
+  # same directory, and matching only `${...}` and `$...` let those through. RAN.
+  p=$(printf '%s' "$p" | sed -E "s|\\\$\\{SWARMKHAZAD_TASK_DIR[^}]*\\}|$task_dir|g")
+  p="${p//\$SWARMKHAZAD_TASK_DIR/$task_dir}"
   case "$p" in "~"|"~/"*) p="$HOME${p#\~}" ;; esac
   [ -n "$p" ] || return 1
   case "$p" in /*) ;; *) p="$cwd/$p" ;; esac
@@ -227,6 +231,23 @@ pre_tool_use() {
           if classify "$w" "$cwd"; then matched=1; break; fi
         done < <(printf '%s' "$cmd" | grep -oE "[^[:space:]'\"()=,;|&<>]*(goal|metrics|decision|gotcha|finding|escalation)\.md")
       fi
+      # A path assembled at runtime — `chmod 644 $(echo "$d")/goal.md` — is not
+      # a word this can resolve: the substitution has not run yet, and the word
+      # scan sees `/goal.md`, which is not in the task dir. RAN, allowed. So a
+      # command that reaches into the task folder and builds a path with `$(` or
+      # a backtick is treated as naming the truth, and falls to the verb and
+      # allowlist checks below like any other. `rm -rf $SWARMKHAZAD_TASK_DIR/tmp/x`
+      # keeps working — it names the folder but builds nothing.
+      if [ "$matched" -eq 0 ]; then
+        case "$bare" in
+          *'$('*|*'`'*)
+            case "$bare" in
+              *goal.md*|*metrics.md*|*decision.md*|*gotcha.md*|*finding.md*|\
+              *escalation.md*|*"$task_dir"*|*SWARMKHAZAD_TASK_DIR*)
+                matched=1; hit_kind="truth" ;;
+            esac ;;
+        esac
+      fi
       [ "$matched" -eq 1 ] || exit 0
       if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)([^[:alnum:]_]|$)'; then
         mutating=1
@@ -259,9 +280,9 @@ pre_tool_use() {
         done
         [ -n "$head_word" ] || continue
         case "$head_word" in
-          cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|find|\
+          cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|\
           awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
-          readlink|md5|shasum|git|bb|open|true|false|xargs|nl|column|note.bb) ;;
+          readlink|md5|shasum|true|false|nl|column|note.bb) ;;
           *) mutating=1; break ;;
         esac
       done < <(printf '%s' "$bare" | tr '|;&\n' '\n\n\n\n')
