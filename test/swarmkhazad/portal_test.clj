@@ -94,6 +94,14 @@
                 "no full-page reload: it would throw away the terminal's scroll and selection every 5s")
             (is (str/includes? body "id=\"detail\"") "the detail column is swapped by the poller instead")
             (is (str/includes? body "d.replaceWith(n)") "which is what the poller does")
+            ;; Behaviour was verified in a real browser, which this suite cannot
+            ;; drive; these two only catch the line being deleted, which is how
+            ;; the bug got in — a fresh <details> has no `open`, so an expanded
+            ;; escalation snapped shut on the next poll.
+            (is (str/includes? body "n.innerHTML===d.innerHTML")
+                "an unchanged column is not swapped at all, so a text selection survives")
+            (is (str/includes? body "if(open.has(K(x)))x.open=true")
+                "and an escalation the reader expanded is re-opened after a swap")
             (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> implement — the route returns 200 <span class=\"status pending\">pending" body)
                 "no verdict names it, and review's met does not carry the line while implement's and run's are unmet → pending, unchecked")
             (is (re-find #"tests green <span class=\"status unmet\">unmet: implement" body))
@@ -234,10 +242,13 @@
       (let [ctx (@(resolve 'task-lib/task-ctx) "t-brief")
             runnable (@(resolve 'run-evidence/bars) ctx
                       (@(resolve 'project-lib/metrics-md) "t-brief" bars))]
-        (is (= 2 (count runnable)) "two of the three cells carry a command")
+        (is (= 3 (count runnable)) "every bar comes back, so none of them can go missing from the page")
+        (is (= 2 (count (filter :command runnable))) "and two of the three cells carry a command")
         (is (= "docker run --rm <img> -c 'import fastmcp'" (:command (first runnable))))
-        (is (some #(str/includes? % "bounded wait") bars)
-            "and the one whose measure is prose is still written down, not dropped")))
+        (let [prose (first (remove :command runnable))]
+          (is (= "mcp run stays up 60s, no traceback" (:name prose)))
+          (is (str/includes? (:measure prose) "bounded wait")
+              "the prose measure is carried, so the page can say who has to run it"))))
 
     (testing "a heading is short and unbulleted, so a sentence about goals is not one"
       (is (= :goal (heading "Goal")))

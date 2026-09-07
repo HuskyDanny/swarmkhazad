@@ -463,16 +463,29 @@
   "Two loops. The pane is appended to every two seconds and keeps its scroll
    unless the reader had it at the bottom; the detail column is re-fetched every
    five and swapped whole. They never touch each other's DOM, which is why the
-   terminal survives a page that is still live."
+   terminal survives a page that is still live.
+
+   The swap has to carry two things across, because the server has no idea they
+   exist. An unchanged column is not swapped at all — most polls change nothing,
+   and replacing the node drops the reader's text selection every five seconds.
+   And an escalation the reader opened is re-opened afterwards: a fresh <details>
+   has no `open` attribute, so expanding one used to snap shut on the next poll,
+   which reads as the page fighting you. The key is the summary text rather than
+   a position, so an escalation appended above another does not hand its open
+   state to a different row."
   (str "const P=()=>document.getElementById('pane');"
        "setInterval(async()=>{const p=P();if(!p)return;"
        "const r=await fetch('/tasks/'+encodeURIComponent(p.dataset.task)+'/roles/'+encodeURIComponent(p.dataset.role)+'/pane');"
        "if(!r.ok)return;const stick=p.scrollTop+p.clientHeight>=p.scrollHeight-8;"
        "p.textContent=await r.text();if(stick)p.scrollTop=p.scrollHeight;},2000);"
+       "const K=x=>x.querySelector('summary')?.textContent;"
        "setInterval(async()=>{const d=document.getElementById('detail');if(!d)return;"
        "const r=await fetch(location.href);if(!r.ok)return;"
        "const n=new DOMParser().parseFromString(await r.text(),'text/html').getElementById('detail');"
-       "if(n)d.replaceWith(n);},5000);"))
+       "if(!n||n.innerHTML===d.innerHTML)return;"
+       "const open=new Set([...d.querySelectorAll('details[open]')].map(K));"
+       "n.querySelectorAll('details').forEach(x=>{if(open.has(K(x)))x.open=true});"
+       "d.replaceWith(n);},5000);"))
 
 (defn page
   "One shell: an accent mark, the product name linking home, and a crumb —
@@ -733,7 +746,13 @@
            [:div.scroll
             [:table.bars [:tr [:th "bar"] [:th "threshold"] [:th "latest evidence"]]
             (for [b (bars-with-evidence ctx)]
-              [:tr [:td (:name b) [:div.muted [:code (:command b)]]] [:td (:threshold b)]
+              [:tr [:td (:name b)
+                    [:div.muted (if (:command b)
+                                  [:code (:command b)]
+                                  ;; prose, not a command: say so rather than
+                                  ;; showing an empty cell that reads as a bug.
+                                  (list "by hand — " (:measure b)))]]
+               [:td (:threshold b)]
                [:td (if-let [e (:evidence b)]
                       [:div (if (:exit e)
                               [:span.status {:class (if (= "0" (:exit e)) "met" "unmet")} "exit " (:exit e)]
