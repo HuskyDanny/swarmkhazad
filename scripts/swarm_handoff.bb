@@ -133,7 +133,9 @@
 
 (defn body-text [type sender commit message]
   (case type
-    "git_handoff" (str "Re-read your instructions.\n\nmerge_and_process.bb " sender " " commit "\n")
+    "git_handoff" (str "Re-read your instructions.\n\n" sender " committed " commit
+                       " in its repo. Nothing to merge: if that is your repo too, it is already"
+                       " on your branch; if it is not, read the diff there rather than pulling it.\n")
     "note" (str "Re-read your instructions.\n\n" message "\n")))
 
 (defn fresh-stamp
@@ -178,27 +180,69 @@
     (when (fs/regular-file? f)
       (try (cheshire.core/parse-string (slurp (str f)) true) (catch Exception _ nil)))))
 
+(def max-refusals
+  "How many times one session's git_handoff may be refused for unmet goals
+   before the work goes forward carrying the gap. Refusing forever wedges every
+   later role on one that cannot meet its bar. Counted per (role, repo) and NOT
+   per turn: a role told its goals are unmet, which works on them and comes
+   back, is on its second attempt at the same bar however many turns it took."
+  3)
+
+(defn judge-state [ctx sender file]
+  (let [f (fs/path (:state-dir ctx) "judge" (str sender "." file))]
+    (when (fs/regular-file? f)
+      (try (cheshire.core/parse-string (slurp (str f)) true) (catch Exception _ nil)))))
+
+(defn refusals [ctx sender] (or (:count (judge-state ctx sender "refusals")) 0))
+
+(defn record-refusal! [ctx sender]
+  (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
+  (spit (str (fs/path (:state-dir ctx) "judge" (str sender ".refusals")))
+        (cheshire.core/generate-string {:count (inc (refusals ctx sender))})))
+
+(defn clear-refusals! [ctx sender]
+  (fs/delete-if-exists (fs/path (:state-dir ctx) "judge" (str sender ".refusals"))))
+
+(defn grade-now!
+  "Ask the judge to grade this session's committed state, right now.
+
+   The judge runs here rather than on every Stop: it grades the tree being
+   handed over, once per attempt. A judge that cannot run answers met=false
+   with unmet=[judge_unavailable], which the refusal budget then handles like
+   any other gap — an infra fault delays a handoff, it does not wedge the task."
+  [ctx sender]
+  (let [r (process/sh {:continue true
+                       :extra-env {"SWARMKHAZAD_SESSION" sender}}
+                      "bb" (str (fs/path script-dir "goal_judge.bb")) "--grade" sender)]
+    ;; No fallback to the verdict already on disk. That file is the PREVIOUS
+    ;; grading, and a met one would wave this handoff through on the strength
+    ;; of work that was judged before the commit being sent now.
+    (or (try (cheshire.core/parse-string (str/trim (:out r)) true) (catch Exception _ nil))
+        {:met false :unmet ["judge_unavailable"] :down true})))
+
 (defn require-met-verdict!
-  "A git_handoff needs the goal judge's latest verdict for this role to say met.
-   Only claude roles have the Stop hook that produces one; other harnesses pass."
+  "A git_handoff is graded when it is sent, and refused while the goals are
+   unmet — up to a point. After max-refusals the work goes forward carrying the
+   gap: refusing forever wedges every later role on one that cannot meet its
+   bar, which is worse than forwarding work that says plainly what is
+   unfinished. Never silent — the unmet items ride on the handoff and are
+   already in escalation.md.
+
+   Only claude sessions are graded; the other harnesses have no judge."
   [ctx row sender]
   (when (= "claude" (:harness row))
-    (let [v (judge-verdict ctx sender)]
+    (let [v (grade-now! ctx sender)
+          spent (>= (refusals ctx sender) max-refusals)]
       (cond
-        (nil? v)
-        (exit! 1 (str "No goal-judge verdict yet for role " sender ". End your turn so the Stop hook grades your work; hand off after it says met."))
-        ;; The budget is the escape hatch. The judge has told this role the same
-        ;; thing max-blocks times and it still cannot meet the bar; refusing
-        ;; forever would wedge the whole task on one role, which is worse than
-        ;; forwarding work that says plainly what is unfinished. Never silent:
-        ;; the unmet items ride on the handoff and are already in escalation.md.
-        (and (not (:met v)) (:exhausted v))
-        (binding [*out* *err*]
-          (println (str "Goal judge still says unmet for role " sender " after " (count (:unmet v))
-                        " item(s), but its block budget is spent — forwarding, with the gap named on the handoff.")))
-        (not (:met v))
-        (exit! 1 (str "Goal judge says unmet for role " sender ": " (str/join "; " (:unmet v))
-                      ". A git_handoff is refused until the verdict is met. Address the items, end your turn to be re-graded, or write the block to escalation.md."))))))
+        (:met v) nil
+        spent (binding [*out* *err*]
+                (println (str "Goal judge still says unmet for " sender " after " max-refusals
+                              " refusals — forwarding, with the gap named on the handoff.")))
+        :else (do (record-refusal! ctx sender)
+                  (exit! 1 (str "Goal judge says unmet for role " sender ": " (str/join "; " (:unmet v))
+                                ". A git_handoff is refused until the verdict is met (attempt "
+                                (refusals ctx sender) " of " max-refusals
+                                "). Address the items, then send it again, or write the block to escalation.md.")))))))
 
 (defn complete-current! [ctx sender]
   (when (seq (in-process-files ctx sender))
@@ -247,12 +291,18 @@
           (exit! 1 (str "Duplicate active handoff for the same from/to/commit: " dup)))
         (let [verdict (when git? (judge-verdict ctx sender))
               ;; Forwarded past a spent budget: the recipient reads what is
-              ;; unfinished on the handoff itself, not only in a file.
-              unmet (when (and verdict (not (:met verdict)) (:exhausted verdict)) (:unmet verdict))
+              ;; unfinished on the handoff itself, not only in a file. Any
+              ;; unmet verdict that reached this point is a spent one — the
+              ;; gate above refused every other kind.
+              unmet (when (and verdict (not (:met verdict))) (:unmet verdict))
               final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
                                          :commit commit :artifacts artifacts :base base :unmet unmet
                                          :non-forwarding? (and git? (handoff-lib/last-session? ctx sender))})]
           (fs/delete draft)
+          ;; The budget is about one piece of work. Once it is handed over the
+          ;; next attempt starts at zero, or a session that struggled early
+          ;; would find the gate already spent when it mattered.
+          (when git? (clear-refusals! ctx sender))
           (println "HANDOFF QUEUED:" (str final))
           (when git? (complete-current! ctx sender)))))))
 

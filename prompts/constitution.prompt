@@ -8,11 +8,13 @@
 
 ## The judge
 
-- Every time you end a turn, a goal judge grades your working state (commits, diff, `draft-<role>.md`, `evidence/`) against goal.md. If it finds goals unmet it tells you which and keeps your turn open: address them, then stop again. If it finds them met but you have not queued a git_handoff for your current HEAD, it asks for that. A `git_handoff` is refused until the latest verdict says met. What you cannot meet goes to `escalation.md`; the judge writes its own line there too.
+- When you run `swarm_handoff.bb` on a `git_handoff`, a goal judge grades your COMMITTED work (commits, diff, `draft-<session>.md`, `evidence/`) against your own goal lines — the ones naming your role and your repo, plus the ones naming neither. If it finds goals unmet the handoff is refused and it tells you which. Address them and send it again. After three refusals the handoff goes through anyway, carrying the gap, so a bar you cannot meet delays the task rather than stopping it — but write it to `escalation.md` first, and the judge writes its own line there too.
+- Ending a turn does not grade anything. The one thing that will stop you is a reminder: if you have committed work and queued no handoff for it, your turn is held open, because nothing else wakes the next role.
 
 ## Mail
 
-- When a wake-up arrives, or when you start, run `ready_for_next.bb`. `NO_TASK` means stop and wait. `TASK: <path>` means the printed `PAYLOAD` is your work; a `git_handoff` has already been merged into your worktree. `BATCH:` lists several items to treat as one unit.
+- When a wake-up arrives, or when you start, run `ready_for_next.bb`. `NO_TASK` means stop and wait. `TASK: <path>` means the printed `PAYLOAD` is your work. `BATCH:` lists several items to treat as one unit.
+- A `git_handoff` names a commit and the repo it was made in. Nothing is merged: if it is your repo, the commit is already on your branch, because every session working a repo shares its worktree. If it is another repo, read the diff there — you cannot and should not pull it into yours.
 - A wake-up while you are mid-task is ignorable; the mail waits in your inbox.
 - When your work is committed, write a draft under `tmp/`:
 
@@ -25,6 +27,5 @@ priority: 50
   and run `swarm_handoff.bb <draft>`. The helper fills the commit (your worktree HEAD) and the artifacts; never type a SHA. It also completes your current inbound item.
 - If you are the last role, `to: all` addresses every other role — that is the terminal broadcast, and the helper marks it `non-forwarding` for you.
 - A `note` is a short message (`type: note`, `to:`, `priority:`, `message: <one line>`). After acting on an inbound note, run `done_with_current.bb`.
-- A `non-forwarding` inbound git_handoff is the terminal broadcast from the last role: merge it (ready_for_next already did), run `done_with_current.bb`, and stop. Do not forward it.
-- If a merge conflicts, resolve every conflicted file, `git add` them, and commit. Then continue.
+- A `non-forwarding` inbound git_handoff is the terminal broadcast from the last session: read it, run `done_with_current.bb`, and stop. Do not forward it.
 - Commit messages end with `By <your role>.`

@@ -3,9 +3,13 @@
 ;; ready_for_next.bb — accept the next inbox item for this role.
 ;;
 ;; Prints NO_TASK, or TASK: <path> (task mode) / BATCH: <dir> (batch mode) with
-;; the payload, after merging any inbound git_handoff commit into this role's
-;; worktree. If work is already in process it is re-printed, not re-dequeued.
+;; the payload. If work is already in process it is re-printed, not re-dequeued.
 ;; Refuses ambiguous state (two in-process items) rather than guessing.
+;;
+;; Nothing is merged. Sessions in one repo share that repo's worktree, so an
+;; inbound commit is already on the branch; sessions in different repos hold
+;; different histories, and merging one's SHA into the other would fail as "not
+;; something we can merge" — the commit is not in that object store at all.
 
 (ns ready-for-next
   (:require [babashka.fs :as fs]
@@ -23,24 +27,15 @@
   (let [r (process/sh {:continue true :dir (str worktree)} "git" "rev-parse" "--short=10" "HEAD")]
     (when (zero? (:exit r)) (str/trim (:out r)))))
 
-(defn merge-inbound! [worktree file]
-  (when (= "git_handoff" (handoff-lib/header-field file "type"))
-    (let [from (handoff-lib/header-field file "from")
-          commit (handoff-lib/header-field file "commit")]
-      (when (and worktree from commit)
-        (let [r (process/sh {:continue true :dir (str worktree)} "bb" (str (fs/path script-dir "merge_and_process.bb")) from commit)]
-          (print (:out r))
-          (when-not (zero? (:exit r))
-            (fail! 1 (str/trim (str (:err r) "\n" (:out r))))))))))
-
 (defn accept-one! [worktree source target]
   (when (fs/exists? target)
     (fail! 2 (str "AMBIGUOUS_TASK_STATE: target already exists: " target)))
   (fs/move source target)
   (handoff-lib/set-header! target "dequeued_at" (handoff-lib/timestamp))
+  ;; The base is this worktree's HEAD at the moment the work was accepted, so
+  ;; the sender's own diff is what `changed-files` reports on the way out.
   (when-let [head (current-head worktree)]
-    (handoff-lib/set-header! target "task_base_commit" head))
-  (merge-inbound! worktree target))
+    (handoff-lib/set-header! target "task_base_commit" head)))
 
 (defn task-mode! [ctx role worktree]
   (let [{:keys [dir files batches]} (handoff-lib/in-process-state ctx role)]
@@ -49,8 +44,7 @@
     (when (> (count files) 1)
       (fail! 2 "AMBIGUOUS_TASK_STATE: multiple tasks are already in process." (str/join "\n" (map #(str "- " %) files))))
     (if (= 1 (count files))
-      (do (merge-inbound! worktree (first files))
-          (handoff-lib/print-task (first files)))
+      (handoff-lib/print-task (first files))
       (let [new-files (handoff-lib/handoff-files (handoff-lib/new-dir ctx role))]
         (if (empty? new-files)
           (println "NO_TASK")
@@ -71,8 +65,7 @@
     (when (> (count batches) 1)
       (fail! 2 "AMBIGUOUS_TASK_STATE: multiple batches are already in process." (str/join "\n" (map #(str "- " %) batches))))
     (if (= 1 (count batches))
-      (do (doseq [f (handoff-lib/handoff-files (first batches))] (merge-inbound! worktree f))
-          (handoff-lib/print-batch (first batches)))
+      (handoff-lib/print-batch (first batches))
       (let [new-files (handoff-lib/handoff-files (handoff-lib/new-dir ctx role))]
         (if (empty? new-files)
           (println "NO_TASK")

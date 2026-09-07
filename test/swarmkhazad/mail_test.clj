@@ -55,19 +55,25 @@
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-mail."})
         home (str (fs/path sandbox "home"))
         src (str (fs/path sandbox "src" "fixture"))
+        stubdir (str (fs/path sandbox "stubbin"))
         id "t-mail"
-        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" id}]
+        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" id
+             "PATH" (str stubdir ":" (System/getenv "PATH"))}]
     (try
       (make-source-repo! src)
+      (fs/create-dirs stubdir)
+      (fs/copy (fs/path repo-root "test" "fixtures" "stub-claude.sh") (fs/path stubdir "claude"))
+      (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles")) "a claude task\nb claude batch\nc claude\n")
         (spit (str (fs/path dir "repos")) (str src "\n"))
         (run {:env env} cli "prepare" id)
         ;; These tests are about mail. The goal judge's gate on git_handoffs has
-        ;; its own suite; here every role is already judged met.
-        (doseq [role ["a" "b" "c"]]
-          (write! (fs/path dir "state" "judge" (str role ".json")) "{\"met\":true,\"unmet\":[]}"))
+        ;; its own suite; here the stub `claude` on PATH answers met to every
+        ;; grading, so a handoff is never refused for a reason about goals.
+        ;; A pre-written verdict file no longer does this: the gate grades when
+        ;; the handoff is sent, so it would call the model regardless.
         (letfn [(helper [session script & args]
                   (apply run {:dir (str (fs/path dir "worktrees" "fixture"))
                               :env (assoc env "SWARMKHAZAD_SESSION" session "SWARMFORGE_ROLE" session

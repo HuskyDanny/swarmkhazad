@@ -1,8 +1,16 @@
 (ns swarmkhazad.judge-test
-  "goal_judge.bb as a Stop hook, and the git_handoff gate it feeds. The judge
-   model is a stub `claude` on PATH that returns whatever verdict the test asks
-   for (SWARMKHAZAD_STUB_VERDICT), so the decision logic, the files it writes
-   and the gate are pinned without a network call."
+  "goal_judge.bb's two entry points, and the budget between them.
+
+   `--grade <session>` is what swarm_handoff.bb calls at the moment a
+   git_handoff is sent: it grades the committed tree once, and the gate refuses
+   while the verdict is unmet, up to max-refusals. The Stop hook is no longer a
+   grader at all — it is a nudge for a session that has committed work and not
+   handed it off.
+
+   The judge model is a stub `claude` on PATH returning whatever verdict the
+   test asks for (SWARMKHAZAD_STUB_VERDICT), so the decisions, the files and the
+   gate are pinned without a network call. The stub records its argv, which is
+   how a test asserts the judge was NOT called."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -40,298 +48,232 @@
   (git dir "remote" "add" "origin" "https://example.invalid/acme/fixture.git")
   (git dir "update-ref" "refs/remotes/origin/main" (git dir "rev-parse" "HEAD")))
 
-(defn with-task [f]
+(defn with-task
+  "A prepared task over `repo-names` (default one repo), roles a and b on
+   claude and c on grok. f gets the helpers defined here."
+  [{:keys [repo-names goal]} f]
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-judge."})
         home (str (fs/path sandbox "home"))
-        src (str (fs/path sandbox "src" "fixture"))
         stubdir (str (fs/path sandbox "stubbin"))
+        names (or repo-names ["fixture"])
+        srcs (mapv #(str (fs/path sandbox "src" %)) names)
         id "t-judge"
         base-env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" id
-                  "PATH" (str stubdir ":" (System/getenv "PATH"))}]
+                  ;; stubdir first, so `claude` is the verdict stub and `bb` is
+                  ;; the shim that can be told to fail for one script.
+                  "PATH" (str stubdir ":" (System/getenv "PATH"))
+                  "SWARMKHAZAD_STUB_BB_REAL" (str/trim (:out (process/sh "which" "bb")))}]
     (try
-      (make-source-repo! src)
+      (doseq [s srcs] (make-source-repo! s))
       (fs/create-dirs stubdir)
       (fs/copy stub (fs/path stubdir "claude"))
       (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
-      (run {:env base-env} cli "new" id "--repo" src)
+      (fs/copy (fs/path repo-root "test" "fixtures" "stub-bb.sh") (fs/path stubdir "bb"))
+      (fs/set-posix-file-permissions (fs/path stubdir "bb") "rwxr-xr-x")
+      (run {:env base-env} cli "new" id "--repo" (first srcs))
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) "a claude task\nb claude task\nc grok\n")
-        (spit (str (fs/path dir "repos")) (str src "\n"))
-        (spit (str (fs/path dir "goal.md")) "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n\n## Hints\n- none\n")
+        (spit (str (fs/path dir "roles")) "a claude task\nb claude task\nc grok task\n")
+        (spit (str (fs/path dir "repos")) (str/join "" (map #(str % "\n") srcs)))
+        (spit (str (fs/path dir "goal.md"))
+              (or goal "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n"))
         (run {:env base-env} cli "prepare" id)
-        ;; Role a is a working role: something reached its inbox. A role with an
-        ;; empty inbox and an untouched worktree is idle and is not graded at
-        ;; all, which `a-role-with-no-task-yet-is-not-graded-at-all` covers.
-        (write! (fs/path dir "mail" "a" "inbox" "in_process" "50_20260101T000000000Z_from_New-Task_to_a.handoff")
-                "id: seed\nfrom: (New Task)\nto: a\npriority: 50\ntype: note\nmessage: begin\n\nbegin\n")
-        (letfn [(stop! [role verdict & [{:keys [session message]}]]
-                  (run {:dir (str (fs/path dir "worktrees" "fixture"))
-                        :env (cond-> (assoc base-env "SWARMKHAZAD_SESSION" role "SWARMFORGE_ROLE" role
-                                            "SWARMKHAZAD_TASK_DIR" (str dir))
-                               verdict (assoc "SWARMKHAZAD_STUB_VERDICT" verdict))
-                        :in (json/generate-string {"hook_event_name" "Stop" "session_id" (or session "s1")
-                                                   "stop_hook_active" false "last_assistant_message" (or message "done")})
-                        :ok? false}
+        (letfn [(worktree [repo] (str (fs/path dir "worktrees" repo)))
+                (env-for [session extra]
+                  (merge (assoc base-env
+                                "SWARMKHAZAD_SESSION" session
+                                "SWARMFORGE_ROLE" (first (str/split session #"_"))
+                                "SWARMKHAZAD_TASK_DIR" (str dir))
+                         extra))
+                (in-session [session repo extra script & args]
+                  (apply run {:dir (worktree repo) :env (env-for session extra) :ok? false}
+                         "bb" (str (fs/path scripts script)) args))
+                (stop! [session repo & [{:keys [turn]}]]
+                  (run {:dir (worktree repo) :env (env-for session nil) :ok? false
+                        :in (json/generate-string {"hook_event_name" "Stop"
+                                                   "session_id" (or turn "turn-1")})}
                        "bb" (str (fs/path scripts "goal_judge.bb"))))
-                (helper [role script & args]
-                  (apply run {:dir (str (fs/path dir "worktrees" "fixture"))
-                              :env (assoc base-env "SWARMKHAZAD_SESSION" role "SWARMFORGE_ROLE" role
-                                          "SWARMKHAZAD_TASK_DIR" (str dir))
-                              :ok? false}
-                         "bb" (str (fs/path scripts script)) args))]
-          (f {:dir dir :env base-env :stop! stop! :helper helper :src src})))
+                (commit! [repo file]
+                  (write! (fs/path (worktree repo) file) (str file "\n"))
+                  (git (worktree repo) "add" file)
+                  (git (worktree repo) "commit" "-q" "-m" (str "add " file)))
+                (handoff! [session repo to verdict]
+                  (let [draft (fs/path dir "tmp" (str session "-draft.txt"))]
+                    (write! draft (str "type: git_handoff\nto: " to "\npriority: 50\n"))
+                    (in-session session repo (when verdict {"SWARMKHAZAD_STUB_VERDICT" verdict})
+                                "swarm_handoff.bb" (str draft))))]
+          (f {:dir dir :env base-env :srcs srcs
+              :worktree worktree :stop! stop! :commit! commit!
+              :handoff! handoff! :in-session in-session})))
       (finally
         (fs/delete-tree sandbox)))))
 
-(defn decision [r]
-  (when-not (str/blank? (:out r)) (json/parse-string (:out r) true)))
+(defn decision [result]
+  (try (json/parse-string (:out result) true) (catch Exception _ nil)))
 
-(defn handoffs [dir]
-  (if (fs/directory? dir)
-    (->> (concat (fs/glob dir "*.handoff") (fs/glob dir "**/*.handoff")) (filter fs/regular-file?) distinct (sort-by str) vec)
-    []))
+(defn verdict-file [dir session]
+  (let [f (fs/path dir "state" "judge" (str session ".json"))]
+    (when (fs/regular-file? f) (json/parse-string (slurp (str f)) true))))
 
-(defn headers [file]
-  (into {} (for [line (take-while (complement str/blank?) (str/split-lines (slurp (str file))))
-                 :let [[k v] (str/split line #": " 2)]
-                 :when (and k v)]
-             [k v])))
+(defn judge-called? [dir role]
+  (fs/regular-file? (fs/path dir "tmp" (str "judge-" role ".argv"))))
 
-(defn verdict-file [dir role]
-  (json/parse-string (slurp (str (fs/path dir "state" "judge" (str role ".json")))) true))
+(defn queued [dir session]
+  (first (sort (map str (fs/glob (fs/path dir "mail" session "outbox") "*.handoff")))))
 
-(deftest unmet-blocks-the-stop-writes-the-verdict-and-escalates-once-per-distinct-verdict
-  (with-task
-    (fn [{:keys [dir stop!]}]
-      (write! (fs/path dir "evidence" "repo-tests.txt") "bar: repo tests\nexit: 1\n--- output ---\n2 failed EVIDENCE-MARK\n")
-      (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\",\"tests\"]}")]
-        (is (zero? (:exit r)) (:err r))
-        (is (= "block" (:decision (decision r))))
-        (is (str/includes? (:reason (decision r)) "goals unmet: GOAL-X; tests"))
-        (is (str/includes? (:reason (decision r)) "escalation.md")))
-      (let [v (verdict-file dir "a")]
-        (is (false? (:met v)))
-        (is (= ["GOAL-X" "tests"] (:unmet v)))
-        (is (= "block" (:decision v)))
-        (is (= "claude-haiku-stub" (:model v)))
-        (is (= "s1" (:session v))))
-      (testing "the judge got goal.md and the working state, thinking off, bounded, schema-forced"
-        (let [raw (slurp (str (fs/path dir "tmp" "judge-a.argv")))
-              argv (str/split-lines raw)
-              prompt (subs raw (str/index-of raw "<goals_md>"))]
-          (is (some #{"--json-schema"} argv))
-          (is (= "haiku" (second (drop-while #(not= "--model" %) argv))))
-          (is (some #{"--no-session-persistence"} argv))
-          (is (str/includes? prompt "<goals_md>"))
-          (is (str/includes? prompt "GOAL-X"))
-          (is (str/includes? prompt "### git status"))
-          (is (str/includes? prompt "(not written)") "the missing draft is reported, not invented")
-          (is (str/includes? prompt "--- repo-tests.txt\nbar: repo tests\nexit: 1") "the run role's evidence reaches the judge")
-          (is (str/includes? prompt "EVIDENCE-MARK"))
-          (is (str/includes? prompt "### role's last message\ndone"))))
-      (testing "escalation.md got one line naming the unmet items"
-        (let [esc (slurp (str (fs/path dir "escalation.md")))]
-          (is (= 1 (count (re-seq #"goal judge says unmet" esc))))
-          (is (str/includes? esc "**a: goal judge says unmet — GOAL-X; tests**"))))
-      (testing "the same verdict again does not add a second line; a different one does"
-        (stop! "a" "{\"met\":false,\"unmet\":[\"tests\",\"GOAL-X\"]}")
-        (is (= 1 (count (re-seq #"goal judge says unmet" (slurp (str (fs/path dir "escalation.md")))))))
-        (stop! "a" "{\"met\":false,\"unmet\":[\"tests\"]}")
-        (is (= 2 (count (re-seq #"goal judge says unmet" (slurp (str (fs/path dir "escalation.md"))))))))
-      (testing "the block budget: three blocks in one session, then the stop is allowed with the gap named"
-        (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"tests\"]}")]
-          (is (nil? (decision r)) (str "fourth stop allowed: " (:out r)))
-          (is (str/includes? (:reason (verdict-file dir "a")) "max blocks reached; unmet: tests")))
-        (let [r (stop! "a" "{\"met\":false,\"unmet\":[\"tests\"]}" {:session "s2"})]
-          (is (= "block" (:decision (decision r))) "a new session has a fresh budget"))))))
+;; ------------------------------------------------------------ the Stop hook
 
-(deftest met-without-a-handoff-blocks-once-to-ask-for-it-and-met-with-a-handoff-allows
-  (with-task
-    (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
-      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
-      (let [r (stop! "a" nil)]
-        (is (= "block" (:decision (decision r))))
-        (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD"))
-        (is (true? (:met (verdict-file dir "a"))))
-        (is (= "" (slurp (str (fs/path dir "escalation.md")))) "met writes no escalation"))
-      (testing "with the verdict met, the gate lets the git_handoff through"
-        (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
-        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
-          (is (zero? (:exit r)) (:err r))))
-      (testing "now the stop is allowed"
-        (let [r (stop! "a" nil)]
+(deftest the-stop-hook-is-a-nudge-and-never-a-grader
+  (with-task {}
+    (fn [{:keys [dir stop! commit! handoff!]}]
+      (testing "a clean worktree stops freely, and nothing was graded"
+        (let [r (stop! "a" "fixture")]
           (is (nil? (decision r)) (:out r))
-          (is (= "allow" (:decision (verdict-file dir "a"))))))
-      (testing "a handoff for an older commit does not count: new work, new handoff"
-        (write! (fs/path dir "worktrees" "fixture" "x2.txt") "x2\n")
-        (git (fs/path dir "worktrees" "fixture") "add" "x2.txt")
-        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x2")
-        (let [r (stop! "a" nil {:session "s-later"})]
+          (is (not (judge-called? dir "a")) "the Stop hook must not call the model at all")
+          (is (nil? (verdict-file dir "a")) "and must not write a verdict")))
+      (testing "committed work with no handoff keeps the turn open"
+        (commit! "fixture" "x.txt")
+        (let [r (stop! "a" "fixture")]
           (is (= "block" (:decision (decision r))))
-          (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD"))))
-      (testing "every session has a repo now, so a met verdict still owes a handoff"
-        (let [r (stop! "c" nil)]
-          (is (= "block" (:decision (decision r))))
-          (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD")))))))
+          (is (str/includes? (:reason (decision r)) "no git_handoff for its HEAD"))
+          (is (not (judge-called? dir "a")) "still no model call: the nudge is not about goals")))
+      (testing "the nudge is bounded — twice in one turn, then the stop is allowed"
+        (is (= "block" (:decision (decision (stop! "a" "fixture")))) "second nudge")
+        (is (nil? (decision (stop! "a" "fixture"))) "third stop in the same turn is allowed"))
+      (testing "a new turn gets a fresh budget"
+        (is (= "block" (:decision (decision (stop! "a" "fixture" {:turn "turn-2"}))))))
+      (testing "once a handoff is queued for that HEAD the stop is allowed"
+        (is (zero? (:exit (handoff! "a" "fixture" "b" nil))))
+        (is (nil? (decision (stop! "a" "fixture" {:turn "turn-3"})))))
+      (testing "but a NEW commit after that handoff is unsent work again"
+        (commit! "fixture" "y.txt")
+        (let [r (stop! "a" "fixture" {:turn "turn-4"})]
+          (is (= "block" (:decision (decision r)))
+              "the handoff already sent was for the old HEAD; this one has not been handed over")))
+      (testing "a worktree git cannot answer for counts as unsent work, never as none"
+        ;; The two errors are not symmetric: a spurious nudge costs a line in a
+        ;; pane, a missed one leaves the board frozen with nobody watching.
+        (let [wt (fs/path dir "worktrees" "fixture")
+              dotgit (fs/path wt ".git")
+              saved (slurp (str dotgit))]
+          (spit (str dotgit) "gitdir: /nowhere/at/all\n")
+          (try
+            (is (= "block" (:decision (decision (stop! "a" "fixture" {:turn "turn-5"})))))
+            (finally (spit (str dotgit) saved)))))
+      (testing "a session holding the terminal broadcast is never nudged"
+        (write! (fs/path dir "mail" "b" "inbox" "in_process" "50_20260101T000000000Z_from_a_to_b.handoff")
+                "id: x\nfrom: a\nto: b\npriority: 50\ntype: git_handoff\ncommit: 0000000000\nnon-forwarding: true\n\nRe-read.\n")
+        (is (nil? (decision (stop! "b" "fixture"))))))))
 
-(deftest the-gate-refuses-a-git-handoff-without-a-met-verdict
-  (with-task
-    (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
-      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
-      (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
-      (testing "no verdict yet"
-        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
+;; ------------------------------------------------------------ the gate
+
+(deftest the-handoff-gate-grades-once-and-refuses-while-unmet
+  (with-task {}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (testing "an unmet verdict refuses the handoff and says which attempt this is"
+        (let [r (handoff! "a" "fixture" "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
           (is (= 1 (:exit r)))
-          (is (str/includes? (:err r) "No goal-judge verdict yet"))))
-      (testing "unmet verdict"
-        (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")
-        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
+          (is (str/includes? (:err r) "Goal judge says unmet for role a: GOAL-X") (:err r))
+          (is (str/includes? (:err r) "attempt 1 of 3"))
+          (is (judge-called? dir "a") "the gate is where the model runs")
+          (is (false? (:met (verdict-file dir "a"))) "and the verdict is written")
+          (is (fs/exists? (fs/path dir "tmp" "a-draft.txt")) "the draft is left for another attempt")))
+      (testing "the same gap again escalates only once"
+        (let [r (handoff! "a" "fixture" "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
           (is (= 1 (:exit r)))
-          (is (str/includes? (:err r) "Goal judge says unmet for role a: GOAL-X"))
-          (is (fs/exists? (fs/path dir "tmp" "g.txt")) "the draft is left for later")))
-      (testing "a note is never gated"
-        (write! (fs/path dir "tmp" "n.txt") "type: note\nto: b\npriority: 50\nmessage: hi\n")
-        (is (zero? (:exit (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "n.txt")))))))
-      (testing "a role on a harness without hooks is not gated"
-        (let [rows (slurp (str (fs/path dir "state" "sessions.tsv")))
-              with-grok (str/replace rows #"(?m)^b\tb\tfixture\t([^\t]*)\tclaude" "b\tb\tfixture\t$1\tgrok")]
-          (is (not= rows with-grok) "the sessions.tsv row for b was rewritten to grok")
-          (spit (str (fs/path dir "state" "sessions.tsv")) with-grok)
-          (write! (fs/path dir "worktrees" "fixture" "y.txt") "y\n")
-          (git (fs/path dir "worktrees" "fixture") "add" "y.txt")
-          (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "y")
-          (write! (fs/path dir "tmp" "gb.txt") "type: git_handoff\nto: a\npriority: 50\n")
-          (let [r (helper "b" "swarm_handoff.bb" (str (fs/path dir "tmp" "gb.txt")))]
-            (is (zero? (:exit r)) (:err r))))))))
+          (is (str/includes? (:err r) "attempt 2 of 3")))
+        (is (= 1 (count (re-seq #"goal judge says unmet" (slurp (str (fs/path dir "escalation.md"))))))
+            "one line per distinct verdict — the Stop-hook judge wrote one per turn, which is how gobel got 22"))
+      (testing "a different gap is a new line"
+        (let [r (handoff! "a" "fixture" "b" "{\"met\":false,\"unmet\":[\"GOAL-Y\"]}")]
+          (is (= 1 (:exit r)))
+          (is (str/includes? (:err r) "attempt 3 of 3")))
+        (is (= 2 (count (re-seq #"goal judge says unmet" (slurp (str (fs/path dir "escalation.md"))))))))
+      (testing "past the budget the work goes forward carrying the gap"
+        (let [r (handoff! "a" "fixture" "b" "{\"met\":false,\"unmet\":[\"GOAL-Y\"]}")]
+          (is (zero? (:exit r)) (:err r))
+          (is (str/includes? (:err r) "after 3 refusals — forwarding"))
+          (let [sent (queued dir "a")]
+            (is (some? sent) "the handoff was queued")
+            (is (str/includes? (slurp sent) "unmet: GOAL-Y")
+                "the recipient reads the gap on the handoff itself, not only in a file"))))
+      (testing "and the budget resets, so the next piece of work starts clean"
+        (is (not (fs/exists? (fs/path dir "state" "judge" "a.refusals"))))))))
+
+(deftest a-met-verdict-lets-the-handoff-straight-through
+  (with-task {}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (let [r (handoff! "a" "fixture" "b" "{\"met\":true,\"unmet\":[]}")]
+        (is (zero? (:exit r)) (:err r))
+        (is (true? (:met (verdict-file dir "a"))))
+        (is (= "" (slurp (str (fs/path dir "escalation.md")))) "a met verdict escalates nothing")
+        (is (not (str/includes? (slurp (queued dir "a")) "unmet:")) "and nothing rides on the handoff")))))
 
 (deftest a-down-judge-is-never-a-silent-pass
-  (with-task
-    (fn [{:keys [dir stop! helper]}]
-      (doseq [[label mode] [["judge process fails" "down"] ["judge returns no JSON" "garbage"]]]
+  (with-task {}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (doseq [[label mode] [["the judge process fails" "down"] ["the judge returns no JSON" "garbage"]]]
         (fs/delete-if-exists (fs/path dir "state" "judge" "a.json"))
-        (let [r (stop! "a" mode)]
-          (is (zero? (:exit r)) (str label ": " (:err r)))
-          (is (nil? (decision r)) (str label ": the stop is allowed — an infra fault must not wedge the role"))
-          (let [v (verdict-file dir "a")]
-            (is (false? (:met v)) label)
-            (is (= ["judge_unavailable"] (:unmet v)) label)
-            (is (true? (:down v)) label)
-            (is (str/includes? (:reason v) "judge unavailable") label))))
-      (testing "escalation.md says the judge was down"
-        (is (str/includes? (slurp (str (fs/path dir "escalation.md"))) "judge unavailable")))
-      (testing "the gate still refuses the git_handoff"
-        (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
-        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
-        (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
-        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
-          (is (= 1 (:exit r)))
-          (is (str/includes? (:err r) "judge_unavailable")))))))
+        (fs/delete-if-exists (fs/path dir "state" "judge" "a.refusals"))
+        (testing label
+          (let [r (handoff! "a" "fixture" "b" mode)]
+            (is (= 1 (:exit r)) "an unavailable judge refuses rather than waving the handoff through")
+            (is (str/includes? (:err r) "judge_unavailable") (:err r))
+            (is (false? (:met (verdict-file dir "a"))))
+            (is (str/includes? (slurp (str (fs/path dir "escalation.md"))) "judge_unavailable")
+                "and says so where a human will see it"))))
+      (testing "an unavailable judge still spends the budget, so a broken model delays rather than wedges"
+        (is (str/includes? (:err (handoff! "a" "fixture" "b" "down")) "attempt 2 of 3"))
+        (is (str/includes? (:err (handoff! "a" "fixture" "b" "down")) "attempt 3 of 3"))
+        (is (zero? (:exit (handoff! "a" "fixture" "b" "down"))))))))
 
-(deftest a-role-with-no-task-yet-is-not-graded-at-all
-  (with-task
-    (fn [{:keys [dir stop!]}]
-      (testing "open mails only the first role, so every other role's first stop is this"
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
-          (is (zero? (:exit r)) (:err r))
-          (is (nil? (decision r)) "waiting is correct; blocking would tell it to work on a task it never got")
-          (let [v (verdict-file dir "b")]
-            (is (true? (:idle v)))
-            (is (= [] (:unmet v)))
-            (is (str/includes? (:reason v) "no task yet")))
-          (is (not (fs/exists? (fs/path dir "tmp" "judge-b.argv"))) "no model was called: nothing to grade")
-          (is (= "" (slurp (str (fs/path dir "escalation.md")))) "and no false unmet line")))
-      (testing "once mail arrives, the role is graded again"
-        (write! (fs/path dir "mail" "b" "inbox" "in_process" "50_x_from_a_to_b.handoff")
-                "id: x\nfrom: a\nto: b\npriority: 50\ntype: note\nmessage: go\n\ngo\n")
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
-          (is (= "block" (:decision (decision r))))
-          (is (str/includes? (:reason (decision r)) "goals unmet: GOAL-X"))))
-      (testing "mail delivered but not yet accepted is still mail — handoffd writes to inbox/new first"
-        (write! (fs/path dir "mail" "b" "inbox" "new" "50_y_from_a_to_b.handoff")
-                "id: y\nfrom: a\nto: b\npriority: 50\ntype: git_handoff\ncommit: 0000000000\nnon-forwarding: true\n\nmerge me\n")
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-new"})]
-          (is (= "block" (:decision (decision r)))
-              "otherwise a terminal broadcast can sit undelivered while its recipient is told nothing has arrived")))
-      (testing "a role with an empty inbox that has COMMITTED is graded — the worktree half of idle?"
-        ;; b, not a: a's fixture seeds mail, so a would be non-idle for that
-        ;; reason alone and this case would pass with untouched? deleted.
-        (doseq [f (concat (fs/glob (fs/path dir "mail" "b" "inbox" "new") "*.handoff")
-                          (fs/glob (fs/path dir "mail" "b" "inbox" "in_process") "*.handoff"))]
-          (fs/delete f))
-        (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
-        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-commit"})]
-          (is (= "block" (:decision (decision r))))
-          (is (not (:idle (verdict-file dir "b"))))))
-      (testing "an uncommitted change also counts as touched"
-        (git (fs/path dir "worktrees" "fixture") "reset" "-q" "--hard" "HEAD~1")
-        (write! (fs/path dir "worktrees" "fixture" "dirty.txt") "d\n")
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-dirty"})]
-          (is (= "block" (:decision (decision r))))
-          (is (not (:idle (verdict-file dir "b"))))))
-      (testing "a git that cannot answer counts as touched, never as idle"
-        (fs/delete-tree (fs/path dir "worktrees" "fixture" "dirty.txt"))
-        (fs/delete-if-exists (fs/path dir "worktrees" "fixture" ".git"))
-        (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-broken"})]
-          (is (= "block" (:decision (decision r)))
-              "a broken worktree must be graded, not silently excused as having no task"))))))
+(deftest a-crashing-judge-process-is-not-a-stale-pass
+  (with-task {}
+    (fn [{:keys [dir commit! handoff! in-session]}]
+      (commit! "fixture" "x.txt")
+      (testing "first, a met verdict is on disk"
+        (is (zero? (:exit (handoff! "a" "fixture" "b" "{\"met\":true,\"unmet\":[]}"))))
+        (is (true? (:met (verdict-file dir "a")))))
+      (testing "then the judge process itself dies: the handoff is refused, not passed on the old verdict"
+        (commit! "fixture" "y.txt")
+        (write! (fs/path dir "tmp" "a-draft.txt") "type: git_handoff\nto: b\npriority: 50\n")
+        (let [r (in-session "a" "fixture" {"SWARMKHAZAD_STUB_BB_FAIL" "goal_judge.bb"}
+                            "swarm_handoff.bb" (str (fs/path dir "tmp" "a-draft.txt")))]
+          (is (= 1 (:exit r)) "the verdict already on disk says met — using it here would be a stale pass")
+          (is (str/includes? (:err r) "judge_unavailable") (:err r)))))))
 
-(deftest a-role-is-graded-on-its-own-goal-lines-not-the-whole-task
-  (with-task
-    (fn [{:keys [dir stop!]}]
-      (fs/set-posix-file-permissions (fs/path dir "goal.md") "rw-r--r--")
-      (spit (str (fs/path dir "goal.md"))
-            "# t\n\n## Goal\n- [ ] a — MINE-ONE\n- [ ] b — THEIRS\n- [ ] MINE-SHARED with no role named\n\n## Not-goal\n- none\n")
-      (stop! "a" "{\"met\":false,\"unmet\":[\"MINE-ONE\"]}")
+(deftest a-harness-with-no-judge-is-not-graded-at-all
+  (with-task {}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (let [r (handoff! "c" "fixture" "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")]
+        (is (zero? (:exit r)) (:err r))
+        (is (not (judge-called? dir "c")) "grok has no judge: nothing graded, nothing refused")
+        (is (nil? (verdict-file dir "c")))))))
+
+;; ------------------------------------------------------------ granularity
+
+(deftest a-session-is-graded-on-its-own-repo-s-goal-lines
+  (with-task {:repo-names ["fixture" "other"]
+              :goal (str "# t-judge\n\n## Goal\n"
+                         "- [ ] a @fixture — MINE-FIXTURE\n"
+                         "- [ ] a @other — MINE-OTHER\n"
+                         "- [ ] b — THEIRS\n"
+                         "- [ ] SHARED with no role and no repo\n\n"
+                         "## Not-goal\n- none\n")}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (is (zero? (:exit (handoff! "a_fixture" "fixture" "a_other" "{\"met\":true,\"unmet\":[]}"))))
       (let [prompt (slurp (str (fs/path dir "tmp" "judge-a.argv")))
-            goals (subs prompt (str/index-of prompt "<goals_md>") (str/index-of prompt "</goals_md>"))]
-        (testing "the Goal section carries this role's lines and the unowned one"
-          (is (str/includes? goals "- [ ] a — MINE-ONE"))
-          (is (str/includes? goals "- [ ] MINE-SHARED with no role named")))
-        (testing "another role's line is moved out of the Goal section and labelled"
-          (is (str/includes? goals "## Not yours — other roles own these; do not grade them\n- [ ] b — THEIRS"))
-          (is (< (str/index-of goals "- [ ] a — MINE-ONE") (str/index-of goals "Not yours"))
-              "a role's own lines come first; the others are context after them"))
-        (testing "graded whole, every role of a multi-role task is unmet until the last one finishes"
-          (is (= 1 (count (re-seq #"- \[ \] b — THEIRS" goals)))
-              "b's line appears once, only in the not-yours block"))))))
-
-(deftest a-spent-block-budget-lets-the-handoff-through-carrying-the-gap
-  (with-task
-    (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
-      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
-      (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
-      (testing "while blocks remain, an unmet role is refused"
-        (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")
-        (is (= 1 (:exit (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))))))
-      (testing "after the budget is spent, it goes through — refusing forever would wedge the task on one role"
-        (dotimes [_ 3] (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"))
-        (is (true? (:exhausted (verdict-file dir "a"))))
-        (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
-          (is (zero? (:exit r)) (:err r))
-          (is (str/includes? (:err r) "block budget is spent"))))
-      (testing "and the handoff names the gap, so the recipient is never told the work is clean"
-        (let [h (headers (first (handoffs (fs/path dir "mail" "a" "outbox"))))]
-          (is (= "GOAL-X" (get h "unmet"))))))))
-
-(deftest the-hook-is-inert-outside-a-role-and-on-other-events
-  (let [r (process/sh {:continue true :in "{\"hook_event_name\":\"Stop\"}" :extra-env {"SWARMKHAZAD_TASK_DIR" "" "SWARMFORGE_ROLE" ""}}
-                      "bb" (str (fs/path scripts "goal_judge.bb")))]
-    (is (zero? (:exit r)))
-    (is (str/blank? (:out r))))
-  (with-task
-    (fn [{:keys [dir env]}]
-      (let [r (run {:env (assoc env "SWARMFORGE_ROLE" "a" "SWARMKHAZAD_TASK_DIR" (str dir))
-                    :in "{\"hook_event_name\":\"PreToolUse\"}" :ok? false}
-                   "bb" (str (fs/path scripts "goal_judge.bb")))]
-        (is (zero? (:exit r)))
-        (is (str/blank? (:out r)))
-        (is (not (fs/exists? (fs/path dir "state" "judge" "a.json"))) "no verdict for a non-Stop event")))))
+            goals (subs prompt (str/index-of prompt "<goals_md>") (str/index-of prompt "</goals_md>"))
+            mine (str/replace goals #"(?s)## Not yours.*" "")]
+        (testing "this session's own repo line is graded, and so is the untagged one"
+          (is (str/includes? mine "MINE-FIXTURE"))
+          (is (str/includes? mine "SHARED with no role and no repo")))
+        (testing "the same role's OTHER repo is not — that is a different session's verdict"
+          (is (not (str/includes? mine "MINE-OTHER"))
+              "gobel's judge called a task partially met by grading three repos as one"))
+        (testing "and another role's line is never this one's to grade"
+          (is (not (str/includes? mine "THEIRS"))))))))

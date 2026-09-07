@@ -1,25 +1,33 @@
 #!/usr/bin/env bb
 
-;; goal_judge.bb — khazad's GoalJudgeModel as a Stop hook on every claude role.
+;; goal_judge.bb — khazad's GoalJudgeModel, at the handoff boundary.
 ;;
-;; When a role tries to end its turn, this grades the role's working state
-;; against goal.md with a cheap model (schema-forced {met, unmet}, thinking
-;; off, bounded output) and decides, as khazad's decide_stop does:
+;; Two entry points, and the split is the whole design:
 ;;
-;;   unmet, budget left        block the stop: "goals unmet: …" — keep working
-;;   met, no handoff yet       block once more: "send your git_handoff" — nothing
-;;                             else wakes a role that stops with met work unsent
-;;   met and handed off        allow
-;;   terminal inbound          allow (the last role's broadcast: merge and stop)
-;;   budget exhausted          allow, but the verdict stands
-;;   judge down                allow the stop (an infra fault must not wedge the
-;;                             role) — but the verdict is met=false,
-;;                             unmet=[judge_unavailable]: never a silent pass
+;;   goal_judge.bb --grade <session>
+;;     Grade this session's COMMITTED state against its own goal lines with a
+;;     cheap model (schema-forced {met, unmet}, thinking off, bounded output),
+;;     write state/judge/<session>.json, print it. swarm_handoff.bb calls this
+;;     once, when a git_handoff is actually being sent, and refuses the handoff
+;;     while the verdict is unmet — until the refusal budget for that session is
+;;     spent, after which the work goes forward with the gap named on it.
 ;;
-;; The verdict is written to state/judge/<role>.json; swarm_handoff.bb refuses a
-;; git_handoff unless the latest verdict says met. Unmet items go to
-;; escalation.md as one bullet per distinct verdict. Evidence under
-;; <task>/evidence/ is part of the state the judge reads.
+;;   goal_judge.bb          (Stop hook, hook JSON on stdin)
+;;     A NUDGE, and nothing about goals: if the session has committed work and
+;;     no git_handoff for that HEAD, keep the turn open and say so. That is the
+;;     one failure a stopping role cannot see — it finishes, stops, and the
+;;     board freezes with nobody watching.
+;;
+;; Grading used to run on EVERY stop. Measured on gobel: the same role graded
+;; four times in one turn, three escalation lines saying the same thing, and a
+;; verdict that flipped UNMET → MET on a tree with no commit and no evidence
+;; write in between. Grading once, on the committed tree, at the moment the work
+;; is handed over, removes the duplicates and the flipping by removing the
+;; repetition rather than patching it.
+;;
+;; A judge that cannot run is never a silent pass: the verdict is met=false,
+;; unmet=[judge_unavailable], and the refusal budget still applies, so an infra
+;; fault delays a handoff rather than wedging the task.
 ;;
 ;; The judge call runs through the role's own environment — a kimi role grades
 ;; with kimi's small model — via `claude -p --json-schema`.
@@ -33,7 +41,11 @@
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 
-(def max-blocks 3)
+(def max-nudges
+  "How many times one turn may be held open to ask for a handoff. The nudge is
+   for forgetting, not for arguing: a role that has been told twice and still
+   has not sent one is telling you something the pane cannot fix."
+  2)
 (def judge-timeout-ms 120000)
 (def max-chars 6000)
 (def judge-unavailable "judge_unavailable")
@@ -104,18 +116,23 @@
          (str/join "\n" (for [p paths] (str "--- " (fs/file-name p) "\n" (clip (slurp (str p))))))
          "\n")))
 
-(defn working-state [ctx role worktree last-message]
-  (let [draft (fs/path (:task-dir ctx) (str "draft-" role ".md"))
+(defn working-state
+  "What the judge grades: the session's commits and diff, its draft write-up,
+   and the measurements under evidence/.
+
+   The role's last assistant message used to be part of this. It is not any
+   more: grading happens when the handoff is sent, and what is being handed
+   over is the commit, never the sentence the role wrote about it."
+  [ctx session worktree]
+  (let [draft (fs/path (:task-dir ctx) (str "draft-" session ".md"))
         evidence (when (fs/directory? (:evidence-dir ctx))
                    (->> (fs/list-dir (:evidence-dir ctx)) (filter fs/regular-file?) (sort-by str)))]
-    (str "role: " role "\n\n"
-         (or (git-state worktree) "### repo\n(this role has no repo)\n") "\n"
+    (str "session: " session "\n\n"
+         (or (git-state worktree) "### repo\n(unavailable)\n") "\n"
          (if (fs/regular-file? draft)
-           (str "### draft-" role ".md\n" (clip (slurp (str draft))) "\n\n")
-           (str "### draft-" role ".md\n(not written)\n\n"))
-         (or (files-section "evidence" evidence) "### evidence\n(none)\n\n")
-         (when-not (str/blank? last-message)
-           (str "### role's last message\n" (clip last-message) "\n")))))
+           (str "### draft-" session ".md\n" (clip (slurp (str draft))) "\n\n")
+           (str "### draft-" session ".md\n(not written)\n\n"))
+         (or (files-section "evidence" evidence) "### evidence\n(none)\n\n"))))
 
 ;; ---------------------------------------------------------------- judge call
 
@@ -156,20 +173,20 @@
 
 ;; ---------------------------------------------------------------- decision
 
-(defn verdict-file [ctx role] (fs/path (:state-dir ctx) "judge" (str role ".json")))
-(defn blocks-file [ctx role] (fs/path (:state-dir ctx) "judge" (str role ".blocks")))
+(defn verdict-file [ctx session] (fs/path (:state-dir ctx) "judge" (str session ".json")))
+(defn nudges-file [ctx session] (fs/path (:state-dir ctx) "judge" (str session ".nudges")))
 
 (defn read-json [path]
   (when (fs/regular-file? path)
     (try (json/parse-string (slurp (str path)) true) (catch Exception _ nil))))
 
-(defn blocks-so-far [ctx role session-id]
-  (let [b (read-json (blocks-file ctx role))]
-    (if (= session-id (:session b)) (or (:count b) 0) 0)))
+(defn nudges-so-far [ctx session turn]
+  (let [b (read-json (nudges-file ctx session))]
+    (if (= turn (:turn b)) (or (:count b) 0) 0)))
 
-(defn record-block! [ctx role session-id]
-  (spit (str (blocks-file ctx role))
-        (json/generate-string {:session session-id :count (inc (blocks-so-far ctx role session-id))})))
+(defn record-nudge! [ctx session turn]
+  (spit (str (nudges-file ctx session))
+        (json/generate-string {:turn turn :count (inc (nudges-so-far ctx session turn))})))
 
 (defn handoff-sent?
   "Has this role queued a git_handoff for its current HEAD (outbox or sent)?"
@@ -200,104 +217,121 @@
                                               "git" "rev-parse" "--verify" "--quiet" r))))]
     (first (filter ok? ["origin/HEAD" "main" "master"]))))
 
-(defn untouched?
-  "The worktree holds no work: nothing committed past the clone's base and
-   nothing uncommitted. A failure to answer counts as touched — never claim a
-   role is idle because a git command did not run."
+(defn committed-past-base?
+  "The worktree holds commits past the task branch's base.
+
+   A git that cannot answer counts as committed. The two errors are not
+   symmetric: a spurious nudge costs one line in a pane nobody is reading,
+   a missed one leaves the board frozen."
   [worktree]
   (if (nil? worktree)
-    true
+    false
     (if-let [base (base-ref worktree)]
-      (let [count (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" (str base "..HEAD"))
-            dirty (process/sh {:continue true :dir (str worktree)} "git" "status" "--porcelain")]
-        (and (zero? (:exit count)) (= "0" (str/trim (:out count)))
-             (zero? (:exit dirty)) (str/blank? (:out dirty))))
-      false)))
+      (let [r (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" (str base "..HEAD"))]
+        (or (not (zero? (:exit r))) (not= "0" (str/trim (:out r)))))
+      true)))
 
-(defn idle?
-  "The role has never had work: no mail has ever reached it and its worktree is
-   untouched. `open` mails only the first role, so every other role's first stop
-   is this — and grading it against a goal it was never handed is how a swarm
-   greets itself with a wall of false unmet lines."
-  [ctx role worktree]
-  (and (empty? (handoff-lib/in-process-files ctx role))
-       ;; inbox/new too: handoffd delivers there first, so mail the role has not
-       ;; accepted yet is still mail. Without this, a role whose turn ended
-       ;; between delivery and ready_for_next is told "nothing has reached your
-       ;; inbox" while a handoff — a terminal broadcast, even — sits in it.
-       (empty? (handoff-lib/handoff-files (handoff-lib/new-dir ctx role)))
-       (empty? (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role)))
-       (empty? (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role)))
-       (empty? (handoff-lib/handoff-files (fs/path (handoff-lib/mail-dir ctx role) "sent")))
-       (untouched? worktree)))
+(defn nudge
+  "What to say when a session ends its turn, or nil to let it stop.
 
-(defn decide
-  "khazad's decide_stop: {:block? bool :reason str}."
-  [{:keys [met unmet down]} {:keys [terminal? sent? blocks idle]}]
+   Nothing here is about goals — those are graded once, when the handoff is
+   sent. This is the one thing a stopping role cannot see about itself."
+  [{:keys [terminal? sent? committed? nudges]}]
   (cond
-    idle {:block? false :reason "no task yet: nothing has reached this role's inbox and it has committed nothing. Waiting is correct."}
-    terminal? {:block? false :reason "terminal broadcast received; merge and stop"}
-    (>= blocks max-blocks) {:block? false :exhausted true
-                            :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
-    down {:block? false :reason "judge unavailable; verdict is met=false until it returns"}
-    (not met) {:block? true :reason (str "goals unmet: " (str/join "; " unmet) ". Keep working on these, then stop again. A bar you cannot meet is an escalation.md line.")}
-    (not sent?) {:block? true :reason "goals met, but no git_handoff for your current HEAD has been queued. Commit if needed, then run swarm_handoff.bb on a git_handoff draft, then stop."}
-    :else {:block? false :reason nil}))
+    terminal? nil
+    (not committed?) nil
+    sent? nil
+    (>= nudges max-nudges) nil
+    :else (str "You have committed work in this worktree and no git_handoff for its HEAD. "
+               "Nothing else wakes the next role: write a git_handoff draft under the task's tmp/ "
+               "and run swarm_handoff.bb on it. If the work is not ready, say why in escalation.md first.")))
 
-(defn escalate! [ctx role verdict previous]
+(defn escalate!
+  "One escalation line per DISTINCT unmet verdict. Graded once per handoff
+   attempt now, so a repeat only happens when the role tried again and still
+   fell short on something new."
+  [ctx session verdict previous]
   (when (and (not (:met verdict))
-             (not (:idle verdict))
              (seq (:unmet verdict))
              (not= (set (:unmet verdict)) (set (:unmet previous))))
     (spit (str (:escalation-file ctx))
-          (str "- **" role ": goal judge says unmet — " (str/join "; " (:unmet verdict)) "** — at "
+          (str "- **" session ": goal judge says unmet — " (str/join "; " (:unmet verdict)) "** — at "
                (handoff-lib/timestamp) (when (:down verdict) (str "; judge unavailable: " (:error verdict))) "\n")
           :append true)))
 
-(defn -main []
-  (let [task-dir (System/getenv "SWARMKHAZAD_TASK_DIR")
-        role (System/getenv "SWARMKHAZAD_SESSION")]
-    (when (or (str/blank? task-dir) (str/blank? role) (not (fs/directory? task-dir)))
-      (System/exit 0))
-    (let [input (try (json/parse-string (slurp *in*)) (catch Exception _ {}))
-          _ (when-not (= "Stop" (get input "hook_event_name")) (System/exit 0))
-          ctx (task-lib/ctx-from-env)
-          row (task-lib/session-row ctx role)
+;; ---------------------------------------------------------------- entry
+
+(defn session-ctx
+  "The task ctx, the session's row, and the goal.md its verdict is about."
+  [session]
+  (let [ctx (task-lib/ctx-from-env)
+        row (task-lib/session-row ctx session)
+        goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
+        split (goals-for-session goals-md (or (:role row) session) (:repo row))]
+    {:ctx ctx
+     :row row
+     :worktree (:worktree-path row)
+     :goals (str (:whole split)
+                 (when (seq (:others split))
+                   (str "\n\n## Not yours — other roles own these; do not grade them\n"
+                        (str/join "\n" (:others split)) "\n")))}))
+
+(defn grade!
+  "Grade the session's committed state now, write the verdict, return it.
+
+   This is the only place a verdict is produced. Called by swarm_handoff.bb at
+   the moment a git_handoff is sent, so the tree being graded is the tree being
+   handed over — gobel's judge produced a wrong \"not committed\" verdict once by
+   grading something else."
+  [session]
+  (let [{:keys [ctx worktree goals]} (session-ctx session)
+        previous (read-json (verdict-file ctx session))
+        verdict (grade goals (working-state ctx session worktree))]
+    (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
+    (spit (str (verdict-file ctx session))
+          (json/generate-string (merge verdict {:role session :at (handoff-lib/timestamp)})
+                                {:pretty true}))
+    (escalate! ctx session verdict previous)
+    verdict))
+
+(defn grade-cmd!
+  "`goal_judge.bb --grade <session>` — grade and print the verdict as JSON."
+  [session]
+  (println (json/generate-string (grade! session)))
+  (System/exit 0))
+
+(defn stop-hook!
+  "The Stop hook: a nudge when work is committed and unsent, nothing more."
+  [session]
+  (let [input (try (json/parse-string (slurp *in*)) (catch Exception _ {}))]
+    (when-not (= "Stop" (get input "hook_event_name")) (System/exit 0))
+    (let [ctx (task-lib/ctx-from-env)
+          row (task-lib/session-row ctx session)
           worktree (:worktree-path row)
-          session-id (or (get input "session_id") "unknown")
-          goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
-          split (goals-for-session goals-md (or (:role row) role) (:repo row))
-          goals (str (:whole split)
-                     (when (seq (:others split))
-                       (str "\n\n## Not yours — other roles own these; do not grade them\n"
-                            (str/join "\n" (:others split)) "\n")))
-          previous (read-json (verdict-file ctx role))
-          idle (idle? ctx role worktree)
-          ;; An idle role is not graded at all: there is nothing to grade, and a
-          ;; model call per idle stop is spend for a foregone answer.
-          verdict (if idle
-                    {:met false :unmet [] :idle true}
-                    (grade goals (working-state ctx role worktree (get input "last_assistant_message"))))
-          facts {:terminal? (terminal-inbound? ctx role)
-                 :sent? (handoff-sent? ctx role worktree)
-                 :idle idle
-                 :blocks (blocks-so-far ctx role session-id)}
-          decision (decide verdict facts)]
-      (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
-      (spit (str (verdict-file ctx role))
-            (json/generate-string (merge verdict {:role role :at (handoff-lib/timestamp) :session session-id
-                                                  :exhausted (boolean (:exhausted decision))
-                                                  :decision (if (:block? decision) "block" "allow") :reason (:reason decision)})
-                                  {:pretty true}))
-      (escalate! ctx role verdict previous)
-      (when (:block? decision)
-        (record-block! ctx role session-id)
-        (println (json/generate-string {:decision "block" :reason (:reason decision)})))
+          turn (or (get input "session_id") "unknown")
+          reason (nudge {:terminal? (terminal-inbound? ctx session)
+                         :sent? (handoff-sent? ctx session worktree)
+                         :committed? (committed-past-base? worktree)
+                         :nudges (nudges-so-far ctx session turn)})]
+      (when reason
+        (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
+        (record-nudge! ctx session turn)
+        (println (json/generate-string {:decision "block" :reason reason})))
       (System/exit 0))))
+
+(defn -main [& args]
+  (let [task-dir (System/getenv "SWARMKHAZAD_TASK_DIR")
+        session (or (first (remove #(str/starts-with? % "--") args))
+                    (System/getenv "SWARMKHAZAD_SESSION"))]
+    (when (or (str/blank? task-dir) (str/blank? session) (not (fs/directory? task-dir)))
+      (System/exit 0))
+    (if (some #{"--grade"} args)
+      (grade-cmd! session)
+      (stop-hook! session))))
 
 (when (= (str *file*) (System/getProperty "babashka.file"))
   (try
-    (-main)
+    (apply -main *command-line-args*)
     (catch Exception e
       ;; Fail OPEN on our own bugs: a hook that crashes must not wedge the role.
       (binding [*out* *err*] (println "goal_judge:" (ex-message e)))

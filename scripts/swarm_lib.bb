@@ -192,7 +192,7 @@
          (if next-session
            (str " Forward finished work to `" next-session "`.\n")
            " You are the last session: your git_handoff goes to every other session and closes the task.\n")
-         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb, merge_and_process.bb\n\n")))
+         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb\n\n")))
 
 (defn write-prompt!
   "prompts/<session>.md: the session header, the constitution, the stage prompt.
