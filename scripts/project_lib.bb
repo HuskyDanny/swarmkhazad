@@ -185,6 +185,141 @@
 
 ;; ---------------------------------------------------------------- goal + metrics
 
+(def section-names
+  "Heading text → the section it opens. A brief is written by a person or by
+   another agent, so the same three sections arrive under many names; the match
+   is by edit distance against these, which absorbs the variants nobody thinks
+   to list and the typos nobody means to make.
+
+   `non-goals` is 5 edits from `goal` and would never match it anyway; what
+   keeps the two apart is that both are spelled out here, not a tie-break. Add a
+   name that collides with another section's and this stops being true — the
+   list is the mechanism, so it is the thing to be careful with."
+  {:goal ["goal" "goals" "goal lines" "objective" "objectives"]
+   :not-goal ["not-goal" "not-goals" "not goal" "not goals" "non-goal" "non-goals"
+              "nongoal" "nongoals" "out of scope" "out-of-scope" "non goals"]
+   :bars ["quantitative bars" "quantitative" "quality bars" "metrics bars" "metrics"
+          "bars" "acceptance" "acceptance criteria" "qualitative bars" "measures"]})
+
+(defn edit-distance
+  "Levenshtein, two rows. Short strings only — this compares headings."
+  [a b]
+  (let [b (vec b)]
+    (last
+     (reduce (fn [prev [i ca]]
+               (reduce (fn [row [j cb]]
+                         (conj row (min (inc (peek row))
+                                        (inc (nth prev (inc j)))
+                                        (+ (nth prev j) (if (= ca cb) 0 1)))))
+                       [(inc i)]
+                       (map-indexed vector b)))
+             (vec (range (inc (count b))))
+             (map-indexed vector a)))))
+
+(defn bullet? [line]
+  (boolean (re-find #"^\s*(?:[-*+•]\s|\[[ xX]?\]|\d+[.)]\s)" line)))
+
+(defn heading
+  "The section this line opens, or nil.
+
+   A line carrying a bullet marker is an item, never a heading. `*` is a marker
+   AND emphasis, so `* Goals` normalises to exactly `goals` and would otherwise
+   open a section from inside a list; the dash forms are safe by distance alone.
+
+   No length check is needed. An edit distance is at least the difference in
+   length, so a line more than four characters longer than the name it is being
+   compared to cannot match one — a sentence is out of reach for free."
+  [line]
+  (let [raw (str/trim line)]
+    (when-not (or (str/blank? raw) (bullet? raw))
+      (let [s (-> (str/lower-case raw)
+                  (str/replace #"^#+\s*" "")
+                  (str/replace #"[*_`:#]" "")
+                  (str/replace #"\s+" " ")
+                  str/trim)]
+        (when (seq s)
+          (first (for [[k names] section-names
+                       n names
+                       :when (<= (edit-distance s n) (max 1 (quot (count n) 4)))]
+                   k)))))))
+
+(defn strip-marker
+  "One line of a section, with its bullet or checkbox marker removed and nothing
+   else touched. The `- [ ] <role> — ` prefix the judge grades against is added
+   when goal.md is written, so a line that already names its role keeps it."
+  [line]
+  (-> (str/trim line)
+      (str/replace #"^[-*+•]\s*" "")
+      (str/replace #"^\d+[.)]\s+" "")
+      (str/replace #"^\[[ xX]?\]\s*" "")
+      str/trim))
+
+(defn table-row? [line]
+  (let [raw (str/trim line)]
+    (and (str/starts-with? raw "|") (str/ends-with? raw "|") (> (count raw) 1))))
+
+(defn table-cells
+  "The cells of a markdown table row, or nil when the row is structure rather
+   than content: a separator (`|---|---|`) or a header naming the columns.
+
+   Callers must ask `table-row?` first. Nil here means \"a table row with nothing
+   in it\", which is not the same as \"not a table row\" — conflating the two put
+   `| bar | measure |` into the bars as a bar of its own."
+  [line]
+  (when (table-row? line)
+    (let [raw (str/trim line)
+          cells (mapv str/trim (str/split (subs raw 1 (dec (count raw))) #"\|" -1))]
+      (when-not (or (every? #(re-matches #":?-{2,}:?" %) cells)
+                    (every? #(contains? #{"bar" "measure" "threshold" "command" "name" ""}
+                                        (str/lower-case %))
+                            cells))
+        cells))))
+
+(defn bar-line
+  "One bars entry in the grammar run_evidence reads:
+   `<name> — bar: <threshold> — measure: `<command>``.
+
+   A brief usually carries the bars as a table, so a row becomes name + measure
+   and, with three columns, the middle one is the threshold. A line already in
+   the grammar passes through untouched — including one whose measure is prose,
+   which stays in metrics.md as a bar a human runs rather than being dropped for
+   not being a command."
+  [line]
+  (if (table-row? line)
+    (when-let [[name a b] (table-cells line)]
+      (when (seq name)
+        (str name
+             (when (and b (seq a)) (str " — bar: " a))
+             (when-let [m (if b b a)] (when (seq m) (str " — measure: " m))))))
+    (not-empty (strip-marker line))))
+
+(defn parse-brief
+  "Split one pasted block into the three things a task contributes.
+
+   Sections are found by their heading, matched on edit distance, so `Not-goal`,
+   `Non-goals` and a typo all land in the same place. Every non-blank line under
+   a heading is one item.
+
+   Text before the first heading is dropped. A paste opens with the conversation
+   that produced it more often than not, and there is no honest way to tell that
+   from a goal — the previous form took the whole block as goal lines, and one
+   paste became twenty-five checkboxes, half of them fragments of a pod listing."
+  [block]
+  (let [result (reduce (fn [{:keys [section] :as acc} line]
+                         (if-let [h (heading line)]
+                           (assoc acc :section h :seen (conj (:seen acc) h))
+                           (if (or (nil? section) (str/blank? line))
+                             acc
+                             (if-let [item (if (= :bars section)
+                                             (bar-line line)
+                                             (not-empty (strip-marker line)))]
+                               (update acc section (fnil conj []) item)
+                               acc))))
+                       {:section nil :seen #{}}
+                       (str/split-lines (or block "")))]
+    (select-keys (merge {:goal [] :not-goal [] :bars []} result)
+                 [:goal :not-goal :bars :seen])))
+
 (defn goal-md
   "goal.md from the two things a task actually contributes. Goal lines carry the
    `- [ ] <role> — ` prefix the judge grades against, so a line typed without a

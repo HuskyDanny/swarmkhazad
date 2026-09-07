@@ -182,6 +182,86 @@
       (finally
         (fs/delete-tree sandbox)))))
 
+(def real-brief
+  "The shape a brief actually arrives in — written elsewhere, pasted whole. The
+   preamble is the conversation that produced it and must not become a goal."
+  (str "Some preamble that came with the paste. Not a goal.\n\n"
+       "Goal\n\n"
+       "- [ ] superset — superset mcp run starts on the built image, endpoints superset-mcp is non-empty.\n"
+       "- [ ] superset — fastmcp is pinned, with the pin's reason recorded.\n\n"
+       "Non-goals\n\n"
+       "- No ingress, no public origin, no DNS. #781's ClusterIP isolation stays as it is.\n"
+       "- Don't upgrade Superset to fix an import. Pin the dependency, not the reverse.\n"
+       "- Not in scope: whether the MCP path is /mcp.\n\n"
+       "Quantitive bars\n\n"
+       "| bar | measure |\n"
+       "|---|---|\n"
+       "| the import that fails now, resolves | `docker run --rm <img> -c 'import fastmcp'` |\n"
+       "| mcp run stays up 60s, no traceback | run it in the built image, bounded wait |\n"
+       "| the Service has endpoints | `kubectl -n superset get endpoints superset-mcp` |\n"))
+
+(deftest one-pasted-block-becomes-the-goal-the-not-goals-and-the-bars
+  (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
+  (load-file (str (fs/path repo-root "scripts" "project_lib.bb")))
+  (load-file (str (fs/path repo-root "scripts" "run_evidence.bb")))
+  (let [parse @(resolve 'project-lib/parse-brief)
+        heading @(resolve 'project-lib/heading)
+        {:keys [goal not-goal bars seen]} (parse real-brief)]
+
+    (testing "each section keeps its own lines and nothing leaks between them"
+      (is (= 2 (count goal)))
+      (is (= 3 (count not-goal)))
+      (is (= 3 (count bars))))
+
+    (testing "the preamble is dropped — there is no honest way to read it as a goal"
+      (is (not-any? #(str/includes? % "preamble") (concat goal not-goal bars))))
+
+    (testing "the checkbox marker is stripped, and the role prefix the judge grades on is kept"
+      (is (str/starts-with? (first goal) "superset — superset mcp run starts")))
+
+    (testing "`Non-goals` is a not-goal, not a goal — the nearer name wins, not the first"
+      (is (str/starts-with? (first not-goal) "No ingress"))
+      (is (not-any? #(str/includes? % "No ingress") goal)))
+
+    (testing "a typo in the heading still finds the section"
+      (is (= #{:goal :not-goal :bars} seen) "`Quantitive bars` is one edit from `Quantitative bars`"))
+
+    (testing "the table's own scaffolding is not a bar"
+      (is (not-any? #(str/includes? % "|") bars) "no separator row and no column header")
+      (is (str/starts-with? (first bars) "the import that fails now, resolves — measure: ")))
+
+    (testing "the bars come back out as measures run_evidence can run"
+      (let [ctx (@(resolve 'task-lib/task-ctx) "t-brief")
+            runnable (@(resolve 'run-evidence/bars) ctx
+                      (@(resolve 'project-lib/metrics-md) "t-brief" bars))]
+        (is (= 2 (count runnable)) "two of the three cells carry a command")
+        (is (= "docker run --rm <img> -c 'import fastmcp'" (:command (first runnable))))
+        (is (some #(str/includes? % "bounded wait") bars)
+            "and the one whose measure is prose is still written down, not dropped")))
+
+    (testing "a heading is short and unbulleted, so a sentence about goals is not one"
+      (is (= :goal (heading "Goal")))
+      (is (= :goal (heading "## Goal")))
+      (is (= :goal (heading "goals:")))
+      (is (= :not-goal (heading "**Not-goal**")))
+      (is (= :not-goal (heading "out of scope")))
+      (is (= :bars (heading "Quality bars")))
+      (is (= :bars (heading "Metrics")))
+      (is (nil? (heading "* Goals"))
+          "`*` is a bullet AND emphasis, so this normalises to exactly `goals`: only the
+           bullet check keeps a list item from opening a section")
+      (is (nil? (heading "- No ingress, no public origin")))
+      (is (nil? (heading "Cause: fastmcp is the one unpinned dependency in the Dockerfile")))
+      (is (nil? (heading "Notes"))))
+
+    (testing "a block with no headings parses to nothing rather than to everything"
+      (let [r (parse (str "staging's MCP pod is crash-looping. The web tier is fine.\n"
+                          "superset-mcp-757cc8b6b8-27n9k 0/1 CrashLoopBackOff 10 restarts\n"
+                          "Error: MCP service dependencies not installed\n"))]
+        (is (empty? (:seen r)))
+        (is (empty? (:goal r))
+            "this exact paste once became twenty-five goal checkboxes")))))
+
 (deftest the-pane-renders-a-terminal-and-still-escapes-what-is-in-it
   ;; every other test in this file drives the handler in a child bb, so the
   ;; namespace is not loaded here until we ask for it.
@@ -378,20 +458,39 @@
         (is (= 404 (:status (request env :get "/projects/nope/new")))))
       (testing "a task is refused without a valid id or a goal, and keeps what was typed"
         (let [r (request env :post (str "/projects/" project "/tasks")
-                         {:body "task-id=bad%2Fid&goal=implement+%E2%80%94+something"})]
+                         {:body (str "task-id=bad%2Fid&brief="
+                                     (java.net.URLEncoder/encode "Goal\nimplement — something" "UTF-8"))})]
           (is (= 400 (:status r)))
           (is (str/includes? (:body r) "invalid task id"))
-          (is (str/includes? (:body r) "implement — something") "the goal survives the rejection"))
-        (let [r (request env :post (str "/projects/" project "/tasks") {:body (str "task-id=" id "&goal=")})]
+          (is (str/includes? (:body r) "implement — something") "the brief survives the rejection"))
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=" id "&brief="
+                                     (java.net.URLEncoder/encode "Goal\n\nNot-goal\n- nothing" "UTF-8"))})]
           (is (= 400 (:status r)))
-          (is (str/includes? (:body r) "write at least one goal line")))
+          (is (str/includes? (:body r) "the Goal section is empty")))
+        (testing "an unstructured paste is refused rather than read as goal lines"
+          (let [r (request env :post (str "/projects/" project "/tasks")
+                           {:body (str "task-id=" id "&brief="
+                                       (java.net.URLEncoder/encode
+                                        "the pod is crash-looping\nError: no module named fastmcp\npip install fastmcp"
+                                        "UTF-8"))})]
+            (is (= 400 (:status r)))
+            (is (str/includes? (:body r) "no section headings found"))))
         (is (not (fs/exists? (fs/path home "tasks" id)))))
       (testing "good input: goal.md, metrics.md, the project link, the project's roles, open started"
         (let [r (request env :post (str "/projects/" project "/tasks")
-                         {:body (str "task-id=" id
-                                     "&goal=" (java.net.URLEncoder/encode "implement — the route returns 200\nrun — tests green" "UTF-8")
-                                     "&not-goal=" (java.net.URLEncoder/encode "no schema change" "UTF-8")
-                                     "&bars=" (java.net.URLEncoder/encode "repo tests — bar: exits 0 — measure: `true`" "UTF-8"))})
+                         {:body (str "task-id=" id "&brief="
+                                     (java.net.URLEncoder/encode
+                                      (str "## Goal\n"
+                                           "- [ ] implement — the route returns 200\n"
+                                           "- [ ] run — tests green\n\n"
+                                           "## Non-goals\n"
+                                           "- no schema change\n\n"
+                                           "## Quantitative bars\n"
+                                           "| bar | threshold | measure |\n"
+                                           "|---|---|---|\n"
+                                           "| repo tests | exits 0 | `true` |\n")
+                                      "UTF-8"))})
               dir (fs/path home "tasks" id)]
           (is (= 303 (:status r)))
           (is (= (str "/tasks/" id) (get (:headers r) "Location")))
@@ -419,7 +518,8 @@
             (is (str/includes? (:body (request env :get "/")) (str "class=\"tcard\" href=\"/tasks/" id "\""))))
           (testing "a second task with the same id is refused"
             (let [r2 (request env :post (str "/projects/" project "/tasks")
-                               {:body (str "task-id=" id "&goal=" (java.net.URLEncoder/encode "implement — again" "UTF-8"))})]
+                               {:body (str "task-id=" id "&brief="
+                                           (java.net.URLEncoder/encode "Goal\n- implement — again" "UTF-8"))})]
               (is (= 400 (:status r2)))
               (is (str/includes? (:body r2) (str "task already exists: " id))
                   "refused by the portal's own check, not by the CLI's path-shaped message")

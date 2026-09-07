@@ -275,24 +275,32 @@
 
 (defn kickstart-project!
   "A task inside a project: the repos and the role lineup come from the project,
-   so the form contributes only the goal, the not-goals and the bars."
-  [project {:strs [task-id goal not-goal bars]}]
+   so the form contributes only the brief — one pasted block that parse-brief
+   splits into the goal, the not-goals and the bars."
+  [project {:strs [task-id brief]}]
   (let [id (str/trim (or task-id ""))
-        goals (nonblank-lines goal)
+        {:keys [goal not-goal bars seen]} (project-lib/parse-brief brief)
         ctx (when (task-lib/valid-task-id? id) (task-lib/task-ctx id))]
     (cond
       (not (task-lib/valid-task-id? id)) {:error (str "invalid task id: " (pr-str id))}
       (fs/exists? (:task-dir ctx)) {:error (str "task already exists: " id)}
-      (empty? goals) {:error "write at least one goal line"}
+      ;; Refusing here is the point. Taking an unstructured paste as goal lines
+      ;; is what turned one brief into twenty-five checkboxes, and a task opens
+      ;; with those locked 444 — the swarm then runs against them for an hour.
+      (empty? seen) {:error (str "no section headings found — give the brief a `Goal` heading "
+                                 "(and `Not-goal` / `Bars` if it has them). "
+                                 "Near spellings are fine; the text above the first heading is ignored.")}
+      (empty? goal) {:error (str "the Goal section is empty — found "
+                                 (str/join ", " (sort (map name seen))))}
       :else
       (let [new (apply process/sh {:continue true} "bb" cli "new" id
                        (mapcat #(vector "--repo" %) (:repos project)))]
         (if-not (zero? (:exit new))
           {:error (str "new failed: " (:err new))}
           (do
-            (spit (str (:goal-file ctx)) (project-lib/goal-md id goals (nonblank-lines not-goal)))
-            (when (seq (nonblank-lines bars))
-              (spit (str (:metrics-file ctx)) (project-lib/metrics-md id (nonblank-lines bars))))
+            (spit (str (:goal-file ctx)) (project-lib/goal-md id goal not-goal))
+            (when (seq bars)
+              (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
             (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
             (spit (str (:roles-file ctx)) (project-lib/roles-text project))
             (fs/create-dirs (:state-dir ctx))
@@ -602,6 +610,21 @@
           ;; from the shell to sit at the bottom of the viewport.
           (project-form error (or params {})))))
 
+(def brief-placeholder
+  "The shape a brief already has when it is written elsewhere, so the box asks
+   for nothing to be reformatted — headings, bullets, and the bars as a table."
+  (str "## Goal\n"
+       "- implement — superset mcp run starts on the built image, endpoints non-empty\n"
+       "- run — the staging pod goes 1/1 Ready and stays Ready\n\n"
+       "## Not-goal\n"
+       "- No ingress, no public origin, no DNS.\n"
+       "- Don't upgrade Superset to fix an import. Pin the dependency.\n\n"
+       "## Quantitative bars\n"
+       "| bar | measure |\n"
+       "|---|---|\n"
+       "| the import that fails now, resolves | `docker run --rm <img> -c '...'` |\n"
+       "| the failing string is gone | `kubectl -n superset logs deploy/superset-mcp` |"))
+
 (defn new-task-page
   "The only form a task needs: what to do, what not to do, and how it is
    measured. Repos and roles are the project's, shown but not asked for."
@@ -628,18 +651,16 @@
             [:input {:type "text" :name "task-id" :required true
                      :placeholder (str (java.time.LocalDate/now) "-something")
                      :value (get params "task-id" "")}]]
-           [:label (str "goal — one outcome per line, each starting with the role that owns it "
-                        "(the judge grades a role against its own lines)")
-            [:textarea {:name "goal" :rows 5
-                        :placeholder "implement — the route returns 200 for a valid token\nrun — the repo's own test command exits 0"}
-             (get params "goal")]]
-           [:label "not-goal — one per line"
-            [:textarea {:name "not-goal" :rows 3 :placeholder "no schema change — the migration lands separately"}
-             (get params "not-goal")]]
-           [:label "metrics bars — one per line, `<name> — bar: <threshold> — measure: `<command>``"
-            [:textarea {:name "bars" :rows 4
-                        :placeholder "repo tests — bar: exits 0 — measure: `bun run test`"}
-             (get params "bars")]]]
+           ;; One box, because a brief is written somewhere else and arrives as
+           ;; one block. Three boxes asked the writer to take it apart by hand,
+           ;; and the way that fails is silent: paste everything into the first
+           ;; and every line of it becomes a goal.
+           [:label (str "the brief — paste it whole. Sections are found by their heading "
+                        "(Goal, Not-goal, Bars — near spellings are fine), and each line "
+                        "under one is an item. A goal line starting with a role is graded "
+                        "against that role.")
+            [:textarea {:name "brief" :rows 16 :placeholder brief-placeholder}
+             (get params "brief")]]]
           [:div.go [:button {:type "submit"} "Open the swarm"]]]]))
 
 (defn pane-rail
