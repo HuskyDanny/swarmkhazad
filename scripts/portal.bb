@@ -10,6 +10,8 @@
 ;;   /tasks/<id>/roles/<role>   the role's pane, streamed by polling
 ;;   /tasks/<id>/roles/<role>/pane   text/plain: live tmux capture, else the archive
 ;;   POST /tasks/<id>/roles/<role>/keys  type into that pane, or Escape to interrupt it
+;;   POST /projects/<name>/review    sort a pasted brief, then show it for review
+;;   POST /tasks/<id>/summary   ask whether the work is ready to merge, for its goals
 ;;   /projects                  POST: create a project (checkouts + role lineup)
 ;;   /projects/<name>/new       the only task form: goal, not-goal, bars
 ;;   /projects/<name>/tasks     POST: scaffold from the project, then open
@@ -36,6 +38,8 @@
 (load-file (str (fs/path script-dir "board_lib.bb")))
 (load-file (str (fs/path script-dir "run_evidence.bb")))
 (load-file (str (fs/path script-dir "telemetry.bb")))
+(load-file (str (fs/path script-dir "ask.bb")))
+(load-file (str (fs/path script-dir "summary.bb")))
 
 (def cli (str (fs/path script-dir "swarmkhazad.bb")))
 (def default-port 8765)
@@ -658,7 +662,7 @@
             (let [idle (project-lib/unused-repos project)]
               (when (seq idle)
                 [:span.status.pending "no role works in " (str/join ", " (map task-lib/repo-name idle))]))]]]
-         [:form {:method "post" :action (str "/projects/" (:name project) "/tasks")}
+         [:form {:method "post" :action (str "/projects/" (:name project) "/review")}
           [:div.fields.stack
            [:label "task id"
             [:input {:type "text" :name "task-id" :required true
@@ -674,7 +678,52 @@
                         "against that role.")
             [:textarea {:name "brief" :rows 16 :placeholder brief-placeholder}
              (get params "brief")]]]
-          [:div.go [:button {:type "submit"} "Open the swarm"]]]]))
+          [:div.go [:button {:type "submit"} "Sort it"]
+           [:span.muted "one model call splits it into goals, not-goals and bars; "
+            "you review before anything opens"]]]]))
+
+(defn review-page
+  "The step between pasting a brief and opening a swarm. The model sorted the
+   paste; this is where a person disagrees with it.
+
+   What is shown is the markdown itself, in one editable box, and it is parsed
+   again on submit by exactly the parser that read the paste. There is no path
+   from the model's answer into goal.md that does not go through the box — so
+   an edit here is the last word, and a model that added a goal nobody asked
+   for is one keystroke from gone."
+  [project {:keys [markdown parsed note cost model fell-back]} params]
+  (let [{:keys [goal not-goal bars]} parsed]
+    (page {:title (str "review · " (:name project)) :crumb (:name project)}
+          [:section
+           [:h2 "Review before the swarm opens"]
+           [:p.muted
+            (str (count goal) " goal, " (count not-goal) " not-goal, " (count bars) " bar")
+            (when-not (= 1 (count goal)) "s")
+            (cond
+              note (list " · " [:span.status.pending note])
+              cost (list " · sorted by " (or model "the model")
+                         (format " · $%.4f" (double cost))))]
+           (when (empty? goal)
+             [:p.err "No goal line survived. Edit the box below — a task cannot open without one."])
+           [:form {:method "post" :action (str "/projects/" (:name project) "/tasks")}
+            [:div.fields.stack
+             [:label "task id"
+              [:input {:type "text" :name "task-id" :required true
+                       :placeholder (str (java.time.LocalDate/now) "-something")
+                       :value (get params "task-id" "")}]]
+             [:label "the brief, sorted — edit anything, this is what opens"
+              [:textarea {:name "brief" :rows 20} markdown]]]
+            [:div.go
+             [:button {:type "submit"} "Open the swarm"]
+             [:span.muted "goal.md becomes read-only the moment it opens"]]]
+           ;; The paste is kept so Back is not the only way to start over from
+           ;; the original, which the model has by then already reworded.
+           [:details.item
+            [:summary [:span.kind "the paste"] [:span.muted "what was sorted"]]
+            [:div.full [:pre (get params "paste" "")]]]]
+          (when fell-back
+            [:p.muted "The model was not reached, so this is the parser's own split. "
+             "It only finds sections that already carry a heading."]))))
 
 (defn pane-rail
   "The task's terminal, beside the task. `watching` is a role name; the tabs are
@@ -760,6 +809,18 @@
                        " " [:span.muted (:at e)]
                        (when (seq (:tail e)) [:pre (:tail e)])]
                       [:span.status.pending "no evidence yet"])]])]]]
+          (let [cached (summary/read-summary ctx)]
+            [:section
+             [:h2 "Ready to merge?"
+              (when-let [h (:headers cached)]
+                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
+             [:form {:method "post" :action (str "/tasks/" id "/summary")}
+              [:button {:type "submit"} (if cached "Ask again" "Ask")]
+              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
+               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
+             (if cached
+               [:pre (:body cached)]
+               [:p.empty "not asked yet"])])
           (let [t (telemetry/task-totals id)]
             [:section [:h2 "Telemetry"
                        (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]
@@ -833,6 +894,16 @@
        (if-let [project (project-lib/read-project name)]
          (html 200 (new-task-page project nil {}))
          (not-found)))
+     ;; The brief goes to the model first and to a person second; only the
+     ;; person's copy reaches /tasks. Two routes rather than a flag, because
+     ;; "open a swarm" and "sort some text" fail in completely different ways.
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/review" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               paste (get params "brief" "")
+               sorted (project-lib/normalize-brief ask/ask paste)]
+           (html 200 (review-page project sorted (assoc params "paste" paste))))
+         (not-found)))
      (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/tasks" uri))]
        (if-let [project (project-lib/read-project name)]
          (let [params (parse-form (if (string? body) body (some-> body slurp)))
@@ -859,6 +930,16 @@
      ;; not a new one. The text is passed as one argv element to `tmux
      ;; send-keys -l`, never through a shell, so it is typed and never run; the
      ;; role must be one this task declared, like every other role route here.
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/summary" uri))]
+       (if-let [ctx (ctx-for id)]
+         (let [r (summary/summarize! ctx)]
+           (if (:error r)
+             (html 200 (page {:title (str id " · summary") :crumb id}
+                             [:section [:h2 "Ready to merge?"]
+                              [:p.err (:error r)]
+                              [:p [:a.doc {:href (str "/tasks/" id)} "← back to " id]]]))
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}))
+         (not-found)))
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]
          (if (and ctx (some #{role} (map :role (roles ctx))))

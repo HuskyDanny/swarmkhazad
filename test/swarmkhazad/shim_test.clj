@@ -93,7 +93,7 @@
       (fs/create-dirs realdir)
       (executable! (fs/path shimdir "claude") "#!/bin/bash\necho wrapper\n")
       (executable! (fs/path realdir "claude") "#!/bin/bash\necho real\n")
-      (let [wrapper? (resolve 'swarm-lib/wrapper-shim?)]
+      (let [wrapper? (resolve 'task-lib/wrapper-shim?)]
         (is (@wrapper? (str (fs/path shimdir "claude"))) "a cmux-cli-shims path is a wrapper")
         (is (not (@wrapper? (str (fs/path realdir "claude")))) "an ordinary bin directory is not")
         (is (not (@wrapper? (str (fs/path sandbox "stubbin" "claude"))))
@@ -106,8 +106,8 @@
                                        :dir repo-root}
                                       "bb" "-e"
                                       (str "(load-file \"scripts/swarm_lib.bb\")"
-                                           "(prn (swarm-lib/harness-candidates \"claude\"))"
-                                           "(prn (:path (swarm-lib/resolve-harness \"claude\")))")))]
+                                           "(prn (task-lib/harness-candidates \"claude\"))"
+                                           "(prn (:path (task-lib/resolve-harness \"claude\")))")))]
             (is (str/includes? out "cmux-cli-shims") "the wrapper is a candidate")
             (is (str/includes? out (str (fs/path realdir "claude"))) "and so is the real binary")
             (is (str/ends-with? (str/trim out) (str "\"" (fs/path realdir "claude") "\""))
@@ -118,7 +118,7 @@
                                      :dir repo-root}
                                     "bb" "-e"
                                     (str "(load-file \"scripts/swarm_lib.bb\")"
-                                         "(prn (swarm-lib/resolve-harness \"claude\"))")))]
+                                         "(prn (task-lib/resolve-harness \"claude\"))")))]
           (is (str/includes? out ":pinned true") "SWARMKHAZAD_HARNESS_<NAME> wins outright")
           (is (str/includes? out (str (fs/path realdir "claude")))))
         (let [r (process/sh {:continue true

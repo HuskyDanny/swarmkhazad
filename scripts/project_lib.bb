@@ -320,6 +320,77 @@
     (select-keys (merge {:goal [] :not-goal [] :bars []} result)
                  [:goal :not-goal :bars :seen])))
 
+(def brief-system-prompt
+  "The model's job is to SORT, not to write. Every added sentence is an
+   acceptance criterion nobody agreed to, locked 444 the moment the swarm opens."
+  (str
+   "You restructure a task brief. You do not write one.\n\n"
+   "You are given a block of text a person pasted — usually part of a chat, a "
+   "ticket, or notes. Sort what is already in it into three sections and return "
+   "markdown, nothing else.\n\n"
+   "## Goal\n"
+   "One line per outcome that must become true. Each line starts with the role "
+   "that owns it and an em dash if the text says who does it; if it does not, "
+   "leave the line without a prefix rather than inventing an owner. An outcome, "
+   "not a step: `the pod goes 1/1 Ready`, not `edit the Dockerfile`.\n\n"
+   "## Not-goal\n"
+   "One line per thing explicitly out of scope, and per constraint that says "
+   "what must NOT change.\n\n"
+   "## Quantitative bars\n"
+   "A markdown table, columns `bar | measure`. `bar` is what is checked, "
+   "`measure` is how — put a shell command in backticks when the text gives "
+   "one, and plain prose when it does not. Never invent a command.\n\n"
+   "Rules:\n"
+   "- Use the words already in the text. Reword only to make a fragment a "
+   "sentence.\n"
+   "- Drop narration, transcript, logs, and pasted output that state no "
+   "requirement. A pod listing is evidence of the problem, not a goal.\n"
+   "- An error string that names what must stop happening IS a bar. Put it in "
+   "the table, not the goal.\n"
+   "- Do not add a goal, a not-goal, or a bar the text does not ask for. If a "
+   "section has nothing, write the heading and leave it empty.\n"
+   "- Output only the three headings and their content. No preamble, no "
+   "explanation, no code fence around the whole thing."))
+
+(defn brief-md
+  "The three sections back as one editable block — the same shape parse-brief
+   reads, so what the reviewer sees is what gets parsed again on submit. There
+   is no second path from the model's answer into goal.md."
+  [{:keys [goal not-goal bars]}]
+  (str "## Goal\n"
+       (str/join "" (for [l goal] (str "- " l "\n")))
+       "\n## Not-goal\n"
+       (str/join "" (for [l not-goal] (str "- " l "\n")))
+       "\n## Quantitative bars\n"
+       (str/join "" (for [l bars] (str "- " l "\n")))))
+
+(defn normalize-brief
+  "One model call between the paste and the review. Returns the normalized
+   markdown plus what it cost, or the deterministic parse re-rendered when the
+   call fails — a brief that reaches the review page late is recoverable, one
+   that never arrives is not.
+
+   `ask-fn` is injected so the tests drive this without a model."
+  [ask-fn block]
+  (let [parsed (parse-brief block)
+        fallback (fn [note]
+                   {:markdown (brief-md parsed) :parsed parsed :note note :fell-back true})]
+    (if (str/blank? (or block ""))
+      (fallback "nothing to sort")
+      (let [r (ask-fn {:prompt block
+                       :system brief-system-prompt
+                       :model (or (not-empty (or (System/getenv "SWARMKHAZAD_BRIEF_MODEL") "")) "sonnet")
+                       :label "brief"})]
+        (cond
+          (:error r) (fallback (str "sorted by the parser alone — " (:error r)))
+          (str/blank? (or (:text r) "")) (fallback "sorted by the parser alone — the model returned nothing")
+          :else
+          (let [md (str/trim (:text r))
+                reparsed (parse-brief md)]
+            (if (empty? (:goal reparsed))
+              (fallback "sorted by the parser alone — the model's answer had no Goal section")
+              {:markdown md :parsed reparsed :cost (:cost r) :model (:model r)})))))))
+
 (defn goal-md
   "goal.md from the two things a task actually contributes. Goal lines carry the
    `- [ ] <role> — ` prefix the judge grades against, so a line typed without a

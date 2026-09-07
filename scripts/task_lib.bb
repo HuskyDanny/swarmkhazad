@@ -277,6 +277,57 @@
   [row]
   (vec (remove str/blank? (str/split (or (:extra-args row) "") #"\s+"))))
 
+;; ------------------------------------------------------- harness resolution
+;;
+;; Which binary a harness name means is a fact about this machine's PATH, not
+;; about opening a swarm — `open` writes it into state/harnesses.tsv, and the
+;; portal needs the same answer for its own one-shot calls. It lives here so
+;; there is one rule rather than two that can drift, which is exactly how a
+;; wrapper shim got pinned once already.
+
+(def wrapper-shim-markers
+  "Path fragments that mark a per-session wrapper standing in for the real CLI.
+
+   A terminal that injects its own agent integration puts one first on PATH and
+   rewrites the argv it forwards. Ours carries `--settings <path>`, which cmux's
+   wrapper merges and hands back INLINE, so the exec dies with `Argument list
+   too long` and the role relaunches forever — a swarm that starts and does
+   nothing, with the reason only visible in the pane.
+
+   These are deliberately narrow. The first version of this test rejected
+   anything under a temp directory, which is true of cmux's shim and equally
+   true of every stub binary a test puts on PATH — it sent the smoke suite at
+   the live vendors. A wrong binary that is merely reported beats a right one
+   that is silently skipped, so anything not listed here is resolved normally
+   and the choice is printed at open."
+  ["/cmux-cli-shims/" ".app/Contents/"])
+
+(defn wrapper-shim? [path]
+  (let [real (str (try (fs/real-path path) (catch Exception _ path)))]
+    (boolean (some #(str/includes? real %) wrapper-shim-markers))))
+
+(defn harness-candidates
+  "Every executable of that name on PATH, in PATH order."
+  [command]
+  (->> (str/split (or (System/getenv "PATH") "") #":")
+       (remove str/blank?)
+       (map #(fs/path % command))
+       (filter fs/executable?)
+       (map str)
+       distinct
+       vec))
+
+(defn resolve-harness
+  "The real binary for a harness. An explicit SWARMKHAZAD_HARNESS_<NAME> wins;
+   otherwise the first candidate on PATH that is not a wrapper shim. Returns
+   {:path ... :skipped [...]} or nil."
+  [harness]
+  (if-let [pinned (not-empty (or (System/getenv (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness))) ""))]
+    {:path pinned :skipped [] :pinned true}
+    (let [all (harness-candidates harness)
+          [skipped [chosen]] (split-with wrapper-shim? all)]
+      (when chosen {:path chosen :skipped (vec skipped)}))))
+
 (defn session-name [role]
   (str "sk-" role))
 

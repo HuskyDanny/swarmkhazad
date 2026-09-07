@@ -273,6 +273,61 @@
         (is (empty? (:goal r))
             "this exact paste once became twenty-five goal checkboxes")))))
 
+(deftest the-model-sorts-the-paste-but-the-parser-still-decides
+  (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
+  (load-file (str (fs/path repo-root "scripts" "project_lib.bb")))
+  (let [normalize @(resolve 'project-lib/normalize-brief)
+        messy (str "so the pod is crash-looping and the web tier is fine\n"
+                   "superset-mcp-757cc8b6b8 0/1 CrashLoopBackOff 10 restarts\n"
+                   "we need mcp run to start and the endpoints to be non-empty\n"
+                   "don't touch the web tier\n")
+        sorted-md (str "## Goal\n- implement — superset mcp run starts and endpoints are non-empty\n\n"
+                       "## Not-goal\n- Don't touch the web tier.\n\n"
+                       "## Quantitative bars\n| bar | measure |\n|---|---|\n"
+                       "| the Service has endpoints | `kubectl get endpoints superset-mcp` |\n")]
+
+    (testing "a paste with no headings is sorted by the model into ones the parser reads"
+      (let [asked (atom nil)
+            r (normalize (fn [req] (reset! asked req) {:text sorted-md :cost 0.011 :model "sonnet"}) messy)]
+        (is (= messy (:prompt @asked)) "the paste goes to the model verbatim")
+        (is (str/includes? (:system @asked) "You do not write one")
+            "and the system prompt is the one that tells it to sort, not to author")
+        (is (= 1 (count (:goal (:parsed r)))))
+        (is (= 1 (count (:not-goal (:parsed r)))))
+        (is (= 1 (count (:bars (:parsed r)))))
+        (is (not (:fell-back r)))
+        (is (= 0.011 (:cost r)))
+        (is (not-any? #(str/includes? % "CrashLoopBackOff") (:goal (:parsed r)))
+            "the pod listing was evidence of the problem, not a goal")))
+
+    (testing "the model's answer is re-parsed, so what the reviewer edits is what opens"
+      (let [r (normalize (constantly {:text sorted-md}) messy)]
+        (is (= (:goal (:parsed r)) (:goal (@(resolve 'project-lib/parse-brief) (:markdown r))))
+            "markdown in, same sections out — there is no second path into goal.md")))
+
+    (testing "a model that fails leaves the parser's own answer, and says so"
+      (let [headed (str "## Goal\n- implement — a thing\n\n## Not-goal\n- another thing\n")]
+        ;; The three notes are pinned separately, not just as "fell back". They
+        ;; are what the reviewer reads to decide whether to retry or to edit,
+        ;; and "the model returned nothing" and "its answer had no Goal
+        ;; section" are different problems with different next actions.
+        (doseq [[why reply expected]
+                [["an error" {:error "timed out after 240s"} "timed out after 240s"]
+                 ["an empty answer" {:text "   "} "the model returned nothing"]
+                 ["an answer with no Goal" {:text "## Notes\n- nothing useful\n"} "had no Goal section"]]]
+          (let [r (normalize (constantly reply) headed)]
+            (is (:fell-back r) (str "falls back on " why))
+            (is (str/includes? (:note r) "the parser alone"))
+            (is (str/includes? (:note r) expected) (str "and says which failure it was: " why))
+            (is (= 1 (count (:goal (:parsed r))))
+                "and the parser's own split still opens the task, rather than nothing")))))
+
+    (testing "a blank paste never reaches the model"
+      (let [called (atom 0)
+            r (normalize (fn [_] (swap! called inc) {:text sorted-md}) "   ")]
+        (is (zero? @called))
+        (is (empty? (:goal (:parsed r))))))))
+
 (deftest the-pane-renders-a-terminal-and-still-escapes-what-is-in-it
   ;; every other test in this file drives the handler in a child bb, so the
   ;; namespace is not loaded here until we ask for it.
