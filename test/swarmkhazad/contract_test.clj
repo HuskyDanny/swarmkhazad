@@ -319,3 +319,42 @@
                        (str "cd " task " && head -5 goal.md")]]
             (is (allowed? (bash task sandbox cmd)) cmd)))))))
 
+(defn tool-call
+  "A PreToolUse payload for any tool name and any tool_input shape — `edit` and
+   `bash` above only build the shapes the hook knows by name, which is exactly
+   the assumption under test."
+  [task-dir tool input]
+  (fire task-dir {} {"hook_event_name" "PreToolUse" "tool_name" tool
+                     "cwd" (str task-dir) "tool_input" input}))
+
+(deftest a-tool-this-hook-has-never-heard-of-does-not-get-a-free-pass
+  ;; The tool dispatch named the writers — Edit, Write, MultiEdit, NotebookEdit,
+  ;; Bash — and waved everything else through before looking at a path. The same
+  ;; denylist mistake as the verb list, one level up, and a live one: roles load
+  ;; the operator's whole ~/.claude.json, so a filesystem MCP server is a tool
+  ;; that exists. RAN: `mcp__fs__write` with the path nested under
+  ;; `tool_input.edits[0].path` was allowed without the path being read once.
+  (with-task
+    (fn [task _]
+      (session-start task)
+      (testing "an MCP write is asked the same question the file tools are asked"
+        (is (denied? (tool-call task "mcp__fs__write"
+                                {"edits" [{"path" (str task "/goal.md") "new" "x"}]}))
+            "nested two levels deep, and found without a schema for this tool")
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/metrics.md")})))
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/decision.md")}))
+            "the bullet files too — note.bb is the writer whatever tool is asking")
+        (is (denied? (tool-call task "ApplyPatch" {"target" "goal.md"}))
+            "relative to the tool cwd, like everywhere else")
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/../t-hook/goal.md")}))))
+      (testing "and the reads the contract promises still pass"
+        ;; The catch-all can be strict only because the readers are named. A
+        ;; role must always be able to read its own truth.
+        (is (allowed? (tool-call task "Read" {"file_path" (str task "/goal.md")})))
+        (is (allowed? (tool-call task "Grep" {"pattern" "bar" "path" (str task "/metrics.md")})))
+        (is (allowed? (tool-call task "Glob" {"pattern" (str task "/*.md")})))
+        (is (allowed? (tool-call task "mcp__linear-server__get_issue" {"id" "MITH-1"}))
+            "and an unrelated MCP call names nothing of ours")
+        (is (allowed? (tool-call task "mcp__fs__write" {"path" (str task "/draft-implement.md")}))
+            "a role's own write-up is its own to write, by any tool")))))
+

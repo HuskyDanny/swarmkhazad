@@ -26,6 +26,12 @@
 # path assembled across several commands. Roles are held there by the prompt and
 # by having no reason to try, not by this file.
 #
+# Nor does it close TOCTOU. Roles sharing a repo share its worktree, so a second
+# session can re-point a name between this check and the write it approved. A
+# PreToolUse hook decides before the tool runs and has no hold on the filesystem
+# in between; closing that needs the truth to be immutable somewhere this cannot
+# reach, not a better check here.
+#
 # No SWARMKHAZAD_TASK_DIR means an ad-hoc launch: silent exit, nothing to enforce.
 # Fails OPEN on malformed input — a role that cannot start because its contract
 # hook broke is worse than a role without the hook. Denials are appended to
@@ -362,7 +368,28 @@ pre_tool_use() {
       fi
       deny "goal.md and metrics.md are the task's truth (chmod 444). A role never edits, moves, or unlocks them — a bar you cannot meet is an escalation.md line, never an edit to the bar." "Bash" "$cmd"
       ;;
-    *) exit 0 ;;
+    Read|Grep|Glob|LS|NotebookRead)
+      # Reads pass, and these are the reads. Named explicitly so the catch-all
+      # below can be strict without denying the one thing the contract promises
+      # a role can always do: read goal.md and metrics.md.
+      exit 0 ;;
+    *)
+      # Any tool this file has never heard of — an MCP server (roles load the
+      # operator's whole ~/.claude.json set), a harness tool added next month.
+      # Enumerating the writers above and waving everything else through is the
+      # same denylist mistake as the verb list, one level up: RAN, a call with
+      # tool_name `mcp__fs__write` and `tool_input.edits[0].path` at goal.md was
+      # allowed without the path being looked at once.
+      #
+      # So instead of guessing which field holds a path, every string anywhere
+      # in tool_input is asked the same question the file tools ask, through the
+      # same task_file — no new matcher, no schema to keep up to date.
+      while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        truth_path "$v" "$cwd" && deny "$(basename "$v") is the task's truth (chmod 444). A role never edits goal.md or metrics.md — a bar you cannot meet is an escalation.md line, never an edit to the bar. To READ it, use Read." "$tool" "$v"
+        note_path "$v" "$cwd" && deny "$(basename "$v") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$v"
+      done < <(printf '%s' "$input" | jq -r '[.tool_input | .. | strings] | .[]' 2>/dev/null)
+      exit 0 ;;
   esac
 }
 
