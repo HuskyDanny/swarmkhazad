@@ -59,7 +59,7 @@
 (defn phantom? [from] (boolean (re-matches #"\(.+\)" (or from ""))))
 
 (defn sent-dir [ctx sender]
-  (if (or (phantom? sender) (not (handoff-lib/role-known? ctx sender)))
+  (if (or (phantom? sender) (not (handoff-lib/session-known? ctx sender)))
     (fs/path (task-lib/system-mail-dir ctx) "sent")
     (fs/path (handoff-lib/mail-dir ctx sender) "sent")))
 
@@ -68,7 +68,7 @@
         sender (get headers "from")
         recipients (handoff-lib/recipient-list headers)]
     (when-not recipients (throw (ex-info "missing to header" {})))
-    (doseq [r recipients :when (not (handoff-lib/role-known? ctx r))]
+    (doseq [r recipients :when (not (handoff-lib/session-known? ctx r))]
       (throw (ex-info (str "unknown recipient " r) {})))
     (update-board! ctx headers recipients)
     (doseq [r recipients]
@@ -83,7 +83,7 @@
     (log! ctx "delivered" (str path) "to" (str/join "," recipients))))
 
 (defn outbox-files [ctx]
-  (->> (conj (mapv #(handoff-lib/outbox-dir ctx %) (handoff-lib/role-names ctx))
+  (->> (conj (mapv #(handoff-lib/outbox-dir ctx %) (handoff-lib/session-names ctx))
              (fs/path (task-lib/system-mail-dir ctx) "outbox"))
        (mapcat handoff-lib/handoff-files)
        (map str)

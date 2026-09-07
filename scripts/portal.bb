@@ -177,8 +177,11 @@
   (let [done (handled ctx)]
     (remove #(contains? done (attention-key %)) (attention ctx))))
 
-(defn roles [ctx]
-  (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
+(defn sessions
+  "The task's (role, repo) sessions — the unit that has a pane, an inbox and a
+   verdict. A one-repo task has one per role, which is what it always had."
+  [ctx]
+  (task-lib/read-sessions-tsv ctx))
 
 (def sgr-class
   "The SGR codes an agent TUI actually emits, and the class each becomes.
@@ -251,15 +254,16 @@
         s (or (not-empty live) archived "")]
     (str/join "\n" (take-last pane-tail-lines (str/split-lines s))))))
 
-(defn role-cards [ctx]
+(defn session-cards [ctx]
   (let [vs (verdicts ctx)]
-    (for [row (roles ctx)
-          :let [role (:role row) mail (task-lib/role-mail-dir ctx role)]]
-      {:role role :harness (:harness row) :model (:model row) :mode (:receive-mode row)
-       :verdict (get vs role)
+    (for [row (sessions ctx)
+          :let [name (:session row) mail (task-lib/session-mail-dir ctx name)]]
+      {:session name :role (:role row) :repo (:repo row)
+       :harness (:harness row) :model (:model row) :mode (:receive-mode row)
+       :verdict (get vs name)
        :sent (count-files (fs/path mail "sent"))
        :inbox (+ (count-files (fs/path mail "inbox" "new")) (count-files (fs/path mail "inbox" "in_process")))
-       :last-line (last (nonblank-lines (pane-text ctx role)))})))
+       :last-line (last (nonblank-lines (pane-text ctx name)))})))
 
 (defn lane [ctx]
   (or (try (board-lib/card-lane ctx (:task-id ctx)) (catch Exception _ nil))
@@ -304,8 +308,7 @@
                          :when (get params (str "role:" stage))]
                      {:role stage
                       :harness (or (get params (str "harness:" stage)) "claude")
-                      :model (or (get params (str "model:" stage)) "anthropic")
-                      :repo (or (not-empty (get params (str "repo-of:" stage))) (first repos))}))]
+                      :model (or (get params (str "model:" stage)) "anthropic")}))]
     (cond
       (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
       (project-lib/read-project nm) {:error (str "project already exists: " nm)}
@@ -313,8 +316,6 @@
       (empty? roles) {:error "pick at least one role"}
       (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
                                                               (first (remove task-lib/git-checkout? repos)))}
-      (not (every? #(contains? (set repos) (:repo %)) roles))
-      {:error "a role was pointed at a checkout this project does not hold"}
       (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
       :else (do (project-lib/write-project! {:name nm :repos repos :roles roles})
                 {:ok nm}))))
@@ -349,6 +350,7 @@
               (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
             (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
             (spit (str (:roles-file ctx)) (project-lib/roles-text project))
+            (spit (str (:repos-file ctx)) (project-lib/repos-text project))
             (fs/create-dirs (:state-dir ctx))
             (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
               (process/process ["bb" cli "open" id] {:out log :err log}))
@@ -607,14 +609,9 @@
            [:select {:name (str "model:" stage)}
             (for [v (sort task-lib/known-vendors)]
               [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
-           ;; Which checkout this role works in. One repo and there is nothing
-           ;; to choose; several and the choice is the whole point — a lineup
-           ;; silently pinned to repo one is how multi-repo stops being real.
-           (when (> (count picked) 1)
-             [:select {:name (str "repo-of:" stage)}
-              (for [r (sort picked)]
-                [:option {:value r :selected (= r (get params (str "repo-of:" stage)))}
-                 (task-lib/repo-name r)])])])]
+           ;; No checkout picker: a role works in every repo the project holds,
+           ;; and a task narrows that with `@repo` tags on its goal lines.
+           ])]
        [:div.go
         [:button {:type "submit"} "Create project"]
         [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]]]))
@@ -634,9 +631,6 @@
      [:div.project-head
       [:h2.pname (:name project)]
       [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
-      (let [idle (project-lib/unused-repos project)]
-        (when (seq idle)
-          [:span.status.unmet "no role opens " (str/join ", " (map task-lib/repo-name idle))]))
       [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
      [:div.scroll
       [:div.swim
@@ -668,7 +662,7 @@
              (for [id loose :let [ctx (task-lib/task-ctx id) att (open-attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
                 [:div.grow [:div.name.trunc id]
-                 [:div.muted.trunc (str/join ", " (map :role (roles ctx)))]]
+                 [:div.muted.trunc (str/join ", " (map :session (sessions ctx)))]]
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
                   [:span.status.met "clear"])
@@ -704,15 +698,12 @@
          [:div.row.head
           [:div.grow
            [:div.name "the swarm"]
-           [:div.muted (str/join " · " (for [{:keys [role model repo]} (:roles project)]
-                                         (str role " (" model ") in " (task-lib/repo-name (or repo "none")))))]]]
+           [:div.muted (str/join " · " (for [{:keys [role model]} (:roles project)]
+                                         (str role " (" model ")")))]]]
          [:div.row.head
           [:div.grow
            [:div.name "checkouts"]
-           [:div.muted (str/join " · " (:repos project))
-            (let [idle (project-lib/unused-repos project)]
-              (when (seq idle)
-                [:span.status.pending "no role works in " (str/join ", " (map task-lib/repo-name idle))]))]]]
+           [:div.muted (str/join " · " (:repos project))]]]
          [:form {:method "post" :action (str "/projects/" (:name project) "/review")}
           [:div.fields.stack
            [:label "task id"
@@ -782,7 +773,7 @@
    the URL and survives a reload rather than living in a variable."
   [ctx watching]
   (let [id (:task-id ctx)
-        names (map :role (roles ctx))
+        names (map :session (sessions ctx))
         watching (or (some #{watching} names) (first names))
         state (when watching (pane-state ctx watching))]
     [:aside.rail
@@ -917,9 +908,9 @@
               " · repo dashboard: dashboards/swarmkhazad.json"]])
           [:section [:h2 "Roles"]
            [:div.cards
-            (for [c (role-cards ctx)]
+            (for [c (session-cards ctx)]
               [:div.card
-               [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:role c))} (:role c)] [:span.chev "›"]]
+               [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:session c)] [:span.chev "›"]]
                [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
                [:div "judge: " (if-let [v (:verdict c)]
                                  [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
@@ -995,10 +986,10 @@
          (if-let [f (and ctx (doc-file ctx rel))] (plain 200 (slurp (str f))) (not-found))))
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx)))) (html 200 (role-page ctx role)) (not-found))))
+         (if (and ctx (some #{role} (map :session (sessions ctx)))) (html 200 (role-page ctx role)) (not-found))))
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/pane" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
+         (if (and ctx (some #{role} (map :session (sessions ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
      ;; Typing into a pane is what an attached operator already does, and the
      ;; attach command is printed beside the box — this route is that reach,
      ;; not a new one. The text is passed as one argv element to `tmux
@@ -1028,7 +1019,7 @@
          (not-found)))
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx))))
+         (if (and ctx (some #{role} (map :session (sessions ctx))))
            (let [params (parse-form (if (string? body) body (some-> body slurp)))]
              (if (= "stop" (get params "do"))
                (handoff-lib/press-key! ctx role "Escape")

@@ -55,7 +55,8 @@
       (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
       (run {:env base-env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude " src " task\nc grok none\n"))
+        (spit (str (fs/path dir "roles")) "a claude task\nb claude task\nc grok\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (spit (str (fs/path dir "goal.md")) "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n\n## Hints\n- none\n")
         (run {:env base-env} cli "prepare" id)
         ;; Role a is a working role: something reached its inbox. A role with an
@@ -64,16 +65,18 @@
         (write! (fs/path dir "mail" "a" "inbox" "in_process" "50_20260101T000000000Z_from_New-Task_to_a.handoff")
                 "id: seed\nfrom: (New Task)\nto: a\npriority: 50\ntype: note\nmessage: begin\n\nbegin\n")
         (letfn [(stop! [role verdict & [{:keys [session message]}]]
-                  (run {:dir (str (fs/path dir "worktrees" (if (= role "c") "" role)))
-                        :env (cond-> (assoc base-env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir))
+                  (run {:dir (str (fs/path dir "worktrees" "fixture"))
+                        :env (cond-> (assoc base-env "SWARMKHAZAD_SESSION" role "SWARMFORGE_ROLE" role
+                                            "SWARMKHAZAD_TASK_DIR" (str dir))
                                verdict (assoc "SWARMKHAZAD_STUB_VERDICT" verdict))
                         :in (json/generate-string {"hook_event_name" "Stop" "session_id" (or session "s1")
                                                    "stop_hook_active" false "last_assistant_message" (or message "done")})
                         :ok? false}
                        "bb" (str (fs/path scripts "goal_judge.bb"))))
                 (helper [role script & args]
-                  (apply run {:dir (str (fs/path dir "worktrees" role))
-                              :env (assoc base-env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir))
+                  (apply run {:dir (str (fs/path dir "worktrees" "fixture"))
+                              :env (assoc base-env "SWARMKHAZAD_SESSION" role "SWARMFORGE_ROLE" role
+                                          "SWARMKHAZAD_TASK_DIR" (str dir))
                               :ok? false}
                          "bb" (str (fs/path scripts script)) args))]
           (f {:dir dir :env base-env :stop! stop! :helper helper :src src})))
@@ -145,9 +148,9 @@
 (deftest met-without-a-handoff-blocks-once-to-ask-for-it-and-met-with-a-handoff-allows
   (with-task
     (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "a") "add" "x.txt")
-      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
       (let [r (stop! "a" nil)]
         (is (= "block" (:decision (decision r))))
         (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD"))
@@ -162,22 +165,23 @@
           (is (nil? (decision r)) (:out r))
           (is (= "allow" (:decision (verdict-file dir "a"))))))
       (testing "a handoff for an older commit does not count: new work, new handoff"
-        (write! (fs/path dir "worktrees" "a" "x2.txt") "x2\n")
-        (git (fs/path dir "worktrees" "a") "add" "x2.txt")
-        (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x2")
+        (write! (fs/path dir "worktrees" "fixture" "x2.txt") "x2\n")
+        (git (fs/path dir "worktrees" "fixture") "add" "x2.txt")
+        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x2")
         (let [r (stop! "a" nil {:session "s-later"})]
           (is (= "block" (:decision (decision r))))
           (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD"))))
-      (testing "a repo-less role with a met verdict is simply allowed"
+      (testing "every session has a repo now, so a met verdict still owes a handoff"
         (let [r (stop! "c" nil)]
-          (is (nil? (decision r)) (:out r)))))))
+          (is (= "block" (:decision (decision r))))
+          (is (str/includes? (:reason (decision r)) "no git_handoff for your current HEAD")))))))
 
 (deftest the-gate-refuses-a-git-handoff-without-a-met-verdict
   (with-task
     (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "a") "add" "x.txt")
-      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
       (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
       (testing "no verdict yet"
         (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
@@ -193,13 +197,13 @@
         (write! (fs/path dir "tmp" "n.txt") "type: note\nto: b\npriority: 50\nmessage: hi\n")
         (is (zero? (:exit (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "n.txt")))))))
       (testing "a role on a harness without hooks is not gated"
-        (let [roles (slurp (str (fs/path dir "state" "roles.tsv")))
-              with-grok (str/replace roles #"(?m)^b\tclaude" "b\tgrok")]
-          (is (not= roles with-grok) "the roles.tsv row for b was rewritten to grok")
-          (spit (str (fs/path dir "state" "roles.tsv")) with-grok)
-          (write! (fs/path dir "worktrees" "b" "y.txt") "y\n")
-          (git (fs/path dir "worktrees" "b") "add" "y.txt")
-          (git (fs/path dir "worktrees" "b") "commit" "-q" "-m" "y")
+        (let [rows (slurp (str (fs/path dir "state" "sessions.tsv")))
+              with-grok (str/replace rows #"(?m)^b\tb\tfixture\t([^\t]*)\tclaude" "b\tb\tfixture\t$1\tgrok")]
+          (is (not= rows with-grok) "the sessions.tsv row for b was rewritten to grok")
+          (spit (str (fs/path dir "state" "sessions.tsv")) with-grok)
+          (write! (fs/path dir "worktrees" "fixture" "y.txt") "y\n")
+          (git (fs/path dir "worktrees" "fixture") "add" "y.txt")
+          (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "y")
           (write! (fs/path dir "tmp" "gb.txt") "type: git_handoff\nto: a\npriority: 50\n")
           (let [r (helper "b" "swarm_handoff.bb" (str (fs/path dir "tmp" "gb.txt")))]
             (is (zero? (:exit r)) (:err r))))))))
@@ -220,9 +224,9 @@
       (testing "escalation.md says the judge was down"
         (is (str/includes? (slurp (str (fs/path dir "escalation.md"))) "judge unavailable")))
       (testing "the gate still refuses the git_handoff"
-        (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "a") "add" "x.txt")
-        (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+        (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
         (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
         (let [r (helper "a" "swarm_handoff.bb" (str (fs/path dir "tmp" "g.txt")))]
           (is (= 1 (:exit r)))
@@ -259,21 +263,21 @@
         (doseq [f (concat (fs/glob (fs/path dir "mail" "b" "inbox" "new") "*.handoff")
                           (fs/glob (fs/path dir "mail" "b" "inbox" "in_process") "*.handoff"))]
           (fs/delete f))
-        (write! (fs/path dir "worktrees" "b" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "b") "add" "x.txt")
-        (git (fs/path dir "worktrees" "b") "commit" "-q" "-m" "x")
+        (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
         (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-commit"})]
           (is (= "block" (:decision (decision r))))
           (is (not (:idle (verdict-file dir "b"))))))
       (testing "an uncommitted change also counts as touched"
-        (git (fs/path dir "worktrees" "b") "reset" "-q" "--hard" "HEAD~1")
-        (write! (fs/path dir "worktrees" "b" "dirty.txt") "d\n")
+        (git (fs/path dir "worktrees" "fixture") "reset" "-q" "--hard" "HEAD~1")
+        (write! (fs/path dir "worktrees" "fixture" "dirty.txt") "d\n")
         (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-dirty"})]
           (is (= "block" (:decision (decision r))))
           (is (not (:idle (verdict-file dir "b"))))))
       (testing "a git that cannot answer counts as touched, never as idle"
-        (fs/delete-tree (fs/path dir "worktrees" "b" "dirty.txt"))
-        (fs/delete-if-exists (fs/path dir "worktrees" "b" ".git"))
+        (fs/delete-tree (fs/path dir "worktrees" "fixture" "dirty.txt"))
+        (fs/delete-if-exists (fs/path dir "worktrees" "fixture" ".git"))
         (let [r (stop! "b" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}" {:session "s-broken"})]
           (is (= "block" (:decision (decision r)))
               "a broken worktree must be graded, not silently excused as having no task"))))))
@@ -301,9 +305,9 @@
 (deftest a-spent-block-budget-lets-the-handoff-through-carrying-the-gap
   (with-task
     (fn [{:keys [dir stop! helper]}]
-      (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-      (git (fs/path dir "worktrees" "a") "add" "x.txt")
-      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+      (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+      (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
       (write! (fs/path dir "tmp" "g.txt") "type: git_handoff\nto: b\npriority: 50\n")
       (testing "while blocks remain, an unmet role is refused"
         (stop! "a" "{\"met\":false,\"unmet\":[\"GOAL-X\"]}")

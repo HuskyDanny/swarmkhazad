@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # swarmkhazad harness shim — installed by `open` as <task>/bin/{claude,codex,grok,copilot}.
 #
-# A role's pane launches `<task>/bin/<harness>`; this file branches on the role
-# in $SWARMFORGE_ROLE, applies that role's model configuration (one row of
+# A session's pane launches `<task>/bin/<harness>`; this file branches on it
+# in $SWARMKHAZAD_SESSION, applies that session's model configuration (one row of
 # state/vendors.tsv — the cc_alt vendor table: base URL, keychain token, model
 # ids, context window) plus the OTEL exporter tagged with task_id and role,
 # then execs the real CLI recorded in state/harnesses.tsv at open time. Model
@@ -11,7 +11,8 @@ set -euo pipefail
 
 harness="$(basename "$0")"
 task_dir="${SWARMKHAZAD_TASK_DIR:?swarmkhazad shim: SWARMKHAZAD_TASK_DIR is not set}"
-role="${SWARMFORGE_ROLE:?swarmkhazad shim: SWARMFORGE_ROLE is not set}"
+session="${SWARMKHAZAD_SESSION:?swarmkhazad shim: SWARMKHAZAD_SESSION is not set}"
+role="${SWARMFORGE_ROLE:-$session}"
 task_id="${SWARMKHAZAD_TASK_ID:?swarmkhazad shim: SWARMKHAZAD_TASK_ID is not set}"
 
 real="$(awk -F'\t' -v h="$harness" '$1==h {print $2}' "$task_dir/state/harnesses.tsv")"
@@ -19,10 +20,11 @@ if [ -z "$real" ] || [ ! -x "$real" ]; then
   echo "swarmkhazad shim: no executable for '$harness' in $task_dir/state/harnesses.tsv" >&2
   exit 127
 fi
-# roles.tsv columns are task-lib's roles-tsv-columns; :model is the sixth (pinned by shim_test).
-vendor="$(awk -F'\t' -v r="$role" '$1==r {print $6}' "$task_dir/state/roles.tsv")"
+# sessions.tsv columns are task-lib's sessions-tsv-columns; :model is the
+# seventh and the session id is the first (both pinned by shim_test).
+vendor="$(awk -F'\t' -v r="$session" '$1==r {print $7}' "$task_dir/state/sessions.tsv")"
 if [ -z "$vendor" ]; then
-  echo "swarmkhazad shim: role '$role' is not in $task_dir/state/roles.tsv" >&2
+  echo "swarmkhazad shim: session '$session' is not in $task_dir/state/sessions.tsv" >&2
   exit 2
 fi
 
@@ -69,7 +71,7 @@ if [ "$harness" = "claude" ]; then
   export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
   export OTEL_EXPORTER_OTLP_ENDPOINT="${SWARMKHAZAD_OTLP_ENDPOINT:-http://127.0.0.1:8428/opentelemetry}"
   export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}"
-  export OTEL_RESOURCE_ATTRIBUTES="task_id=${task_id},role=${role}${OTEL_RESOURCE_ATTRIBUTES:+,$OTEL_RESOURCE_ATTRIBUTES}"
+  export OTEL_RESOURCE_ATTRIBUTES="task_id=${task_id},role=${role},session=${session},repo=${SWARMKHAZAD_REPO:-}${OTEL_RESOURCE_ATTRIBUTES:+,$OTEL_RESOURCE_ATTRIBUTES}"
 fi
 
 exec "$real" "${extra[@]+"${extra[@]}"}" "$@"

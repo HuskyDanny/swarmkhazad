@@ -77,7 +77,7 @@
         (testing "Not-goal is left for the operator, never invented"
           (is (str/includes? goal "## Not-goal\n- <what this issue deliberately does not cover")))
         (testing "roles is one implement role; metrics.md is still the template"
-          (is (= "implement claude none task" (last (str/split-lines (slurp (str (fs/path dir "roles")))))))
+          (is (= "implement claude task" (last (str/split-lines (slurp (str (fs/path dir "roles")))))))
           (is (str/includes? (slurp (str (fs/path dir "metrics.md"))) "## Quantitative")))))))
 
 (deftest an-issue-without-acceptance-lines-gets-one-checkbox-naming-the-title

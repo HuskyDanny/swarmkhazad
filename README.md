@@ -45,12 +45,30 @@ The `<role> — ` prefix is load-bearing: the goal judge grades each role agains
 - the diff stays inside src/api/ — judged by: Allen
 ```
 
-**`roles`** — one line per agent, in pipeline order. The first role gets the opening note; the last one broadcasts to the rest and ends the task:
+**`roles`** — one line per agent, in pipeline order. A role names no checkout; it can work in any of the task's repos:
 
 ```
-implement claude ~/repos/some-project task branch=feat/x --model sonnet
-review    claude ~/repos/some-project task --model sonnet
-run       claude ~/repos/some-project task --model haiku
+implement claude task --model sonnet
+review    claude task --model sonnet
+run       claude task --model haiku
+```
+
+**`repos`** — the checkouts this task works in, one per line:
+
+```
+~/repos/some-project
+~/repos/other-project branch=feat/x
+```
+
+A goal line tags the repos it touches, and that is what decides which sessions
+run. An untagged line belongs to every role and every repo, which is what a
+one-repo task writes:
+
+```
+## Goal
+- [ ] implement @some-project — the route returns 200
+- [ ] implement @other-project — the client calls it
+- [ ] review — read both
 ```
 
 Then run it:
@@ -77,41 +95,55 @@ Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is
 ```
 ~/.swarmkhazad/tasks/<task-id>/
   goal.md  metrics.md          the truth: what done means and how it is measured (locked 444)
-  roles                        the declaration, one line per role (grammar below)
+  roles                        the lineup, one line per role (grammar below)
+  repos                        the checkouts, one per line
   decision.md gotcha.md escalation.md   roles append one bullet per line
   draft-<role>.md              a role's full write-up
   evidence/<bar>.txt           the run role's measurements
-  repos/<name>/                clone of the target repo, objects hardlinked from the local checkout
-  worktrees/<role>/            one worktree per role, branch sk/<task-id>/<role>, off repos/<name>
-  mail/<role>/                 outbox/ sent/ failed/ inbox/{new,in_process,completed}
+  worktrees/<repo>/            one worktree per repo, branch sk/<task-id>, added from the checkout itself
+  mail/<session>/              outbox/ sent/ failed/ inbox/{new,in_process,completed}
   bin/                         per-role harness shims (claude, codex, grok)
   prompts/ hooks/              generated per launch
-  state/                       roles.tsv (spawn-time snapshot of `roles`), tmux socket, board/, daemon/, sessions/, judge/
+  state/                       sessions.tsv (the (role, repo) table), tmux socket, board/, daemon/, sessions/, judge/
   tmp/                         scratch; handoff drafts live here, never in the repo
 ```
 
-Each stage creates the directories it fills; `prepare` creates `repos/ worktrees/ mail/ state/ tmp/` and the three bullet files.
+Each stage creates the directories it fills; `prepare` creates `worktrees/ mail/ state/ tmp/` and the three bullet files.
 
 ### The `roles` declaration
 
 ```
-<role> <harness> <repo-path|none> [task|batch] [model=<vendor>] [branch=<name>] [cli args...]
+<role> <harness> [task|batch] [model=<vendor>] [cli args...]
 ```
 
-`role` is `[A-Za-z0-9][A-Za-z0-9.-]*` (it is a path component and a refname segment). `harness` is `claude|codex|copilot|grok`. `repo-path` is a local git checkout — a linked worktree is fine, and a shallow one works too, it just costs disk because git declines to hardlink objects out of it; `none` means the role works in the task folder. `branch=<name>` pins the clone to that branch of the checkout instead of its default — the branch must already exist there, since the swarm never fetches, and roles sharing a repo must name the same one. The optional tokens may appear in any order; anything else is passed to the harness CLI verbatim. Two checkouts with the same basename cannot share a task — they would share one clone.
+`role` is `[A-Za-z0-9][A-Za-z0-9-]*` — a path component, a refname segment, and half of a tmux session name, which is why a dot is refused: `tmux new-session -s sk-a.b` succeeds and every later `-t sk-a.b` fails `can't find pane: b`, because tmux reads a dot as `session.pane`. `harness` is `claude|codex|copilot|grok`. The optional tokens may appear in any order; anything else is passed to the harness CLI verbatim.
 
-`state/roles.tsv` is the snapshot `prepare` writes, one row per role, columns `role harness repo worktree-path receive-mode model branch extra-args`; an absent value is the literal `none`.
+### The `repos` declaration
 
-### The clone
+```
+<abs-path> [branch=<name>]
+```
 
-The clone is pinned to the source checkout's `origin/<default>` at open time (`origin/HEAD`'s target, else `main`, else the source's own branch), or to `origin/<branch>` when a role names one. `git clone` transfers only what the source's local branches reach, so when the source has fetched but not merged and its `origin/<branch>` is ahead of its local one, that commit never arrives; the pin then falls back to the branch tip the clone actually holds. The clone's `origin` is repointed at the source's upstream URL — or removed when the source has none — and every other ref and local branch is dropped. After that the source is never read again.
+Each path is a local git checkout — a linked worktree is fine, and so is a shallow one. `branch=<name>` starts the task branch from that branch instead of the checkout's default; the branch must already exist there, since the swarm never fetches. Two checkouts with the same basename cannot share a task: the basename names the worktree directory and tags goal lines, so a collision would make both ambiguous.
+
+### Sessions
+
+A task runs one session per (role, repo) pair, and that is the unit with a tmux pane, an inbox and a judge verdict. `state/sessions.tsv` is what `prepare` writes: columns `session role repo worktree-path harness receive-mode model extra-args`. A one-repo task names its sessions after its roles (`review`); past one repo the id says which (`review_gobel`). Nothing derives that rule twice — every reader looks the id up in the table.
+
+Which repos a role gets comes from its goal lines: the `@repo` tags on the lines it owns, or every repo when it has none. A tag naming a repo the task does not hold is refused, because a typo that silently widened a role to every checkout would only be found by watching it open the wrong worktree.
+
+### The worktrees
+
+There is no clone. Each repo gets one worktree, added from the checkout itself, on branch `sk/<task-id>` — so roles sharing a repo share its worktree, and the handoff between them needs no merge. The start ref is explicit: the source's `origin/<default>` at open time (`origin/HEAD`'s target, else `main`, else the source's own branch). A bare `worktree add` would inherit whatever the source has checked out, which is how a task once started from someone else's work in progress. A ref naming a commit the checkout does not actually hold — a shallow clone's `origin/main` pointing past its own boundary — falls back to the branch tip it has.
+
+The cost of not cloning is that `git worktree add` registers the worktree and the branch **in the source checkout**. Nothing else there is touched: the working tree stays clean and on its own branch.
 
 ## Commands
 
 ```
 swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]
                                                scaffold goal.md, metrics.md, roles
-swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv — no agents yet
+swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv — no agents yet
 swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
 swarmkhazad open --linear <KEY> [--repo <path>]...
                                                scaffold from a Linear issue, then open
@@ -123,11 +155,11 @@ swarmkhazad telemetry <task-id>                cost, tokens and sessions per rol
 
 ## The swarm
 
-`open` starts one tmux server per task on `/tmp/swarmkhazad-<user>/<task-id>.sock`, one session per role (`sk-<role>`), puts the board card in the first role's lane, queues a `(New Task)` note to that role, starts `handoffd`, then launches each role's harness in its worktree with `SWARMFORGE_ROLE`, `SWARMKHAZAD_TASK_ID`, `SWARMKHAZAD_TASK_DIR` exported and `<task>/bin` plus this repo's `scripts/` on PATH. Each role gets `prompts/<role>.md` (folder rules, mail rules, a stage prompt from `prompts/<role>.prompt`) appended to its system prompt. No terminal windows open; attach with `tmux -S <socket> attach -t sk-<role>`.
+`open` starts one tmux server per task on `/tmp/swarmkhazad-<user>/<task-id>.sock`, one session per (role, repo) pair (`sk-<session>`), puts the board card in the first role's lane, queues a `(New Task)` note to the first session, starts `handoffd`, then launches each session's harness in its repo's worktree with `SWARMFORGE_ROLE`, `SWARMKHAZAD_SESSION`, `SWARMKHAZAD_REPO`, `SWARMKHAZAD_TASK_ID`, `SWARMKHAZAD_TASK_DIR` exported and `<task>/bin` plus this repo's `scripts/` on PATH. Each session gets `prompts/<session>.md` (folder rules, mail rules, a stage prompt from `prompts/<role>.prompt` — the stage is the role's, so every repo gets the same instructions and only the header differs) appended to its system prompt. No terminal windows open; attach with `tmux -S <socket> attach -t sk-<session>`.
 
 ### Harness shims
 
-`open` installs `scripts/shim.sh` as `<task>/bin/<harness>` for every known harness and launches roles through them. A shim reads the role from `SWARMFORGE_ROLE`, the role's model vendor from `state/roles.tsv`, the vendor's row from `state/vendors.tsv` (a copy of `scripts/vendors.tsv`: `vendor base_url keychain_service model_main model_small ctx_tokens` — the one table the shim and the smoke both read), and the real binary from `state/harnesses.tsv` (resolved at `open` from the operator's PATH), then execs the real CLI. For `claude` it applies the vendor's configuration first — `anthropic` (direct; any routing inherited from the operator's shell is dropped), or a `vendors.tsv` row (base URL, keychain token via `security`, model ids, context window, `--model` pin) — and the telemetry exporter: `CLAUDE_CODE_ENABLE_TELEMETRY=1`, OTLP metrics over `http/protobuf` to `SWARMKHAZAD_OTLP_ENDPOINT` (default `http://127.0.0.1:8428/opentelemetry`, a local VictoriaMetrics), `OTEL_RESOURCE_ATTRIBUTES=task_id=<id>,role=<role>`. The vendor's token sits in the role's process environment for the life of the session, where the agent can read it; that is the cc_alt arrangement, not a new exposure.
+`open` installs `scripts/shim.sh` as `<task>/bin/<harness>` for every known harness and launches roles through them. A shim reads the session from `SWARMKHAZAD_SESSION`, its model vendor from `state/sessions.tsv`, the vendor's row from `state/vendors.tsv` (a copy of `scripts/vendors.tsv`: `vendor base_url keychain_service model_main model_small ctx_tokens` — the one table the shim and the smoke both read), and the real binary from `state/harnesses.tsv` (resolved at `open` from the operator's PATH), then execs the real CLI. For `claude` it applies the vendor's configuration first — `anthropic` (direct; any routing inherited from the operator's shell is dropped), or a `vendors.tsv` row (base URL, keychain token via `security`, model ids, context window, `--model` pin) — and the telemetry exporter: `CLAUDE_CODE_ENABLE_TELEMETRY=1`, OTLP metrics over `http/protobuf` to `SWARMKHAZAD_OTLP_ENDPOINT` (default `http://127.0.0.1:8428/opentelemetry`, a local VictoriaMetrics), `OTEL_RESOURCE_ATTRIBUTES=task_id=<id>,role=<role>,session=<session>,repo=<repo>`. The vendor's token sits in the role's process environment for the life of the session, where the agent can read it; that is the cc_alt arrangement, not a new exposure.
 
 `open` also pre-accepts Claude Code's folder-trust dialog for every claude role's working directory by adding `projects[<realpath>].hasTrustDialogAccepted: true` to `~/.claude.json` (`SWARMKHAZAD_CLAUDE_JSON` overrides the path); `close` removes exactly those entries. Nothing else in that file is touched. Without it a fresh worktree stops at the dialog and hooks never run.
 
@@ -156,7 +188,7 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 - `/` — every task with its board lane, roles and attention count, plus the kickstart form: task id, one local checkout per line, the `roles` declaration (stage prompts, harnesses and vendors listed under it). Submitting runs `new`, writes `roles`, starts `open` in the background (`state/portal-open.log`) and redirects to the task page.
 - `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
 - `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
-- `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`doc-file`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
+- `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`doc-file`: canonical path under the task folder, never under `worktrees/`, never through a symlink that leaves it).
 
 ## Intake from Linear
 
@@ -166,7 +198,7 @@ The fetch is a headless `claude -p` with exactly one MCP server and exactly one 
 
 ## Telemetry
 
-Claude Code's own OpenTelemetry export is the source; the shim turns it on for every claude role and tags it (`OTEL_RESOURCE_ATTRIBUTES=task_id=<id>,role=<role>`), pointing OTLP at `SWARMKHAZAD_OTLP_ENDPOINT` (default `http://127.0.0.1:8428/opentelemetry`, a local VictoriaMetrics single-node). Start the store before `open` — an export to a closed port is dropped, not queued:
+Claude Code's own OpenTelemetry export is the source; the shim turns it on for every claude role and tags it (`OTEL_RESOURCE_ATTRIBUTES=task_id=<id>,role=<role>,session=<session>,repo=<repo>`), pointing OTLP at `SWARMKHAZAD_OTLP_ENDPOINT` (default `http://127.0.0.1:8428/opentelemetry`, a local VictoriaMetrics single-node). Start the store before `open` — an export to a closed port is dropped, not queued:
 
 ```
 brew install victoriametrics && brew services start victoriametrics

@@ -173,9 +173,9 @@
       (println "SWARMKHAZAD_RUN_REMOTE is set but there is no remote runner; evidence runs locally only. Unset it."))
     (System/exit 2))
   (let [ctx (task-lib/ctx-from-env)
-        role (or (first args) (System/getenv "SWARMFORGE_ROLE"))
-        _ (when (str/blank? role) (task-lib/fail! "SWARMFORGE_ROLE is not set"))
-        row (task-lib/role-row ctx role)
+        session (or (first args) (System/getenv "SWARMKHAZAD_SESSION"))
+        _ (when (str/blank? session) (task-lib/fail! "SWARMKHAZAD_SESSION is not set"))
+        row (task-lib/session-row ctx session)
         worktree (or (:worktree-path row) (str (fs/cwd)))
         metrics-md (if (fs/regular-file? (:metrics-file ctx)) (slurp (str (:metrics-file ctx))) "")
         results (measure-all! ctx worktree metrics-md)]

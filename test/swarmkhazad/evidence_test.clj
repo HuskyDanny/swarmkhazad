@@ -53,13 +53,14 @@
       (make-source-repo! src repo-files)
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "implement claude " src " task\nrun claude " src " task\n"))
+        (spit (str (fs/path dir "roles")) "implement claude task\nrun claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (spit (str (fs/path dir "metrics.md")) metrics)
         (run {:env env} cli "prepare" id)
         (f {:dir dir
             :measure (fn [& [extra-env]]
-                       (run {:dir (str (fs/path dir "worktrees" "run"))
-                             :env (merge env {"SWARMFORGE_ROLE" "run" "SWARMKHAZAD_TASK_DIR" (str dir)} extra-env)
+                       (run {:dir (str (fs/path dir "worktrees" "fixture"))
+                             :env (merge env {"SWARMKHAZAD_SESSION" "run" "SWARMKHAZAD_TASK_DIR" (str dir)} extra-env)
                              :ok? false}
                             "bb" (str (fs/path scripts "run_evidence.bb"))))}))
       (finally
@@ -98,7 +99,7 @@
           (let [h (headers (fs/path ev "repo-tests.txt"))]
             (is (= "bb test" (get h "command")))
             (is (= "0" (get h "exit")))
-            (is (= (str (fs/path dir "worktrees" "run")) (get h "cwd")))
+            (is (= (str (fs/path dir "worktrees" "fixture")) (get h "cwd")))
             (is (str/includes? (output (fs/path ev "repo-tests.txt")) "tests ran"))))
         (testing "<id> is substituted; the role's environment reaches the command; threshold carried"
           (let [f (fs/path ev "every-role-called.txt") h (headers f)]
@@ -114,7 +115,7 @@
             (is (= "Spend (USD)" (get h "bar")))
             (is (str/includes? (output f) "sum=3.2"))))
         (testing "the second bar with the same name got its own file, run from the worktree"
-          (is (= (str (fs/real-path (fs/path dir "worktrees" "run"))) (str/trim (output (fs/path ev "wall-clock-2.txt"))))))
+          (is (= (str (fs/real-path (fs/path dir "worktrees" "fixture"))) (str/trim (output (fs/path ev "wall-clock-2.txt"))))))
         (testing "the summary names each bar with its exit"
           (is (str/includes? (:out r) "repo-tests"))
           (is (re-find #"spend-usd\s+exit=3" (:out r)))

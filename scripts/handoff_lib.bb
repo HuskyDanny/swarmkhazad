@@ -32,45 +32,53 @@
     (catch Exception _
       (= (str a) (str b)))))
 
-(defn infer-role-from-cwd [ctx]
-  (let [here (str (fs/cwd))]
-    (some (fn [row]
-            (when (and (:repo row) (same-path? (:worktree-path row) here))
-              (:role row)))
-          (task-lib/read-roles-tsv ctx))))
+(defn infer-session-from-cwd
+  "The session whose worktree is the cwd — but only when exactly one is.
 
-(defn role
-  "SWARMFORGE_ROLE, else the role whose worktree is the cwd."
-  ([] (role (ctx)))
+   Roles sharing a repo share its worktree, so a directory names a repo and not
+   a session. Guessing between implement_gobel and review_gobel would put mail
+   in the wrong inbox, which is worse than refusing."
+  [ctx]
+  (let [here (str (fs/cwd))
+        hits (filter #(and (:worktree-path %) (same-path? (:worktree-path %) here))
+                     (task-lib/read-sessions-tsv ctx))]
+    (when (= 1 (count hits)) (:session (first hits)))))
+
+(defn session
+  "SWARMKHAZAD_SESSION, else a role that runs in exactly one repo, else the cwd."
+  ([] (session (ctx)))
   ([ctx]
-   (or (not-empty (System/getenv "SWARMFORGE_ROLE"))
-       (infer-role-from-cwd ctx)
-       (throw (ex-info "Set SWARMFORGE_ROLE." {:exit 1})))))
+   (or (not-empty (System/getenv "SWARMKHAZAD_SESSION"))
+       (when-let [r (not-empty (System/getenv "SWARMFORGE_ROLE"))]
+         (let [rows (task-lib/role-sessions ctx r)]
+           (when (= 1 (count rows)) (:session (first rows)))))
+       (infer-session-from-cwd ctx)
+       (throw (ex-info "Set SWARMKHAZAD_SESSION." {:exit 1})))))
 
-(defn role-row [ctx role-name]
-  (or (task-lib/role-row ctx role-name)
-      (throw (ex-info (str "Unknown role: " role-name) {:exit 1}))))
+(defn session-row [ctx name]
+  (or (task-lib/session-row ctx name)
+      (throw (ex-info (str "Unknown session: " name) {:exit 1}))))
 
-(defn role-known? [ctx role-name]
-  (boolean (task-lib/role-row ctx role-name)))
+(defn session-known? [ctx name]
+  (boolean (task-lib/session-row ctx name)))
 
-(defn role-receive-mode [ctx role-name]
-  (let [mode (:receive-mode (role-row ctx role-name))]
+(defn session-receive-mode [ctx name]
+  (let [mode (:receive-mode (session-row ctx name))]
     (if (str/blank? mode) "task" mode)))
 
-(defn role-names [ctx] (task-lib/role-names ctx))
+(defn session-names [ctx] (task-lib/session-names ctx))
 
-(defn last-role? [ctx role-name]
-  (= role-name (last (role-names ctx))))
+(defn last-session? [ctx name]
+  (= name (last (session-names ctx))))
 
 ;; ---------------------------------------------------------------- dirs
 
-(defn mail-dir [ctx role-name] (task-lib/role-mail-dir ctx role-name))
-(defn outbox-dir [ctx role-name] (fs/path (mail-dir ctx role-name) "outbox"))
-(defn inbox-dir [ctx role-name] (fs/path (mail-dir ctx role-name) "inbox"))
-(defn new-dir [ctx role-name] (fs/path (inbox-dir ctx role-name) "new"))
-(defn in-process-dir [ctx role-name] (fs/path (inbox-dir ctx role-name) "in_process"))
-(defn completed-dir [ctx role-name] (fs/path (inbox-dir ctx role-name) "completed"))
+(defn mail-dir [ctx name] (task-lib/session-mail-dir ctx name))
+(defn outbox-dir [ctx name] (fs/path (mail-dir ctx name) "outbox"))
+(defn inbox-dir [ctx name] (fs/path (mail-dir ctx name) "inbox"))
+(defn new-dir [ctx name] (fs/path (inbox-dir ctx name) "new"))
+(defn in-process-dir [ctx name] (fs/path (inbox-dir ctx name) "in_process"))
+(defn completed-dir [ctx name] (fs/path (inbox-dir ctx name) "completed"))
 
 ;; ---------------------------------------------------------------- time
 
@@ -108,14 +116,14 @@
 (defn in-process-state
   "What a role has accepted and not finished: single files and batch dirs.
    Both receive helpers validate against this one view."
-  [ctx role-name]
-  (let [dir (in-process-dir ctx role-name)]
+  [ctx session]
+  (let [dir (in-process-dir ctx session)]
     {:dir dir :files (handoff-files dir) :batches (batch-dirs dir)}))
 
 (defn in-process-files
   "Single in-process handoffs plus every file inside an in-process batch."
-  [ctx role-name]
-  (let [{:keys [files batches]} (in-process-state ctx role-name)]
+  [ctx session]
+  (let [{:keys [files batches]} (in-process-state ctx session)]
     (into files (mapcat handoff-files batches))))
 
 (defn glob-handoffs
@@ -214,20 +222,20 @@
   "The pane's scrollback. `-e` keeps the SGR escapes, without which an agent TUI
    arrives as flat grey text and every colour it used to mean something with is
    gone. Callers that want plain text strip them; the portal renders them."
-  [ctx role-name & {:keys [ansi] :or {ansi false}}]
+  [ctx session & {:keys [ansi] :or {ansi false}}]
   (when-let [socket (tmux-socket ctx)]
     (let [args (concat ["tmux" "-S" socket "capture-pane" "-p"]
                        (when ansi ["-e"])
-                       ["-t" (task-lib/session-name role-name) "-S" "-"])
+                       ["-t" (task-lib/session-name session) "-S" "-"])
           r (apply process/sh {:continue true} args)]
       (when (zero? (:exit r)) (:out r)))))
 
 (defn- tmux-send!
-  [ctx role-name args]
+  [ctx session args]
   (when-let [socket (tmux-socket ctx)]
     (zero? (:exit (apply process/sh {:continue true}
                         (concat ["tmux" "-S" socket "send-keys"
-                                 "-t" (task-lib/session-name role-name)]
+                                 "-t" (task-lib/session-name session)]
                                 args))))))
 
 (defn type-into-pane!
@@ -242,45 +250,45 @@
    Best-effort. A role whose session is gone returns false, and the caller
    decides whether that matters — handoffd logs it and moves on, because the
    inbox file is delivered either way."
-  [ctx role-name text]
+  [ctx session text]
   (boolean
    (when (seq (or text ""))
-     (when (tmux-send! ctx role-name ["-l" text])
+     (when (tmux-send! ctx session ["-l" text])
        (Thread/sleep 150)
-       (tmux-send! ctx role-name ["C-m"])
+       (tmux-send! ctx session ["C-m"])
        (Thread/sleep 50)
-       (tmux-send! ctx role-name ["C-j"])
+       (tmux-send! ctx session ["C-j"])
        true))))
 
 (defn press-key!
   "Send one tmux key name — Escape to interrupt the turn a role is in the middle
    of, C-c to signal it. A key name cannot go through `type-into-pane!`, which
    sends literally by design."
-  [ctx role-name key]
-  (boolean (tmux-send! ctx role-name [key])))
+  [ctx session key]
+  (boolean (tmux-send! ctx session [key])))
 
-(defn archive-role!
-  "Snapshot the role's pane to state/sessions/<role>/pane.txt — what the portal
+(defn archive-session!
+  "Snapshot the pane to state/sessions/<session>/pane.txt — what the portal
    shows once the session is gone."
-  [ctx role-name]
-  (when-let [text (or (System/getenv "SWARMKHAZAD_PANE_STUB") (capture-pane ctx role-name))]
-    (let [file (fs/path (:sessions-dir ctx) role-name "pane.txt")]
+  [ctx session]
+  (when-let [text (or (System/getenv "SWARMKHAZAD_PANE_STUB") (capture-pane ctx session))]
+    (let [file (fs/path (:sessions-dir ctx) session "pane.txt")]
       (fs/create-dirs (fs/parent file))
       (spit (str file) text))))
 
 (defn archive-all! [ctx]
-  (doseq [r (role-names ctx)] (archive-role! ctx r)))
+  (doseq [r (session-names ctx)] (archive-session! ctx r)))
 
 ;; ---------------------------------------------------------------- done
 
 (defn finish-done!
-  "Archive the role's pane and say whether more mail waits."
-  [ctx role-name]
+  "Archive the pane and say whether more mail waits."
+  [ctx session]
   (try
-    (archive-role! ctx role-name)
+    (archive-session! ctx session)
     (catch Exception e
       (binding [*out* *err*]
-        (println (str "archive failed role=" role-name " error=" (.getMessage e))))))
-  (if (seq (handoff-files (new-dir ctx role-name)))
+        (println (str "archive failed session=" session " error=" (.getMessage e))))))
+  (if (seq (handoff-files (new-dir ctx session)))
     (println "MAIL_WAITING")
     (println "NO_TASK")))

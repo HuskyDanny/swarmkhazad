@@ -30,7 +30,9 @@ task_dir="${SWARMKHAZAD_TASK_DIR:-}"
 [ -d "$task_dir" ] || exit 0
 TASK_REAL=$(cd "$task_dir" 2>/dev/null && pwd -P) || exit 0
 task_id="${SWARMKHAZAD_TASK_ID:-$(basename "$task_dir")}"
-role="${SWARMFORGE_ROLE:-}"
+# The session, not the role: two sessions of one role differ by repo, and a
+# shared draft-<role>.md would have them overwriting each other.
+role="${SWARMKHAZAD_SESSION:-${SWARMFORGE_ROLE:-}}"
 
 input=$(cat 2>/dev/null) || exit 0
 event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null) || exit 0

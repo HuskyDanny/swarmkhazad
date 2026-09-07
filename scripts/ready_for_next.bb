@@ -86,12 +86,12 @@
 
 (defn -main []
   (let [ctx (task-lib/ctx-from-env)
-        role (handoff-lib/role ctx)
-        row (handoff-lib/role-row ctx role)
+        role (handoff-lib/session ctx)
+        row (handoff-lib/session-row ctx role)
         worktree (when (:repo row) (:worktree-path row))]
     (doseq [d [(handoff-lib/new-dir ctx role) (handoff-lib/in-process-dir ctx role) (handoff-lib/completed-dir ctx role)]]
       (fs/create-dirs d))
-    (case (handoff-lib/role-receive-mode ctx role)
+    (case (handoff-lib/session-receive-mode ctx role)
       "batch" (batch-mode! ctx role worktree)
       "task" (task-mode! ctx role worktree)
       (fail! 2 (str "INVALID_RECEIVE_MODE for role " role)))))

@@ -74,14 +74,14 @@
   ;; wrote it and was refused, then had to list its siblings by hand).
   (let [recipients (cond
                      (str/blank? to) []
-                     (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/role-names ctx)))
+                     (= "all" (str/trim to)) (vec (remove #{sender} (handoff-lib/session-names ctx)))
                      :else (mapv str/trim (str/split to #"," -1)))]
     [recipients
      (cond-> []
        (str/blank? to) (conj "Missing required header 'to'.")
        (some str/blank? recipients) (conj "Header 'to' contains an empty recipient.")
        (not= (count recipients) (count (distinct recipients))) (conj "Duplicate recipient in 'to'.")
-       :always (into (for [r recipients :when (and (not (str/blank? r)) (not (handoff-lib/role-known? ctx r)))]
+       :always (into (for [r recipients :when (and (not (str/blank? r)) (not (handoff-lib/session-known? ctx r)))]
                        (format "Unknown recipient role '%s'." r))))]))
 
 (defn base-errors [{:strs [type priority message]}]
@@ -117,7 +117,7 @@
   "Another live handoff with the same from/to/commit: in any outbox, or in a
    recipient's inbox new/in_process."
   [ctx sender recipients commit]
-  (let [dirs (concat (for [r (handoff-lib/role-names ctx)] (handoff-lib/outbox-dir ctx r))
+  (let [dirs (concat (for [r (handoff-lib/session-names ctx)] (handoff-lib/outbox-dir ctx r))
                      (for [r recipients state ["new" "in_process"]] (fs/path (handoff-lib/inbox-dir ctx r) state)))]
     (->> dirs
          (mapcat handoff-lib/glob-handoffs)
@@ -214,8 +214,8 @@
   (when (not= 1 (count args)) (exit! 1 usage-text))
   (let [ctx (task-lib/ctx-from-env)
         draft (fs/absolutize (fs/path (first args)))
-        sender (handoff-lib/role ctx)
-        row (handoff-lib/role-row ctx sender)]
+        sender (handoff-lib/session ctx)
+        row (handoff-lib/session-row ctx sender)]
     (when-not (fs/regular-file? draft) (exit! 1 (str "Draft file not found: " draft)))
     (when-not (fs/starts-with? (fs/canonicalize draft) (fs/canonicalize (:tmp-dir ctx)))
       (exit! 1 (str "Draft must live under " (:tmp-dir ctx) "; got " draft)))
@@ -233,8 +233,6 @@
         (System/exit 2))
       (let [git? (= type "git_handoff")
             worktree (:worktree-path row)
-            _ (when (and git? (nil? (:repo row)))
-                (exit! 1 (str "Role " sender " has no repo; it can send notes, not git handoffs.")))
             _ (when (and git? (inbound-non-forwarding? ctx sender))
                 (exit! 1 "Current inbound handoff is non-forwarding (terminal); merge it and run done_with_current.bb, do not send a git_handoff."))
             _ (when git? (require-met-verdict! ctx row sender))
@@ -253,7 +251,7 @@
               unmet (when (and verdict (not (:met verdict)) (:exhausted verdict)) (:unmet verdict))
               final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
                                          :commit commit :artifacts artifacts :base base :unmet unmet
-                                         :non-forwarding? (and git? (handoff-lib/last-role? ctx sender))})]
+                                         :non-forwarding? (and git? (handoff-lib/last-session? ctx sender))})]
           (fs/delete draft)
           (println "HANDOFF QUEUED:" (str final))
           (when git? (complete-current! ctx sender)))))))

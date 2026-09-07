@@ -72,9 +72,10 @@
       (finally
         (fs/delete-tree sandbox)))))
 
-(deftest roles-tsv-model-column-is-the-sixth-the-shim-reads
+(deftest sessions-tsv-columns-are-the-ones-the-shim-reads
   (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
-  (is (= 5 (.indexOf @(resolve 'task-lib/roles-tsv-columns) :model)) "shim.sh reads $6 for the vendor")
+  (is (= 0 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :session)) "shim.sh matches $1 against the session")
+  (is (= 6 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :model)) "shim.sh reads $7 for the vendor")
   (is (= #{"anthropic" "glm" "kimi" "deepseek" "qwen"} @(resolve 'task-lib/known-vendors)) "vendors.tsv rows plus anthropic")
   (is (= "moonshotai/kimi-k3:exacto" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
   (is (= "" (:ctx-tokens (get ((resolve 'task-lib/read-vendors)) "qwen"))) "an empty last column survives"))
@@ -141,9 +142,10 @@
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles"))
-              (str "plain claude " src " task\n"
-                   "fast claude " src " task model=kimi\n"
-                   "deep claude " src " task model=deepseek --model sonnet\n"))
+              (str "plain claude task\n"
+                   "fast claude task model=kimi\n"
+                   "deep claude task model=deepseek --model sonnet\n"))
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (let [result (run {:env env} cli "smoke" id)
               out (:out result)]
           (testing "every role reports OK and sent its note to itself"
@@ -165,7 +167,7 @@
               (is (= "otlp" (get e "OTEL_METRICS_EXPORTER")))
               (is (= "http/protobuf" (get e "OTEL_EXPORTER_OTLP_PROTOCOL")))
               (is (= "http://127.0.0.1:8428/opentelemetry" (get e "OTEL_EXPORTER_OTLP_ENDPOINT")))
-              (is (= (str "task_id=" id ",role=plain") (get e "OTEL_RESOURCE_ATTRIBUTES")))
+              (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
               (is (not (some #{"--model"} (str/split-lines (slurp (str (fs/path dir "tmp" "launch-plain.argv")))))) "no --model pin for anthropic")))
           (testing "a kimi role gets the cc_alt env and a --model pin, and the run reports that model"
             (let [e (env-map (fs/path dir "tmp" "launch-fast.env"))
@@ -177,7 +179,7 @@
               (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
               (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS")))
               (is (= "1" (get e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")))
-              (is (= (str "task_id=" id ",role=fast") (get e "OTEL_RESOURCE_ATTRIBUTES")))
+              (is (= (str "task_id=" id ",role=fast,session=fast,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
               (is (= ["--model" "moonshotai/kimi-k3:exacto"] (take 2 argv)) "the pin comes first so declared args can still override")
               (is (str/includes? out "used=moonshotai/kimi-k3:exacto"))))
           (testing "a deepseek role with declared extra args keeps both the pin and the args"
@@ -198,7 +200,8 @@
       (let [id "t-smoke-bad"
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task model=kimi\n"))
+        (spit (str (fs/path dir "roles")) "a claude task model=kimi\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (testing "a run that answers with some other model is a collision, not a pass"
           (let [result (run {:env (assoc env "SWARMKHAZAD_STUB_MODEL" "claude-opus-5") :ok? false} cli "smoke" id)]
             (is (not= 0 (:exit result)))
@@ -217,23 +220,23 @@
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)
             socket (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude none\n"))
+        (spit (str (fs/path dir "roles")) "a claude task\nb claude\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (try
           (run {:env env} cli "open" id)
           (let [cfg (json/parse-string (slurp claude-json))
                 projects (get cfg "projects")
-                a-real (str (fs/canonicalize (fs/path dir "worktrees" "a")))
-                task-real (str (fs/canonicalize dir))]
-            (is (= true (get-in projects [a-real "hasTrustDialogAccepted"])) "role a's worktree is trusted")
-            (is (= true (get-in projects [task-real "hasTrustDialogAccepted"])) "a repo-less role works in the task folder, which is trusted too")
+                wt-real (str (fs/canonicalize (fs/path dir "worktrees" "fixture")))]
+            (is (= true (get-in projects [wt-real "hasTrustDialogAccepted"])) "the repo's worktree is trusted")
             (is (= true (get-in projects ["/somewhere/else" "hasTrustDialogAccepted"])) "existing entries untouched")
             (is (= [] (get-in projects ["/somewhere/else" "allowedTools"])) "existing entry fields untouched")
             (is (= 7 (get cfg "numStartups")) "other top-level keys untouched")
-            (is (= 3 (count projects)))
+            (is (= 2 (count projects))
+                "both roles share the repo's worktree, so trust is seeded once")
             (testing "a second open adds nothing"
               (run {:env env} cli "close" id)
               (run {:env env} cli "open" id)
-              (is (= 3 (count (get (json/parse-string (slurp claude-json)) "projects")))))
+              (is (= 2 (count (get (json/parse-string (slurp claude-json)) "projects")))))
             (testing "close removes exactly the entries open added"
               (run {:env env} cli "close" id)
               (let [after (get (json/parse-string (slurp claude-json)) "projects")]

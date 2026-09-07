@@ -149,24 +149,20 @@
   "The project's `roles` declaration, in the same grammar a hand-written one
    uses — the swarm never learns that a project exists.
 
-   Each role names its OWN checkout. An earlier version bound the whole lineup
-   to the first repo and invented an `implement.<repo-name>` role for the rest,
-   which is one-project-per-repo thinking wearing a multi-repo hat: it decided
-   for you which checkout the swarm actually worked in. A role card carries a
-   checkout, and this writes what the card says."
-  [{:keys [repos roles]}]
-  (let [fallback (or (first repos) "none")]
-    (str task-lib/roles-grammar-comment
-         (str/join "" (for [{:keys [role harness model repo]} roles]
-                        (str role " " harness " " (or repo fallback) " task model=" model "\n"))))))
+   A role names no checkout. The project holds the repos and every role can
+   work in all of them; which ones a role actually opens is decided by the
+   `@repo` tags on its goal lines, task by task. Binding a role to one checkout
+   here was one-project-per-repo thinking wearing a multi-repo hat: it settled,
+   before the goal was written, which repo the work was allowed to touch."
+  [{:keys [roles]}]
+  (str task-lib/roles-grammar-comment
+       (str/join "" (for [{:keys [role harness model]} roles]
+                      (str role " " harness " task model=" model "\n")))))
 
-(defn unused-repos
-  "Checkouts the project clones but no role works in. Not an error — a checkout
-   can be there to be read — but the portal says so, because one nobody opens is
-   usually a role that was meant to be picked and was not."
-  [{:keys [repos roles]}]
-  (let [used (set (keep :repo roles))]
-    (vec (remove used repos))))
+(defn repos-text
+  "The project's `repos` declaration — every checkout it holds."
+  [{:keys [repos]}]
+  (task-lib/repos-text repos))
 
 ;; ---------------------------------------------------------------- task <-> project
 

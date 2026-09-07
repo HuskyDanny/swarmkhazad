@@ -24,8 +24,8 @@
 
 (defn -main []
   (let [ctx (task-lib/ctx-from-env)
-        role (handoff-lib/role ctx)
-        mode (handoff-lib/role-receive-mode ctx role)
+        role (handoff-lib/session ctx)
+        mode (handoff-lib/session-receive-mode ctx role)
         {:keys [files batches]} (handoff-lib/in-process-state ctx role)
         completed (handoff-lib/completed-dir ctx role)
         stamp (handoff-lib/timestamp)]

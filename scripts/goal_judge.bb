@@ -54,19 +54,23 @@
        "Judge only from the evidence given; a claim in the draft without a matching "
        "commit, file or measurement is not met. Be strict and literal. Report through the structured output only."))
 
-(defn goals-for-role
-  "goal.md, with the Goal checkboxes split into this role's and the others'.
+(defn goals-for-session
+  "goal.md, with the Goal checkboxes split into this session's and the others'.
 
-   The convention is `- [ ] <role> — <outcome>`, so a three-role task's goal.md
-   names work no single role can do. Graded whole, every role is unmet until the
-   last one finishes — measured on the fixture: implement met all seven of its
-   own lines and was blocked on `run —` and `review —`. A line naming no role
-   belongs to everyone."
-  [goals-md role]
+   The convention is `- [ ] <role> @<repo> — <outcome>`, so a task's goal.md
+   names work no single session can do. Graded whole, every session is unmet
+   until the last one finishes — measured on the fixture: implement met all
+   seven of its own lines and was blocked on `run —` and `review —`.
+
+   A line is this session's when it names no role or names this role, AND tags
+   no repo or tags this repo. Both defaults are the same one: a line that never
+   said belongs to everyone, which is what a single-repo task writes."
+  [goals-md role repo]
   (let [lines (str/split-lines (or goals-md ""))
-        box? #(re-matches #"\s*- \[[ xX]\]\s*.*" %)
-        mine? (fn [l] (let [[_ named] (re-matches #"\s*- \[[ xX]\]\s*([A-Za-z0-9][A-Za-z0-9.-]*)\s+—.*" l)]
-                        (or (nil? named) (= named role))))
+        box? #(some? (task-lib/goal-line %))
+        mine? (fn [l] (when-let [g (task-lib/goal-line l)]
+                        (and (or (nil? (:role g)) (= role (:role g)))
+                             (or (empty? (:repos g)) (boolean (some #{repo} (:repos g)))))))
         [mine others] [(filter #(and (box? %) (mine? %)) lines)
                        (filter #(and (box? %) (not (mine? %))) lines)]]
     {:mine (vec mine)
@@ -136,7 +140,7 @@
                                         ;; labels — measured on the fixture, where three roles reported
                                         ;; 5, 4 and 3 sessions for one session each plus their gradings.
                                         "OTEL_RESOURCE_ATTRIBUTES" (str "task_id=" (System/getenv "SWARMKHAZAD_TASK_ID")
-                                                                        ",role=" (System/getenv "SWARMFORGE_ROLE") "-judge")}})
+                                                                        ",role=" (System/getenv "SWARMKHAZAD_SESSION") "-judge")}})
         done (deref p judge-timeout-ms nil)
         _ (when-not done (process/destroy-tree p))
         result (if done @p {:exit -1 :out "" :err "timed out"})
@@ -229,7 +233,7 @@
 
 (defn decide
   "khazad's decide_stop: {:block? bool :reason str}."
-  [{:keys [met unmet down]} {:keys [terminal? sent? repo? blocks idle]}]
+  [{:keys [met unmet down]} {:keys [terminal? sent? blocks idle]}]
   (cond
     idle {:block? false :reason "no task yet: nothing has reached this role's inbox and it has committed nothing. Waiting is correct."}
     terminal? {:block? false :reason "terminal broadcast received; merge and stop"}
@@ -237,7 +241,7 @@
                             :reason (str "max blocks reached; " (if met "goals met" (str "unmet: " (str/join "; " unmet))))}
     down {:block? false :reason "judge unavailable; verdict is met=false until it returns"}
     (not met) {:block? true :reason (str "goals unmet: " (str/join "; " unmet) ". Keep working on these, then stop again. A bar you cannot meet is an escalation.md line.")}
-    (and repo? (not sent?)) {:block? true :reason "goals met, but no git_handoff for your current HEAD has been queued. Commit if needed, then run swarm_handoff.bb on a git_handoff draft, then stop."}
+    (not sent?) {:block? true :reason "goals met, but no git_handoff for your current HEAD has been queued. Commit if needed, then run swarm_handoff.bb on a git_handoff draft, then stop."}
     :else {:block? false :reason nil}))
 
 (defn escalate! [ctx role verdict previous]
@@ -252,17 +256,17 @@
 
 (defn -main []
   (let [task-dir (System/getenv "SWARMKHAZAD_TASK_DIR")
-        role (System/getenv "SWARMFORGE_ROLE")]
+        role (System/getenv "SWARMKHAZAD_SESSION")]
     (when (or (str/blank? task-dir) (str/blank? role) (not (fs/directory? task-dir)))
       (System/exit 0))
     (let [input (try (json/parse-string (slurp *in*)) (catch Exception _ {}))
           _ (when-not (= "Stop" (get input "hook_event_name")) (System/exit 0))
           ctx (task-lib/ctx-from-env)
-          row (task-lib/role-row ctx role)
-          worktree (when (:repo row) (:worktree-path row))
+          row (task-lib/session-row ctx role)
+          worktree (:worktree-path row)
           session-id (or (get input "session_id") "unknown")
           goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
-          split (goals-for-role goals-md role)
+          split (goals-for-session goals-md (or (:role row) role) (:repo row))
           goals (str (:whole split)
                      (when (seq (:others split))
                        (str "\n\n## Not yours — other roles own these; do not grade them\n"
@@ -276,7 +280,6 @@
                     (grade goals (working-state ctx role worktree (get input "last_assistant_message"))))
           facts {:terminal? (terminal-inbound? ctx role)
                  :sent? (handoff-sent? ctx role worktree)
-                 :repo? (boolean (:repo row))
                  :idle idle
                  :blocks (blocks-so-far ctx role session-id)}
           decision (decide verdict facts)]

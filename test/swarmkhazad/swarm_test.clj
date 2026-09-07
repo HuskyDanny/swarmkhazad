@@ -74,7 +74,8 @@
       (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task --model sonnet\nb claude " src " task\n"))
+        (spit (str (fs/path dir "roles")) "a claude task --model sonnet\nb claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (let [out (:out (run {:env env} cli "open" id))
               socket (str/trim (slurp (str (fs/path dir "state" "tmux-socket"))))
               board (fs/path dir "state" "board" "tasks.tsv")]
@@ -117,8 +118,9 @@
                 (is (some? (get a-done "dequeued_at")))
                 (is (= "git_handoff" (get b-done "type")))
                 (is (= "a" (get b-done "from")))
-                (is (= (git (fs/path dir "repos" "fixture") "rev-parse" "--short=10" "main") (get b-done "task_base_commit"))
-                    "the base is b's HEAD when it accepted — the pinned clone commit, not a's commit")
+                (is (= (get (headers (first (handoffs (fs/path dir "mail" "a" "sent")))) "commit")
+                       (get b-done "task_base_commit"))
+                    "the base is the worktree's HEAD when b accepted — sharing a repo with a, that is a's own commit")
                 (is (= id (get b-done "task_id")))
                 (is (some? (get b-done "completed_at")))))
             (testing "a's git_handoff carried the commit and its artifacts; b merged it by SHA"
@@ -126,8 +128,9 @@
                 (is (= 10 (count (get h "commit"))))
                 (is (= "a.txt" (get h "artifacts")))
                 (is (nil? (get h "non-forwarding")))
-                (is (= "from a\n" (slurp (str (fs/path dir "worktrees" "b" "a.txt")))))
-                (is (= (get h "commit") (subs (git (fs/path dir "worktrees" "b") "rev-parse" (str (get h "commit") "^{commit}")) 0 10)))))
+                (is (= "from a\n" (slurp (str (fs/path dir "worktrees" "fixture" "a.txt")))))
+                (is (= (get h "commit") (subs (git (fs/path dir "worktrees" "fixture") "rev-parse" (str (get h "commit") "^{commit}")) 0 10))
+                    "roles in one repo share its worktree, so the merge is a no-op and the commit is simply there")))
             (testing "the daemon typed a wake-up into each recipient's pane"
               (doseq [role ["a" "b"]]
                 (let [pane (:out (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-"))]
@@ -155,7 +158,7 @@
                 (is (= ["--model" "sonnet"] (filterv #{"--model" "sonnet"} argv)))
                 (is (str/includes? (last argv) "ready_for_next.bb") "the initial prompt tells the role how to start")
                 (is (str/includes? (slurp (str (fs/path dir "prompts" "a.md"))) "Forward finished work to `b`"))
-                (is (str/includes? (slurp (str (fs/path dir "prompts" "b.md"))) "You are the last role"))))
+                (is (str/includes? (slurp (str (fs/path dir "prompts" "b.md"))) "You are the last session"))))
             (testing "nothing was written to the source checkout"
               (is (= "" (git src "status" "--porcelain")))
               (is (= "one\n" (slurp (str (fs/path src "README.md")))))
@@ -183,7 +186,8 @@
     (try
       (make-source-repo! src)
       (run {:env env} cli "new" "t-noharness" "--repo" src)
-      (spit (str (fs/path home "tasks" "t-noharness" "roles")) (str "a copilot " src "\n"))
+      (spit (str (fs/path home "tasks" "t-noharness" "roles")) "a copilot\n")
+      (spit (str (fs/path home "tasks" "t-noharness" "repos")) (str src "\n"))
       (let [result (run {:env (assoc env "PATH" "/usr/bin:/bin:/opt/homebrew/bin") :ok? false} cli "open" "t-noharness")]
         (is (not= 0 (:exit result)))
         (is (str/includes? (:err result) "'copilot' is required")))

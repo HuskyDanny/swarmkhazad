@@ -48,8 +48,9 @@
     []))
 
 (defn with-task
-  "A prepared task with roles a (task), b (batch), c (no repo). f gets a map with
-   :dir, :env (task id + home), and a `helper` fn that runs a script as a role."
+  "A prepared task over one repo with roles a (task), b (batch) and c. One repo
+   means the session ids are the role names. f gets a map with :dir, :env (task
+   id + home), and a `helper` fn that runs a script as a session."
   [f]
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-mail."})
         home (str (fs/path sandbox "home"))
@@ -60,16 +61,19 @@
       (make-source-repo! src)
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude " src " batch\nc claude none\n"))
+        (spit (str (fs/path dir "roles")) "a claude task\nb claude batch\nc claude\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (run {:env env} cli "prepare" id)
         ;; These tests are about mail. The goal judge's gate on git_handoffs has
         ;; its own suite; here every role is already judged met.
         (doseq [role ["a" "b" "c"]]
           (write! (fs/path dir "state" "judge" (str role ".json")) "{\"met\":true,\"unmet\":[]}"))
-        (letfn [(helper [role script & args]
-                  (let [row-dir (if (= role "c") (str dir) (str (fs/path dir "worktrees" role)))]
-                    (apply run {:dir row-dir :env (assoc env "SWARMFORGE_ROLE" role "SWARMKHAZAD_TASK_DIR" (str dir)) :ok? false}
-                           "bb" (str (fs/path scripts script)) args)))]
+        (letfn [(helper [session script & args]
+                  (apply run {:dir (str (fs/path dir "worktrees" "fixture"))
+                              :env (assoc env "SWARMKHAZAD_SESSION" session "SWARMFORGE_ROLE" session
+                                          "SWARMKHAZAD_TASK_DIR" (str dir))
+                              :ok? false}
+                         "bb" (str (fs/path scripts script)) args))]
           (f {:dir dir :env env :src src :helper helper :sandbox (str sandbox)})))
       (finally
         (fs/delete-tree sandbox)))))
@@ -102,7 +106,7 @@
           (is (str/includes? (:err r) needle) (str label ": " (:err r)))
           (is (fs/exists? draft) (str label ": a rejected draft is left for repair"))))
       (testing "a draft outside the task's tmp/ is refused before parsing"
-        (let [stray (str (fs/path dir "worktrees" "a" "note.txt"))]
+        (let [stray (str (fs/path dir "worktrees" "fixture" "note.txt"))]
           (write! stray "type: note\nto: b\npriority: 50\nmessage: hi\n")
           (let [r (helper "a" "swarm_handoff.bb" stray)]
             (is (= 1 (:exit r)))
@@ -143,23 +147,19 @@
             (is (nil? (get h "commit")))
             (is (str/includes? (slurp (str (first files))) "\n\nRe-read your instructions.\n\nhello there\n")))))
       (testing "a git_handoff whose HEAD changes nothing is refused"
-        (git (fs/path dir "worktrees" "a") "commit" "-q" "--allow-empty" "-m" "nothing")
+        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "--allow-empty" "-m" "nothing")
         (let [draft (draft! dir "g0.txt" "type: git_handoff\nto: b\npriority: 50\n")
               r (helper "a" "swarm_handoff.bb" draft)]
           (is (= 1 (:exit r)) (:err r))
           (is (str/includes? (:err r) "changes no files"))
           (is (fs/exists? draft))))
-      (testing "a role without a repo can send notes but not git handoffs"
-        (let [draft (draft! dir "c1.txt" "type: git_handoff\nto: a\npriority: 50\n")
-              r (helper "c" "swarm_handoff.bb" draft)]
-          (is (= 1 (:exit r)))
-          (is (str/includes? (:err r) "has no repo")))
+      (testing "any session can send a note"
         (let [draft (draft! dir "c2.txt" "type: note\nto: a\npriority: 50\nmessage: from c\n")]
           (is (zero? (:exit (helper "c" "swarm_handoff.bb" draft))))))
       (testing "a role holding the terminal broadcast may not forward a git_handoff"
-        (write! (fs/path dir "worktrees" "a" "x.txt") "x\n")
-        (git (fs/path dir "worktrees" "a") "add" "x.txt")
-        (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "x")
+        (write! (fs/path dir "worktrees" "fixture" "x.txt") "x\n")
+        (git (fs/path dir "worktrees" "fixture") "add" "x.txt")
+        (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "x")
         (write! (fs/path dir "mail" "a" "inbox" "in_process" "50_20260101T000000000Z_from_b_to_a.handoff")
                 "id: x\nfrom: b\nto: a\npriority: 50\ntype: git_handoff\ncommit: 0000000000\nnon-forwarding: true\n\nRe-read.\n")
         (let [draft (draft! dir "g1.txt" "type: git_handoff\nto: b\npriority: 50\n")
@@ -180,7 +180,7 @@
                 h (headers (first gits))]
             (is (= 1 (count gits)) "exactly one live git_handoff")
             (is (= "x.txt" (get h "artifacts")) "the empty commit contributes nothing; the diff is against the parent")
-            (is (= (git (fs/path dir "worktrees" "a") "rev-parse" "--short=10" "HEAD") (get h "commit")))))))))
+            (is (= (git (fs/path dir "worktrees" "fixture") "rev-parse" "--short=10" "HEAD") (get h "commit")))))))))
 
 (deftest handoffd-once-delivers-good-mail-and-quarantines-bad-mail
   (with-task
@@ -191,9 +191,9 @@
               "id: p1\nfrom: a\nto: nobody\npriority: 50\ntype: note\nmessage: hi\n\nhi\n")
       (write! (fs/path dir "mail" "a" "outbox" "50_20260101T000000002Z_from_a_to_.handoff")
               "id: p2\nfrom: a\npriority: 50\ntype: note\nmessage: hi\n\nhi\n")
-      (write! (fs/path dir "worktrees" "a" "y.txt") "y\n")
-      (git (fs/path dir "worktrees" "a") "add" "y.txt")
-      (git (fs/path dir "worktrees" "a") "commit" "-q" "-m" "y")
+      (write! (fs/path dir "worktrees" "fixture" "y.txt") "y\n")
+      (git (fs/path dir "worktrees" "fixture") "add" "y.txt")
+      (git (fs/path dir "worktrees" "fixture") "commit" "-q" "-m" "y")
       (is (zero? (:exit (helper "a" "swarm_handoff.bb" (draft! dir "ok.txt" "type: git_handoff\nto: b\npriority: 50\n")))))
       (let [r (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-mail")]
         (is (zero? (:exit r)) (:err r)))
@@ -278,6 +278,30 @@
           (is (= 2 (:exit r)))
           (is (str/includes? (:err r) "TASK_IN_PROCESS_IS_BATCH")))))))
 
+(deftest a-shared-worktree-never-guesses-which-session-is-running
+  ;; Roles working the same repo share its worktree, so the cwd names a REPO
+  ;; and not a session. The pane exports SWARMKHAZAD_SESSION; a helper run by
+  ;; hand from that directory has to be told, because delivering a's mail to
+  ;; review's inbox is worse than refusing.
+  (with-task
+    (fn [{:keys [dir env]}]
+      (let [wt (str (fs/path dir "worktrees" "fixture"))
+            call (fn [extra]
+                   (run {:dir wt
+                         :env (merge env {"SWARMKHAZAD_TASK_DIR" (str dir)} extra)
+                         :ok? false}
+                        "bb" (str (fs/path scripts "ready_for_next.bb"))))]
+        (testing "three sessions share this worktree, so the cwd settles nothing"
+          (let [r (call {})]
+            (is (= 1 (:exit r)))
+            (is (str/includes? (:err r) "Set SWARMKHAZAD_SESSION") (:err r))))
+        (testing "SWARMFORGE_ROLE alone is enough while the role runs in one repo"
+          (let [r (call {"SWARMFORGE_ROLE" "a"})]
+            (is (zero? (:exit r)) (:err r))))
+        (testing "and the session, when given, is what is used"
+          (let [r (call {"SWARMKHAZAD_SESSION" "b"})]
+            (is (zero? (:exit r)) (:err r))))))))
+
 (deftest harness-argv-carries-each-cli-s-own-flags-in-both-modes
   (load-file (str (fs/path scripts "swarm_lib.bb")))
   (let [scratch (fs/create-temp-dir {:prefix "sk-argv."})
@@ -285,9 +309,10 @@
         _ (spit (str prompt) "PROMPT-TEXT")
         ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"
              :hooks-dir (fs/path scratch "hooks") :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"}
-        row (fn [h] {:role "r" :harness h :worktree-path "/tmp/t/worktrees/r" :extra-args "--flag va'lue"})
+        row (fn [h] {:session "r" :role "r" :repo "fixture" :harness h
+                     :worktree-path "/tmp/t/worktrees/fixture" :extra-args "--flag va'lue"})
         argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
-        start-with #(str/starts-with? % "You are role r in task t.")]
+        start-with #(str/starts-with? % "You are role r working in fixture (session r) of task t.")]
     (try
       (testing "claude: system prompt file, hook settings, bypass, name in the pane, extra args, then the message after --"
         (let [a (argv "claude" :interactive)]
@@ -302,16 +327,16 @@
           (is (= "SMOKE" (last a)))))
       (testing "codex and copilot have no system-prompt flag: the prompt text leads the message"
         (let [a (argv "codex" :interactive)]
-          (is (= ["/bin/codex" "-C" "/tmp/t/worktrees/r" "--no-alt-screen" "--yolo" "--flag" "va'lue"] (butlast a)))
+          (is (= ["/bin/codex" "-C" "/tmp/t/worktrees/fixture" "--no-alt-screen" "--yolo" "--flag" "va'lue"] (butlast a)))
           (is (str/starts-with? (last a) "PROMPT-TEXT\n\nYou are role r")))
-        (is (= ["/bin/codex" "exec" "--skip-git-repo-check" "-C" "/tmp/t/worktrees/r" "--flag" "va'lue"] (butlast (argv "codex" :smoke))))
+        (is (= ["/bin/codex" "exec" "--skip-git-repo-check" "-C" "/tmp/t/worktrees/fixture" "--flag" "va'lue"] (butlast (argv "codex" :smoke))))
         (let [a (argv "copilot" :interactive)]
-          (is (= ["/bin/copilot" "-C" "/tmp/t/worktrees/r" "--no-alt-screen" "--name" "sk r" "--yolo" "--flag" "va'lue" "-i"] (butlast a)))
+          (is (= ["/bin/copilot" "-C" "/tmp/t/worktrees/fixture" "--no-alt-screen" "--name" "sk r" "--yolo" "--flag" "va'lue" "-i"] (butlast a)))
           (is (str/starts-with? (last a) "PROMPT-TEXT\n\n")))
         (is (= "-p" (last (butlast (argv "copilot" :smoke))))))
       (testing "grok takes the prompt text as --rules and the message as --verbatim"
         (let [a (argv "grok" :interactive)]
-          (is (= ["/bin/grok" "--cwd" "/tmp/t/worktrees/r" "--permission-mode" "bypassPermissions" "--flag" "va'lue" "--minimal" "--rules" "PROMPT-TEXT" "--verbatim"] (butlast a)))
+          (is (= ["/bin/grok" "--cwd" "/tmp/t/worktrees/fixture" "--permission-mode" "bypassPermissions" "--flag" "va'lue" "--minimal" "--rules" "PROMPT-TEXT" "--verbatim"] (butlast a)))
           (is (start-with (last a)))))
       (testing "the launch script single-quotes every token, so a quote in an arg survives the shell"
         (let [line ((resolve 'swarm-lib/launch-script) ctx (row "claude") prompt)]

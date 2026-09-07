@@ -60,7 +60,8 @@
       (make-source-repo! src)
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "implement claude " src " task model=kimi\nrun claude " src " task\nreview claude " src " task\n"))
+        (spit (str (fs/path dir "roles")) "implement claude task model=kimi\nrun claude task\nreview claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (spit (str (fs/path dir "goal.md")) "# t-portal\n\n## Goal\n- [ ] implement — the route returns 200\n- [ ] run — tests green\n- [x] control — already ticked\n\n## Not-goal\n- [ ] not a goal box\n")
         (spit (str (fs/path dir "metrics.md")) "## Quantitative\n- every role called — bar: each ≥ 1 — measure: `echo x`\n- wall clock — bar: < 30 min — measure: `echo y`\n- notes only — bar: n/a — measure: `echo z`\n- silent measure — bar: n/a — measure: `echo -n`\n")
         (run {:env env} cli "prepare" id)
@@ -286,7 +287,8 @@
       (make-source-repo! src)
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "implement claude " src " task\n"))
+        (spit (str (fs/path dir "roles")) "implement claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (run {:env env} cli "prepare" id)
         ;; In a project, so the assertions below run against the swimlane card
         ;; and not the loose-task row — they count attention by different code
@@ -481,7 +483,8 @@
       (make-source-repo! src)
       (run {:env env} cli "new" id "--repo" src)
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "implement claude " src " task\n"))
+        (spit (str (fs/path dir "roles")) "implement claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (run {:env env} cli "prepare" id)
         ;; the socket file is what the portal reads to find the server; a real
         ;; `open` writes it, and this test stands in for that one line.
@@ -576,21 +579,14 @@
         (let [r (request env :post "/projects"
                          {:body (str "name=" project "&repo%3A" src "=on&repo%3A" nested "=on"
                                      "&role%3Aimplement=on&model%3Aimplement=anthropic"
-                                     "&repo-of%3Aimplement=" (java.net.URLEncoder/encode src "UTF-8")
-                                     "&role%3Arun=on&model%3Arun=kimi"
-                                     "&repo-of%3Arun=" (java.net.URLEncoder/encode nested "UTF-8"))})]
+                                     "&role%3Arun=on&model%3Arun=kimi")})]
           (is (= 303 (:status r)))
           (is (= "/" (get (:headers r) "Location"))))
         (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
           (is (= [src nested] (:repos stored)) "a project holds more than one checkout")
-          (is (= [{:role "implement" :harness "claude" :model "anthropic" :repo src}
-                  {:role "run" :harness "claude" :model "kimi" :repo nested}] (:roles stored))
-              "each role keeps the checkout its own card named, not the first one"))
-        (let [r (request env :post "/projects"
-                         {:body (str "name=p-elsewhere&repo%3A" src "=on&role%3Aimplement=on"
-                                     "&repo-of%3Aimplement=" (java.net.URLEncoder/encode nested "UTF-8"))})]
-          (is (= 400 (:status r)))
-          (is (str/includes? (:body r) "a role was pointed at a checkout this project does not hold")))
+          (is (= [{:role "implement" :harness "claude" :model "anthropic"}
+                  {:role "run" :harness "claude" :model "kimi"}] (:roles stored))
+              "a role names no checkout: it can work in any of the project's repos"))
         (let [body (:body (request env :get "/"))]
           (is (str/includes? body (str "class=\"pname\">" project)))
           (is (str/includes? body "class=\"colname\">implement"))
@@ -598,21 +594,12 @@
           (is (str/includes? body "class=\"colname\">done") "done is always the last column")
           (is (not (str/includes? body "class=\"colname\">review")) "a role that was not picked is not a column")
           (is (str/includes? body (str "href=\"/projects/" project "/new\"")) "New task goes to the project's own form")
-          (is (not (str/includes? body "no role opens"))
-              "every checkout in this project has a role in it"))
-        ;; every role card defaults to the first checkout, so ticking three and
-        ;; leaving the cards alone clones two that nobody ever opens.
-        (let [r (request env :post "/projects"
-                         {:body (str "name=p-idle&repo%3A" src "=on&repo%3A" nested "=on"
-                                     "&role%3Aimplement=on&model%3Aimplement=anthropic")})]
-          (is (= 303 (:status r))))
-        (let [body (:body (request env :get "/"))]
-          (is (str/includes? body "no role opens nested")
-              "a checkout no role works in is named on the swimlane, where the mistake was made")))
+          (is (not (str/includes? body "repo-of:"))
+              "no role names a checkout: every role can work in every repo the project holds")))
       (testing "the task form shows the swarm and the checkouts but never asks for them"
         (let [body (:body (request env :get (str "/projects/" project "/new")))]
-          (is (str/includes? body "implement (anthropic) in fixture"))
-          (is (str/includes? body "run (kimi) in nested") "the form says which checkout each role works in")
+          (is (str/includes? body "implement (anthropic)"))
+          (is (str/includes? body "run (kimi)"))
           (is (str/includes? body src))
           (is (str/includes? body nested))
           (is (not (str/includes? body "name=\"roles\"")) "there is no roles field to get wrong"))
@@ -661,20 +648,24 @@
             (is (str/includes? goal "## Not-goal\n- no schema change")))
           (is (str/includes? (slurp (str (fs/path dir "metrics.md"))) "repo tests — bar: exits 0"))
           (is (= project (str/trim (slurp (str (fs/path dir "project"))))) "the task names its project, so the swimlane can find it")
-          (let [roles (slurp (str (fs/path dir "roles")))]
-            (is (str/includes? roles (str "implement claude " src " task model=anthropic")))
-            (is (str/includes? roles (str "run claude " nested " task model=kimi"))
-                "one task, two checkouts: each role's own repo and vendor reach the roles file")
-            (is (not (str/includes? roles "review")) "only the picked roles"))
+          (let [roles (slurp (str (fs/path dir "roles")))
+                repos (slurp (str (fs/path dir "repos")))]
+            (is (str/includes? roles "implement claude task model=anthropic"))
+            (is (str/includes? roles "run claude task model=kimi") "each role's vendor reaches the roles file")
+            (is (not (str/includes? roles "review")) "only the picked roles")
+            (is (str/includes? repos src) "and the project's checkouts reach the repos file")
+            (is (str/includes? repos nested)))
           (let [deadline (+ (System/currentTimeMillis) 60000)]
             (while (and (not (fs/regular-file? (fs/path dir "state" "tmux-socket"))) (< (System/currentTimeMillis) deadline))
               (Thread/sleep 500)))
           (is (fs/regular-file? (fs/path dir "state" "tmux-socket"))
               (str "open did not start: " (slurp (str (fs/path dir "state" "portal-open.log")))))
-          (is (= #{"fixture" "nested"} (set (map fs/file-name (filter fs/directory? (fs/list-dir (fs/path dir "repos"))))))
-              "one task, two clones — the project's checkouts both land in it")
-          (is (every? #(fs/directory? (fs/path dir "worktrees" %)) ["implement" "run"])
-              "and each role has its own worktree off its own clone")
+          (is (= #{"fixture" "nested"} (set (map fs/file-name (fs/list-dir (fs/path dir "worktrees")))))
+              "one task, two worktrees — one per checkout, added from the sources")
+          (is (= ["implement_fixture" "implement_nested" "run_fixture" "run_nested"]
+                 (mapv #(first (str/split % #"\t"))
+                       (str/split-lines (slurp (str (fs/path dir "state" "sessions.tsv"))))))
+              "and a session per (role, repo), because no goal line tagged a repo")
           (testing "the card appears in the project's swimlane, in the lane its own board says"
             (is (str/includes? (:body (request env :get "/")) (str "class=\"tcard\" href=\"/tasks/" id "\""))))
           (testing "a second task with the same id is refused"
@@ -688,10 +679,10 @@
                   "the live goal.md was not rewritten")))
           (testing "the live pane route reads the real tmux pane"
             (let [deadline (+ (System/currentTimeMillis) 30000)]
-              (while (and (not (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement/pane"))) "launch.sh"))
+              (while (and (not (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement_fixture/pane"))) "launch.sh"))
                           (< (System/currentTimeMillis) deadline))
                 (Thread/sleep 500)))
-            (is (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement/pane"))) "launch.sh")))
+            (is (str/includes? (:body (request env :get (str "/tasks/" id "/roles/implement_fixture/pane"))) "launch.sh")))
           (run {:env env} cli "close" id)))
       (finally
         (fs/delete-tree sandbox)))))

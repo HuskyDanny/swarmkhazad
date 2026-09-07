@@ -32,7 +32,15 @@
 (defn goal-template [task-id]
   (str "# " task-id " — <what this task is, one line>\n"
        "Opened by <who> · " (java.time.LocalDate/now) "\n\n"
-       "## Goal\n- [ ] <role or repo> — <the outcome, one line>\n\n"
+       "## Goal\n"
+       ;; The grammar goes in an HTML comment, not in a live checkbox: a
+       ;; placeholder `@<repo>` inside a real goal line reads as a tag naming a
+       ;; repo the task does not have, and prepare would refuse the task it had
+       ;; just scaffolded.
+       "<!-- one line per outcome: `- [ ] <role> @<repo> — <outcome>`.\n"
+       "     The role and the @repo tags are both optional; a line with neither\n"
+       "     belongs to every role and every repo. -->\n"
+       "- [ ] <the outcome, one line>\n\n"
        "## Not-goal\n- <deliberately not doing X — why>\n\n"
        "## Hints\n- <absolute path> — why it matters\n"))
 
@@ -65,16 +73,17 @@
         (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos)
             (println (str "linear: " (:identifier issue) " " (:title issue))))
         (do (spit (str (:goal-file ctx)) (goal-template task-id))
-            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))))
+            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
+            (spit (str (:repos-file ctx)) (task-lib/repos-text repos))))
       (println (str (:task-dir ctx))))))
 
 (defn prepare! [task-id]
   (let [result (task-lib/prepare! (task-lib/task-ctx task-id))]
     (println "task:" (:task-dir result))
-    (doseq [{:keys [clone fresh branch sha upstream]} (:clones result)]
-      (println (str "clone: " clone (if fresh (str " " branch " @ " sha " origin=" (or upstream "none")) " (existing)"))))
-    (doseq [{:keys [role harness receive-mode model worktree-path]} (:roles result)]
-      (println (str "role: " role " " harness " " receive-mode " model=" model " " worktree-path)))))
+    (doseq [{:keys [name source path branch start]} (:repos result)]
+      (println (str "repo: " name " " path " " branch " @ " start " from " source)))
+    (doseq [{:keys [session harness receive-mode model worktree-path]} (:sessions result)]
+      (println (str "session: " session " " harness " " receive-mode " model=" model " " worktree-path)))))
 
 (defn paths! [task-id]
   (doseq [[k v] (sort-by (comp str key) (task-lib/task-ctx task-id))]
@@ -84,9 +93,9 @@
   (let [ctx (swarm-lib/open! task-id)]
     (println "swarm open:" task-id)
     (println "tmux socket:" (:tmux-socket ctx))
-    (doseq [{:keys [role harness model worktree-path]} (:roles ctx)]
-      (println (str "  " (task-lib/session-name role) "  " harness " model=" model "  " worktree-path)))
-    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>"))))
+    (doseq [{:keys [session harness model worktree-path]} (:sessions ctx)]
+      (println (str "  " (task-lib/session-name session) "  " harness " model=" model "  " worktree-path)))
+    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>_<repo>"))))
 
 (defn open-cmd!
   "`open <task-id>`, or `open --linear <KEY> [--repo <path>]...`, which scaffolds

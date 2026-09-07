@@ -72,8 +72,10 @@
    so: a missing decision.md and an unread one look identical otherwise, and the
    answer leans on which it was."
   [ctx]
-  (let [roles (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) [])
-        per-role (int (max 4000 (quot diff-budget (max 1 (count roles)))))
+  (let [repos (->> (task-lib/read-sessions-tsv ctx)
+                   (keep (fn [r] (when (:worktree-path r) [(or (:repo r) "?") (:worktree-path r)])))
+                   distinct)
+        per-repo (int (max 4000 (quot diff-budget (max 1 (count repos)))))
         section (fn [title body] (str "## " title "\n" (or (not-empty (str/trim (str body))) "(none)") "\n\n"))]
     (str
      (section "goal.md" (read-file (:goal-file ctx) file-budget))
@@ -82,9 +84,10 @@
      (section "gotcha.md — what tripped them" (read-file (:gotcha-file ctx) file-budget))
      (section "escalation.md — what they say needs a human" (read-file (:escalation-file ctx) file-budget))
      (section "evidence — each bar's own output" (evidence-section ctx))
-     (str/join "" (for [{:keys [role worktree-path repo]} roles]
-                    (section (str "diff — role " role " in " (task-lib/repo-name (or repo "?")))
-                             (worktree-diff worktree-path per-role)))))))
+     ;; One diff per repo, not per session: roles sharing a repo share its
+     ;; worktree, so a per-session loop would print the same diff twice.
+     (str/join "" (for [[repo worktree] repos]
+                    (section (str "diff — " repo) (worktree-diff worktree per-repo)))))))
 
 (def system-prompt
   (str

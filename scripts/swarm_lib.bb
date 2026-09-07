@@ -154,14 +154,20 @@
   (when (server-up? ctx) (tmux ctx "kill-server"))
   (fs/delete-if-exists (fs/path (:tmux-socket ctx))))
 
-(defn boot-sessions! [ctx roles]
+(defn boot-sessions!
+  "One tmux session per (role, repo), each opened in that repo's worktree.
+
+   The window carries the session's own name rather than the role's: two
+   sessions of one role differ only by repo, and a pane titled `implement`
+   twice is a pane you cannot tell apart."
+  [ctx rows]
   (fs/create-dirs (fs/parent (fs/path (:tmux-socket ctx))))
   (spit (str (:tmux-socket-file ctx)) (str (:tmux-socket ctx) "\n"))
-  (doseq [{:keys [role worktree-path]} roles
-          :let [session (task-lib/session-name role)]]
-    (tmux! ctx "new-session" "-d" "-s" session "-n" role "-c" worktree-path)
-    (tmux! ctx "set-option" "-t" session "history-limit" (str pane-history-limit))
-    (tmux! ctx "set-window-option" "-t" (str session ":" role) "allow-rename" "off")))
+  (doseq [{:keys [session worktree-path]} rows
+          :let [name (task-lib/session-name session)]]
+    (tmux! ctx "new-session" "-d" "-s" name "-n" session "-c" worktree-path)
+    (tmux! ctx "set-option" "-t" name "history-limit" (str pane-history-limit))
+    (tmux! ctx "set-window-option" "-t" (str name ":" session) "allow-rename" "off")))
 
 ;; ---------------------------------------------------------------- prompts
 
@@ -170,26 +176,34 @@
         fallback (fs/path prompts-src-dir "default.prompt")]
     (slurp (str (if (fs/regular-file? specific) specific fallback)))))
 
-(defn role-header [ctx roles row]
-  (let [names (mapv :role roles)
-        idx (.indexOf names (:role row))
-        next-role (get names (inc idx))]
-    (str "# swarmkhazad · task " (:task-id ctx) " · role " (:role row) "\n\n"
+(defn role-header [ctx rows row]
+  (let [names (mapv :session rows)
+        idx (.indexOf names (:session row))
+        next-session (get names (inc idx))
+        mine (->> rows (filter #(= (:role row) (:role %))) (mapv :repo))]
+    (str "# swarmkhazad · task " (:task-id ctx) " · " (:session row) "\n\n"
          "- Task folder: " (:task-dir ctx) "\n"
-         (if (:repo row)
-           (str "- Your worktree: " (:worktree-path row) " (branch " (task-lib/role-branch ctx (:role row)) ", off the task's clone of " (:repo row) ")\n")
-           "- You have no repo; work in the task folder.\n")
-         "- Roles in order: " (str/join " → " names) ". You are #" (inc idx) " of " (count names) "."
-         (if next-role (str " Forward finished work to `" next-role "`.\n") " You are the last role: your git_handoff goes to every other role and closes the task.\n")
+         "- Your repo: " (:repo row) "\n"
+         "- Your worktree: " (:worktree-path row) " (branch " (task-lib/task-branch ctx) ")\n"
+         (when (> (count mine) 1)
+           (str "- As " (:role row) " you cover " (str/join ", " mine)
+                " — one session each, run in that order. This one is only " (:repo row) ".\n"))
+         "- Sessions in order: " (str/join " → " names) ". You are #" (inc idx) " of " (count names) "."
+         (if next-session
+           (str " Forward finished work to `" next-session "`.\n")
+           " You are the last session: your git_handoff goes to every other session and closes the task.\n")
          "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb, merge_and_process.bb\n\n")))
 
 (defn write-prompt!
-  "prompts/<role>.md: the role header, the constitution, the stage prompt."
-  [ctx roles row]
+  "prompts/<session>.md: the session header, the constitution, the stage prompt.
+
+   The stage prompt is the ROLE's — every repo gets the same instructions for
+   what implement or review means; only the header differs."
+  [ctx rows row]
   (fs/create-dirs (:prompts-dir ctx))
-  (let [file (fs/path (:prompts-dir ctx) (str (:role row) ".md"))]
+  (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))]
     (spit (str file)
-          (str (role-header ctx roles row)
+          (str (role-header ctx rows row)
                (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
                "\n## Stage: " (:role row) "\n\n"
                (stage-prompt (:role row))))
@@ -220,12 +234,13 @@
 
 (defn write-hook-settings! [ctx row]
   (fs/create-dirs (:hooks-dir ctx))
-  (let [file (fs/path (:hooks-dir ctx) (str (:role row) ".settings.json"))]
+  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))]
     (spit (str file) (json/generate-string hook-settings {:pretty true}))
     file))
 
 (defn start-text [ctx row]
-  (str "You are role " (:role row) " in task " (:task-id ctx) ". Read " (:goal-file ctx) " and " (:metrics-file ctx)
+  (str "You are role " (:role row) " working in " (:repo row) " (session " (:session row)
+       ") of task " (:task-id ctx) ". Read " (:goal-file ctx) " and " (:metrics-file ctx)
        ", then run ready_for_next.bb and follow its output."))
 
 ;; ---------------------------------------------------------------- launch
@@ -246,7 +261,7 @@
         message (if (= mode :interactive) (start-text ctx row) text)
         prompt-text (slurp (str prompt))
         led (str prompt-text "\n\n" message)
-        name (str "sk " (:role row))]
+        name (str "sk " (:session row))]
     (vec
      (case (:harness row)
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
@@ -268,26 +283,28 @@
 
 (defn launch-script [ctx row prompt]
   (str "#!/bin/bash\n"
-       "# swarmkhazad launch for role " (:role row) " of task " (:task-id ctx) " — generated by open\n"
+       "# swarmkhazad launch for session " (:session row) " of task " (:task-id ctx) " — generated by open\n"
        "export SWARMFORGE_ROLE=" (sq (:role row)) "\n"
+       "export SWARMKHAZAD_SESSION=" (sq (:session row)) "\n"
+       "export SWARMKHAZAD_REPO=" (sq (str (:repo row))) "\n"
        "export SWARMKHAZAD_TASK_ID=" (sq (:task-id ctx)) "\n"
        "export SWARMKHAZAD_TASK_DIR=" (sq (:task-dir ctx)) "\n"
        "export PATH=" (sq (str (:bin-dir ctx))) ":" (sq (str script-dir)) ":\"$PATH\"\n"
        "cd " (sq (:worktree-path row)) " || exit 1\n"
        "exec " (str/join " " (map sq (harness-argv ctx row (shim-path ctx (:harness row)) prompt :interactive nil))) "\n"))
 
-(defn launch-role!
-  "Write prompts/<role>.launch.sh and type `bash <path>` into the role's pane.
+(defn launch-session!
+  "Write prompts/<session>.launch.sh and type `bash <path>` into its pane.
    The command itself is typed, not the launch: a tty still in canonical mode
    (zsh not yet up) drops everything past 1024 bytes, and a full launch line with
    temp-dir paths is longer than that (RAN: the pane showed a truncated command
    and no launch)."
-  [ctx roles row]
-  (let [prompt (write-prompt! ctx roles row)
-        script (fs/path (:prompts-dir ctx) (str (:role row) ".launch.sh"))]
+  [ctx rows row]
+  (let [prompt (write-prompt! ctx rows row)
+        script (fs/path (:prompts-dir ctx) (str (:session row) ".launch.sh"))]
     (spit (str script) (launch-script ctx row prompt))
     (fs/set-posix-file-permissions script "rwxr-xr-x")
-    (tmux! ctx "send-keys" "-t" (task-lib/session-name (:role row)) (str "bash " (sq script)) "Enter")
+    (tmux! ctx "send-keys" "-t" (task-lib/session-name (:session row)) (str "bash " (sq script)) "Enter")
     (str script)))
 
 ;; ---------------------------------------------------------------- board + mail
@@ -346,56 +363,64 @@
 ;; ---------------------------------------------------------------- open / close
 
 (defn open!
-  "Open the swarm for task-id. Returns the ctx plus :roles and :commands."
+  "Open the swarm for task-id. Returns the ctx plus :sessions and :commands.
+
+   The board card is a ROLE's — a lane is a stage of the work, and a role
+   working three repos is still in one stage. The opening note is a SESSION's,
+   because mail is delivered to a pane."
   [task-id]
   (let [ctx (task-lib/task-ctx task-id)
-        {:keys [roles]} (task-lib/prepare! ctx)]
+        {:keys [roles repos sessions]} (task-lib/prepare! ctx)]
     (check-dependencies!)
     (resolve-harnesses! ctx roles)
     (stop-handoffd! ctx)
     (kill-server! ctx)
-    (boot-sessions! ctx roles)
+    (boot-sessions! ctx sessions)
     (write-shims! ctx)
     (lock-truth! ctx)
-    (trust-worktrees! ctx roles)
+    (trust-worktrees! ctx sessions)
     (when-not (board-lib/card-lane ctx task-id)
-      (board-lib/create-card! ctx task-id (:role (first roles)))
-      (queue-new-task-note! ctx (:role (first roles))))
+      (board-lib/create-card! ctx task-id (:role (first sessions)))
+      (queue-new-task-note! ctx (:session (first sessions))))
     (start-handoffd! ctx)
-    (assoc ctx :roles roles :commands (mapv #(launch-role! ctx roles %) roles))))
+    (assoc ctx :roles roles :repos repos :sessions sessions
+           :commands (mapv #(launch-session! ctx sessions %) sessions))))
 
 ;; ---------------------------------------------------------------- smoke
 
 (defn smoke-prompt
-  "The smoke asks the role to note itself: a one-role task has no other recipient."
-  [ctx role]
-  (str "Smoke test for role " role ". Do exactly these steps and nothing else.\n"
+  "The smoke asks the session to note itself: a one-session task has no other
+   recipient."
+  [ctx session]
+  (str "Smoke test for session " session ". Do exactly these steps and nothing else.\n"
        "1. Read " (:goal-file ctx) " (one Read call).\n"
-       "2. Write the file " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) " with exactly these four lines:\n"
-       "type: note\nto: " role "\npriority: 50\nmessage: smoke from " role "\n"
-       "3. Run: swarm_handoff.bb " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) "\n"
+       "2. Write the file " (fs/path (:tmp-dir ctx) (str "smoke-" session ".txt")) " with exactly these four lines:\n"
+       "type: note\nto: " session "\npriority: 50\nmessage: smoke from " session "\n"
+       "3. Run: swarm_handoff.bb " (fs/path (:tmp-dir ctx) (str "smoke-" session ".txt")) "\n"
        "4. Reply with the single line HANDOFF_OK if that command printed HANDOFF QUEUED, else the error text."))
 
 (defn smoke-note
-  "The note this role's smoke queued, if any."
-  [ctx role]
+  "The note this session's smoke queued, if any."
+  [ctx session]
   (some (fn [f]
           (let [h (:headers (handoff-lib/parse-message f))]
-            (when (and (= "note" (get h "type")) (= role (get h "from"))
+            (when (and (= "note" (get h "type")) (= session (get h "from"))
                        (str/starts-with? (or (get h "message") "") "smoke from"))
               f)))
-        (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role))))
+        (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx session))))
 
 (defn smoke-role!
-  "Launch, read goal.md, send one note, exit clean — through the role's shim."
-  [ctx roles row]
-  (let [role (:role row)
-        prompt (write-prompt! ctx roles row)
+  "Launch, read goal.md, send one note, exit clean — through the shim."
+  [ctx rows row]
+  (let [role (:session row)
+        prompt (write-prompt! ctx rows row)
         argv (harness-argv ctx row (shim-path ctx (:harness row)) prompt :smoke (smoke-prompt ctx role))
         started (System/currentTimeMillis)
         p (process/process argv {:dir (:worktree-path row)
                                  :out :string :err :string
-                                 :extra-env {"SWARMFORGE_ROLE" role
+                                 :extra-env {"SWARMFORGE_ROLE" (:role row)
+                                             "SWARMKHAZAD_SESSION" (:session row)
+                                             "SWARMKHAZAD_REPO" (str (:repo row))
                                              "SWARMKHAZAD_TASK_ID" (:task-id ctx)
                                              "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))
                                              "PATH" (str (:bin-dir ctx) ":" script-dir ":" (System/getenv "PATH"))}})
@@ -410,21 +435,27 @@
                  (or (nil? expected) (some #{expected} models))
                  (or (not= "claude" (:harness row)) (some? json-out)))]
     (when note (fs/delete note))
-    {:role role :harness (:harness row) :vendor (:model row) :ok ok?
+    {:role role :repo (:repo row) :harness (:harness row) :vendor (:model row) :ok ok?
      :exit (:exit result) :seconds (quot (- (System/currentTimeMillis) started) 1000)
      :models models :expected expected :note (some? note)
      :cost (get json-out "total_cost_usd") :turns (get json-out "num_turns")
      :detail (when-not ok? (str/trim (str (:err result) "\n" (subs (or (:out result) "") 0 (min 600 (count (or (:out result) "")))))))}))
 
 (defn smoke!
-  "Prepare the task (no tmux, no daemon) and smoke every declared role, in parallel."
+  "Prepare the task (no tmux, no daemon) and smoke every declared role.
+
+   One session per role, not every session: the smoke proves harness
+   resolution, the vendor pin and the mail round-trip, none of which vary by
+   repo — and a role over four repos would otherwise pay for four launches to
+   learn the same thing once."
   [task-id]
   (let [ctx (task-lib/task-ctx task-id)
-        {:keys [roles]} (task-lib/prepare! ctx)]
+        {:keys [roles sessions]} (task-lib/prepare! ctx)
+        one-each (mapv #(first (filter (fn [r] (= (:role %) (:role r))) sessions)) roles)]
     (check-dependencies!)
     (resolve-harnesses! ctx roles)
     (write-shims! ctx)
-    (doall (pmap #(smoke-role! ctx roles %) roles))))
+    (doall (pmap #(smoke-role! ctx sessions %) one-each))))
 
 (defn close!
   "Tear the swarm down: archive panes, stop the daemon, kill the tmux server,
@@ -435,6 +466,5 @@
       (handoff-lib/archive-all! ctx))
     (stop-handoffd! ctx)
     (kill-server! ctx)
-    (when (fs/regular-file? (:roles-tsv ctx))
-      (untrust-worktrees! ctx (task-lib/read-roles-tsv ctx)))
+    (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
     ctx))
