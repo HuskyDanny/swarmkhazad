@@ -36,17 +36,6 @@
 ;; there, not at the first agent launch.
 (def known-vendors (conj (set (keys (read-vendors))) "anthropic"))
 
-;; roles.tsv column order. Read by every helper; never index a column by number
-;; anywhere else. A role without a repo carries the literal `none` in :repo.
-;; :extra-args is space-joined — an argument can never contain whitespace because
-;; the declaration is split on whitespace — and must be re-split into argv by the
-;; consumer, never spliced into a shell string.
-(def roles-tsv-columns
-  "A role no longer names a repo. The task does — see the `repos` file — and a
-   role works across all of them. What used to be :repo and :worktree-path is
-   now a property of the SESSION, of which a role has one per repo it works in."
-  [:role :harness :receive-mode :model :extra-args])
-
 (def sessions-tsv-columns
   "state/sessions.tsv: the (role, repo) pairs this task runs, and where each
    one's working directory is. Written once at prepare, read everywhere else —

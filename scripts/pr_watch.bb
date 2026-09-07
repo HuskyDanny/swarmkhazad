@@ -98,18 +98,23 @@
 (defn shipped
   "What ship recorded, one map per repo, each carrying its own checkout.
 
-   The checkout comes from the task's `repos`, not from the PR record: `gh`
-   picks its repo from the directory it runs in, and running every query from
-   one directory answered every repo's poll with the first repo's PR — a
-   review comment on gobel woke cirdan's session about cirdan."
+   `gh` picks its repo from the directory it runs in, so every poll has to run
+   in that repo's checkout: querying them all from one directory answered every
+   repo's poll with the first repo's PR — a review comment on gobel woke
+   cirdan's session about cirdan.
+
+   The path is read back from the record rather than looked up in the task's
+   `repos` each time. The lookup ran `parse-repos` — a `rev-parse` and a
+   canonicalize per repo — every 60s from the daemon and on every render of the
+   task page, to answer a question ship already knew and threw away. It also
+   answered it wrong for the one case that matters: a repo dropped from `repos`
+   after its PR was opened lost the checkout its own open PR needs."
   [ctx]
   (when (fs/directory? (pr-dir ctx))
-    (let [source (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
-                            [(:name r) (:path r)]))]
-      (vec (for [f (sort (fs/glob (pr-dir ctx) "*.json"))
-                 :let [m (try (json/parse-string (slurp (str f)) true) (catch Exception _ nil))]
-                 :when (and m (:url m))]
-             (assoc m :source (get source (:repo m))))))))
+    (vec (for [f (sort (fs/glob (pr-dir ctx) "*.json"))
+               :let [m (try (json/parse-string (slurp (str f)) true) (catch Exception _ nil))]
+               :when (and m (:url m))]
+           m))))
 
 (defn seen-file [ctx repo] (fs/path (pr-dir ctx) (str repo ".seen.json")))
 

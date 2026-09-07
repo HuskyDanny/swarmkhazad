@@ -715,7 +715,7 @@
    one is actually in. The lane comes from the task's own board, so a card moves
    because a git handoff moved it, never because the portal said so."
   [project]
-  (let [columns (conj (mapv :role (:roles project)) "done")
+  (let [columns (conj (mapv :role (:roles project)) board-lib/review-lane "done")
         cards (for [id (project-lib/tasks-for (:name project))
                     :let [ctx (task-lib/task-ctx id)]]
                 {:id id :lane (lane ctx) :progress (lane-progress ctx)

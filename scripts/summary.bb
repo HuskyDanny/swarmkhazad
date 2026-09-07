@@ -89,6 +89,11 @@
      (section "decision.md — what the roles chose, and why" (read-file (:decision-file ctx) file-budget))
      (section "gotcha.md — what tripped them" (read-file (:gotcha-file ctx) file-budget))
      (section "escalation.md — what they say needs a human" (read-file (:escalation-file ctx) file-budget))
+     ;; Splitting findings out of escalation.md took them away from the only
+     ;; reader that weighs them before a merge. Ten of gobel's 22 escalation
+     ;; lines were findings; a verdict that cannot see them is reading half the
+     ;; task's own notes.
+     (section "finding.md — what they established that nobody asked for" (read-file (:finding-file ctx) file-budget))
      (section "evidence — each bar's own output" (evidence-section ctx))
      ;; One diff per repo, not per session: roles sharing a repo share its
      ;; worktree, so a per-session loop would print the same diff twice.

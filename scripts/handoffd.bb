@@ -56,10 +56,6 @@
     (fs/move path target)
     (spit (str target ".error") (str reason "\n"))))
 
-(defn role->sessions [ctx]
-  (into {} (for [[role rows] (group-by :role (task-lib/read-sessions-tsv ctx))]
-             [role (mapv :session rows)])))
-
 (defn update-board! [ctx headers recipients]
   (when (= "git_handoff" (get headers "type"))
     ;; The lane a card moves INTO is the recipient's role, not the session that
@@ -70,8 +66,7 @@
       (board-lib/hand-off! ctx
                            (or (handoff-lib/task-key headers) (:task-id ctx))
                            (get headers "from")
-                           next-lane
-                           (role->sessions ctx)))))
+                           next-lane))))
 
 (defn phantom? [from] (boolean (re-matches #"\(.+\)" (or from ""))))
 

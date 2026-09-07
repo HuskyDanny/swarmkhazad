@@ -89,20 +89,34 @@
                                   %)
                                current))))))
 
+(def review-lane
+  "A shipped task and a finished task are different states, so `in-review` is
+   its own lane rather than an early `done`. It lives here because two readers
+   need the same string: ship, which puts a card in it, and the portal, which
+   has to draw a column for it — without one, a shipped card fell through to
+   `stray` and rendered as \"not in a lane yet\", which is exactly the stall it
+   exists to distinguish itself from."
+  "in-review")
+
 (defn hand-off!
   "Record that one session handed off, and move the card to `next-lane` only
    once every session of the lane's role has.
 
-   `role->sessions` maps a role to its session ids. A lane with no entry — an
+   Which sessions a role has is read from sessions.tsv here rather than passed
+   in: this file already loads task_lib and already has the ctx, so the caller
+   was deriving something its callee could see. A lane that names no role — an
    old card whose lane is a session id, or `done` — moves on the first handoff,
    which is what a one-repo task has always done."
-  [ctx name session next-lane role->sessions]
+  [ctx name session next-lane]
   (with-lock ctx
     (fn []
       (let [current (rows ctx)
             row (some #(when (= name (:name %)) %) current)]
         (when-not row (throw (ex-info (str "Unknown card: " name) {})))
-        (let [expected (set (get role->sessions (:lane row)))]
+        (let [expected (->> (task-lib/read-sessions-tsv ctx)
+                            (filter #(= (:lane row) (:role %)))
+                            (map :session)
+                            set)]
           (if (and (seq expected) (not (contains? expected session)))
             ;; The sender's role is not the lane's, so its turn is already over:
             ;; the card moved on when the last of its siblings handed off, and

@@ -34,11 +34,6 @@
 (load-file (str (fs/path script-dir "board_lib.bb")))
 (load-file (str (fs/path script-dir "summary.bb")))
 
-(def review-lane
-  "A shipped task and a finished task are different states, so `in-review` is
-   its own lane rather than an early `done`."
-  "in-review")
-
 (def owner->account
   "GitHub org → the account that opens PRs there. One entry today; the map
    exists because the answer is per-owner and guessing it wrong pushes as the
@@ -203,7 +198,19 @@
                                    ;; Nothing here can answer a prompt, and a
                                    ;; push that blocks on one hangs the run.
                                    "GIT_TERMINAL_PROMPT" "0"}}
-                      "git" "-c" (str "credential.helper=" helper)
+                      "git"
+                      ;; `credential.helper` is a LIST, and `-c` appends to it
+                      ;; rather than replacing it — git then takes the first
+                      ;; complete answer. On a machine with osxkeychain in the
+                      ;; system config (this one), that helper answers for
+                      ;; github.com first and ours is never consulted: ship
+                      ;; printed one account and pushed as whichever the
+                      ;; keychain happened to hold. An empty value clears every
+                      ;; helper before it, so this pair is the whole list.
+                      ;; RAN: without the reset `git credential fill` for
+                      ;; github.com answers from the keychain; with it, ours.
+                      "-c" "credential.helper="
+                      "-c" (str "credential.helper=" helper)
                       "push" "--set-upstream" "origin" (str branch ":refs/heads/" branch))]
     (when-not (zero? (:exit r))
       (fail! (str "push failed for " repo "\n" (str/trim (:err r)))))
@@ -234,7 +241,7 @@
   (let [dir (fs/path (:state-dir ctx) "pr")]
     (fs/create-dirs dir)
     (spit (str (fs/path dir (str (:repo plan) ".json")))
-          (str (json/generate-string (assoc (select-keys plan [:repo :branch :base :head :account])
+          (str (json/generate-string (assoc (select-keys plan [:repo :branch :base :head :account :source])
                                             :url url
                                             :at (str (java.time.Instant/now)))
                                      {:pretty true})
@@ -276,9 +283,12 @@
           (when-not (seq order)
             (fail! (str "the summary has no `## " summary/merge-order-heading "` section naming this task's repos ("
                         (str/join ", " names) "). Re-run the summary; ship never works the order out itself.")))
-          (let [by-name (into {} (map (juxt :name identity) repos))
-                plans (vec (keep #(repo-plan ctx (by-name %)) order))
-                missing (remove (set order) (map :repo (keep #(repo-plan ctx %) repos)))]
+          ;; Once per repo. `repo-plan` is about seven git spawns, and computing
+          ;; it over `order` and again over `repos` forked twice what a three
+          ;; repo ship needs for the same two answers.
+          (let [all (into {} (for [r repos :let [p (repo-plan ctx r)] :when p] [(:name r) p]))
+                plans (vec (keep all order))
+                missing (remove (set order) (keys all))]
             (when (seq missing)
               (fail! (str "the summary's merge order does not name " (str/join ", " missing)
                           ", which has commits to ship. Re-run the summary.")))
@@ -304,9 +314,9 @@
             ;; Only once every repo is up: a half-shipped task is still the
             ;; last role's, and the lane is what says whose it is.
             (if (board-lib/card-lane ctx id)
-              (board-lib/set-lane! ctx id review-lane)
-              (board-lib/create-card! ctx id review-lane))
-            (println (str (count plans) " repo(s) shipped; the card is in " review-lane))))))))
+              (board-lib/set-lane! ctx id board-lib/review-lane)
+              (board-lib/create-card! ctx id board-lib/review-lane))
+            (println (str (count plans) " repo(s) shipped; the card is in " board-lib/review-lane))))))))
 
 (when (= (str *file*) (System/getProperty "babashka.file"))
   (try

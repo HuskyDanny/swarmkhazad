@@ -737,12 +737,26 @@
             (run {:env env} "bb" "-e"
                  (str "(load-file \"" scripts "/board_lib.bb\") "
                       "(let [ctx (task-lib/task-ctx \"" id "\")] "
-                      "(board-lib/hand-off! ctx \"" id "\" \"implement_fixture\" \"run\" "
-                      "{\"implement\" [\"implement_fixture\" \"implement_nested\"]}))"))
+                      "(board-lib/hand-off! ctx \"" id "\" \"implement_fixture\" \"run\"))"))
             (is (str/includes? (:body (request env :get (str "/tasks/" id))) "implement 1/2")
                 "one of implement's two repos has handed off; the lane has not moved")
             (is (str/includes? (:body (request env :get "/")) "<span class=\"muted\">1/2</span>")
                 "and the swimlane card carries the same fraction beside its status"))
+          (testing "a shipped task has a column of its own, between the last role and done"
+            ;; `in-review` is the state task.md adds so days of waiting read as
+            ;; waiting rather than as a stall. With no column for it the card
+            ;; fell through to `stray` and rendered as "not in a lane yet" —
+            ;; which is exactly the reading it exists to prevent.
+            (run {:env env} "bb" "-e"
+                 (str "(load-file \"" scripts "/board_lib.bb\") "
+                      "(board-lib/set-lane! (task-lib/task-ctx \"" id "\") \"" id "\" "
+                      "board-lib/review-lane)"))
+            (let [body (:body (request env :get "/"))]
+              (is (str/includes? body "in-review") "the lane is drawn")
+              (is (not (str/includes? body "not in a lane yet"))
+                  "and the card is in it, not stranded beside the board")
+              (is (< (.indexOf body ">run<") (.indexOf body ">in-review<") (.indexOf body ">done<"))
+                  "after the last role and before done — a shipped task is not a finished one")))
           (run {:env env} cli "close" id)))
       (testing "a project is editable: the form comes back filled in, and saving rewrites it"
         (let [body (:body (request env :get (str "/projects/" project "/edit")))]

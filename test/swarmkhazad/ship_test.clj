@@ -551,29 +551,46 @@
       (is (str/includes? (str (:err r) (:out r)) "ship only ever pushes sk/<task-id>")
           (str branch ": and refuses on the rule, not on a git failure downstream")))))
 
-(deftest a-pr-whose-checkout-is-gone-is-reported-not-guessed-at
+(deftest a-repo-dropped-from-the-task-can-still-answer-for-the-pr-it-already-has
+  ;; The checkout is recorded when the PR is opened, so the open PR keeps
+  ;; working. Looking it up in the task's `repos` on every poll answered a
+  ;; question ship already knew, and answered it wrong exactly here.
   (with-shipped-task
     (fn [{:keys [dir poll graphql! inbox deliver!] :as h}]
       (ship! h)
       (graphql! nil live-pr)
       (graphql! "cirdan" quiet-pr)
-      ;; The repo is dropped from the task after its PR was opened. `gh` picks
-      ;; its repo from the directory it runs in, so without a checkout there is
-      ;; no honest query to make.
       (spit (str (fs/path dir "repos"))
             (str/join "\n" (remove #(str/ends-with? % "/gobel")
                                    (str/split-lines (slurp (str (fs/path dir "repos")))))))
       (let [r (poll)]
         (is (zero? (:exit r)))
-        (is (str/includes? (:out r) "no checkout for this repo")
-            "said plainly, rather than querying from wherever the poller happens to stand"))
+        (is (str/includes? (:out r) "handoff    gobel")
+            "its PR is open and its comments are still work"))
+      (deliver!)
+      (is (= 3 (count (inbox "implement_gobel")))))))
+
+(deftest a-pr-whose-checkout-is-gone-is-reported-not-guessed-at
+  ;; `gh` picks its repo from the directory it runs in, so with the checkout
+  ;; itself gone there is no honest query to make — and querying from wherever
+  ;; the poller happens to stand is how one repo's PR answered another's poll.
+  (with-shipped-task
+    (fn [{:keys [dir sandbox poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (fs/delete-tree (fs/path sandbox "src" "gobel"))
+      (let [r (poll)]
+        (is (zero? (:exit r)))
+        (is (str/includes? (:out r) "no checkout for this repo")))
       (deliver!)
       (is (empty? (inbox "implement_gobel")))))
   (with-shipped-task
-    (fn [{:keys [dir poll inbox] :as h}]
+    (fn [{:keys [dir sandbox poll] :as h}]
       (ship! h)
       (spit (str (fs/path dir "state" "pr" "gobel.json"))
-            "{\"repo\":\"gobel\",\"url\":\"https://example.invalid/not/a/pr\",\"account\":\"allen-mithra\"}")
+            (str "{\"repo\":\"gobel\",\"url\":\"https://example.invalid/not/a/pr\","
+                 "\"account\":\"allen-mithra\",\"source\":\"" (fs/path sandbox "src" "gobel") "\"}"))
       (let [r (poll)]
         (is (zero? (:exit r)))
         (is (str/includes? (:out r) "not a GitHub PR url"))))))
@@ -671,7 +688,27 @@
           (is (not (str/includes? saw "ghs_stubtoken"))
               (str "the token reached a child of git:\n" saw))
           (is (str/includes? saw "$SK_GH_TOKEN")
-              "what leaks now is the variable's NAME — the helper reads it at push time rather than carrying its value"))
+              "what leaks now is the variable's NAME — the helper reads it at push time rather than carrying its value")
+          (testing "and ours is the only helper left in the list"
+            ;; `-c` appends, so without a reset the machine's own helper — here
+            ;; osxkeychain — answers for github.com first and ship pushes as
+            ;; whoever the keychain holds, having just printed a different name.
+            ;; An empty value clears every helper before it.
+            ;;
+            ;; Asserted by COUNT, not by prefix: git renders a value beginning
+            ;; with `!` as `''\\!'f(){…}'`, so the string `'credential.helper'=''`
+            ;; is the opening of our own entry too, and a prefix test passed
+            ;; just as happily with the reset deleted.
+            (let [params (second (re-find #"CONFIG_PARAMETERS=(.*)" saw))
+                  entries (re-seq #"'credential\.helper'='[^ ]*" params)]
+              (is (= 2 (count entries))
+                  (str "the reset and ours, in that order — got:\n" params))
+              (is (= "'credential.helper'=''" (first entries))
+                  "the first entry is the empty reset, and nothing but it")
+              (is (not= "'credential.helper'=''" (second entries))
+                  "and the second is a real helper, not a second reset")
+              (is (< (.indexOf params (str (first entries) " ")) (.indexOf params "SK_GH_TOKEN"))
+                  "ours comes after the reset, so the reset does not clear ours"))))
         (is (str/includes? (slurp (str (fs/path dir "state" "pr" "gobel.json"))) "pull/1")
             "and the push still worked, so this is not a guard that passes by doing nothing")))))
 
