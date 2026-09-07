@@ -40,6 +40,7 @@
 (load-file (str (fs/path script-dir "telemetry.bb")))
 (load-file (str (fs/path script-dir "ask.bb")))
 (load-file (str (fs/path script-dir "summary.bb")))
+(load-file (str (fs/path script-dir "pr_watch.bb")))
 
 (def cli (str (fs/path script-dir "swarmkhazad.bb")))
 (def default-port 8765)
@@ -989,6 +990,17 @@
              (if cached
                [:pre (:body cached)]
                [:p.empty "not asked yet"])])
+          (when-let [prs (seq (pr-watch/shipped ctx))]
+            [:section
+             [:h2 "In review"]
+             [:ul.plain
+              (for [p prs]
+                [:li [:span.muted (:repo p) " "] [:a.doc {:href (:url p)} (:url p)]
+                 [:span.muted " as " (:account p)]])]
+             [:form {:method "post" :action (str "/tasks/" id "/pr")}
+              [:button {:type "submit"} "Check now"]
+              [:span.muted " handoffd asks every 60s; this asks now. New review comments and "
+               "failing checks become handoffs to whoever last committed in that repo."]]])
           (let [t (telemetry/task-totals id)]
             [:section [:h2 "Telemetry"
                        (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]
@@ -1130,6 +1142,11 @@
            (when (some #(= key (attention-key %)) (attention ctx))
              (set-handled! ctx key (= "handle" (get params "do"))))
            {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
+         (not-found)))
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/pr" uri))]
+       (if-let [ctx (ctx-for id)]
+         (do (try (pr-watch/poll! ctx) (catch Exception _ nil))
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
          (not-found)))
      (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/summary" uri))]
        (if-let [ctx (ctx-for id)]

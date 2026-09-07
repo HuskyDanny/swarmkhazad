@@ -19,8 +19,14 @@
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 (load-file (str (fs/path script-dir "board_lib.bb")))
+(load-file (str (fs/path script-dir "pr_watch.bb")))
 
 (def poll-ms 1000)
+(def pr-poll-ms
+  "How often a shipped PR is asked what has happened on it. A minute is slow
+   enough that a task waiting days costs nothing and fast enough that a review
+   comment does not sit unread over lunch. The portal's button skips the wait."
+  60000)
 (def wake-message "You have new handoff mail. If idle, run ready_for_next.bb.")
 (def stopping (atom false))
 
@@ -111,6 +117,19 @@
         (try (fail! ctx (fs/path path) (.getMessage e))
              (catch Exception nested (log! ctx "failed-to-archive" path (.getMessage nested))))))))
 
+(def last-pr-poll (atom 0))
+
+(defn poll-prs!
+  "Ask GitHub what has happened on the task's PRs, at most every pr-poll-ms.
+   Only after ship has recorded one: a task that never shipped has nothing to
+   ask about, and asking would be a network call per second for nothing."
+  [ctx]
+  (let [now (System/currentTimeMillis)]
+    (when (and (fs/directory? (fs/path (:state-dir ctx) "pr"))
+               (> (- now @last-pr-poll) pr-poll-ms))
+      (reset! last-pr-poll now)
+      (doseq [line (pr-watch/poll! ctx)] (log! ctx "pr" line)))))
+
 (defn shutdown! [ctx]
   ;; Runs from the TERM shutdown hook and from the stop-file path; log once.
   (when (compare-and-set! stopping false true)
@@ -126,6 +145,9 @@
   (try
     (while (not (should-stop? ctx))
       (poll-once! ctx)
+      (try (poll-prs! ctx)
+           ;; A GitHub outage must not take the delivery daemon down with it.
+           (catch Exception e (log! ctx "pr-poll-failed" (.getMessage e))))
       (Thread/sleep poll-ms))
     (finally
       (shutdown! ctx))))
@@ -137,7 +159,14 @@
       (binding [*out* *err*] (println "Usage: handoffd.bb [--once] <task-id>"))
       (System/exit 1))
     (let [ctx (task-lib/task-ctx id)]
-      (if once? (poll-once! ctx) (run-daemon! ctx)))))
+      (if once?
+        ;; `--once` is the whole loop once, PRs included — a debugging run that
+        ;; quietly skipped half of what the daemon does would be worse than no
+        ;; debugging run at all.
+        (do (poll-once! ctx)
+            (try (poll-prs! ctx)
+                 (catch Exception e (log! ctx "pr-poll-failed" (.getMessage e)))))
+        (run-daemon! ctx)))))
 
 (when (= (str *file*) (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))

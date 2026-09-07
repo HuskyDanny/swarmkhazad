@@ -1,7 +1,7 @@
 (ns swarmkhazad.ship-test
-  "ship.bb — the only thing swarmkhazad does that leaves the machine. The
-   remotes here are local bare repos and `gh` is a stub, so a wrong push in
-   this suite lands in /tmp rather than on GitHub."
+  "ship.bb and pr_watch.bb — going out, and what comes back. The remotes here
+   are local bare repos and `gh` is a stub, so a wrong push in this suite lands
+   in /tmp rather than on GitHub."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -68,6 +68,10 @@
         gh-log (str (fs/path sandbox "gh.log"))
         id "t-ship"
         env {"SWARMKHAZAD_HOME" home "GH_STUB_LOG" gh-log
+             ;; On the base env, not only on the poll helper: handoffd does the
+             ;; polling in the field, and a canned answer only the direct
+             ;; caller could see would hide that.
+             "GH_STUB_GRAPHQL" (str (fs/path sandbox "graphql.json"))
              "PATH" (str stubdir ":" (System/getenv "PATH"))}
         dir (fs/path home "tasks" id)]
     (try
@@ -102,9 +106,19 @@
                   (->> (str/split-lines (git (fs/path sandbox "remotes" (str name ".git"))
                                              "for-each-ref" "--format=%(refname:short)" "refs/heads/"))
                        (remove str/blank?) sort vec))
-                (summary! [text] (write! (fs/path dir "state" "summary.md") text))]
+                (summary! [text] (write! (fs/path dir "state" "summary.md") text))
+                (graphql! [repo text]
+                  (write! (fs/path sandbox (str "graphql.json" (when repo (str "." repo)))) text))
+                (poll [& [extra-env]]
+                  (run {:env (merge env extra-env) :ok? false}
+                       "bb" (str (fs/path scripts "pr_watch.bb")) id))
+                (inbox [session] (->> (fs/glob (fs/path dir "mail" session "inbox" "new") "*.handoff")
+                                      (map str) sort vec))]
           (f {:dir dir :env env :sandbox (str sandbox) :ship ship :gh-calls gh-calls
-              :remote-branches remote-branches :summary! summary!})))
+              :remote-branches remote-branches :summary! summary!
+              :graphql! graphql! :poll poll :inbox inbox
+              :deliver! (fn [] (run {:env env :ok? false}
+                                    "bb" (str (fs/path scripts "handoffd.bb")) "--once" id))})))
       (finally
         (fs/delete-tree sandbox)))))
 
@@ -309,3 +323,193 @@
       (is (= "acme-bot" (:known m))
           "pushing as the wrong person is the failure this map exists to prevent")
       (is (= "allen-mithra" (:unknown m))))))
+
+;; ------------------------------------------------------------- the PR loop
+
+(def live-pr
+  "One unresolved review thread, one resolved one, an issue comment from the
+   reviewer, one from us, a failing check and a passing one."
+  (str "{\"data\":{\"repository\":{\"pullRequest\":{"
+       "\"headRefOid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"isDraft\":true,\"state\":\"OPEN\","
+       "\"reviewThreads\":{\"nodes\":["
+       "{\"id\":\"THREAD_1\",\"isResolved\":false,\"isOutdated\":false,"
+       " \"comments\":{\"nodes\":[{\"id\":\"C1\",\"author\":{\"login\":\"a-reviewer\"},"
+       "  \"body\":\"This drops the retry. Was that deliberate?\",\"path\":\"exporter.txt\",\"line\":3}]}},"
+       "{\"id\":\"THREAD_2\",\"isResolved\":true,\"isOutdated\":false,"
+       " \"comments\":{\"nodes\":[{\"id\":\"C2\",\"author\":{\"login\":\"a-reviewer\"},"
+       "  \"body\":\"already dealt with\",\"path\":\"x\",\"line\":1}]}}]},"
+       "\"comments\":{\"nodes\":["
+       "{\"id\":\"IC1\",\"author\":{\"login\":\"a-reviewer\"},\"body\":\"Nice, one question above.\"},"
+       "{\"id\":\"IC2\",\"author\":{\"login\":\"allen-mithra\"},\"body\":\"Opened by swarmkhazad.\"}]},"
+       "\"commits\":{\"nodes\":[{\"commit\":{\"statusCheckRollup\":{\"contexts\":{\"nodes\":["
+       "{\"__typename\":\"CheckRun\",\"name\":\"build\",\"conclusion\":\"FAILURE\","
+       " \"detailsUrl\":\"https://example.invalid/run/1\"},"
+       "{\"__typename\":\"CheckRun\",\"name\":\"lint\",\"conclusion\":\"SUCCESS\",\"detailsUrl\":null}"
+       "]}}}}]}}}}}"))
+
+(def quiet-pr
+  (str "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"b\",\"isDraft\":true,"
+       "\"state\":\"OPEN\",\"reviewThreads\":{\"nodes\":[]},\"comments\":{\"nodes\":[]},"
+       "\"commits\":{\"nodes\":[]}}}}}"))
+
+(defn handoff-lib-files [dir]
+  (if (fs/directory? dir) (vec (fs/glob dir "*.handoff")) []))
+
+(defn headers-of [file]
+  (into {} (for [line (take-while (complement str/blank?) (str/split-lines (slurp (str file))))
+                 :let [[k v] (str/split line #": " 2)]
+                 :when (and k v)]
+             [k v])))
+
+(defn ship! [{:keys [ship summary!]}]
+  (summary! order-summary)
+  (is (zero? (:exit (ship {:in "yes\n"})))))
+
+(deftest a-review-comment-and-a-red-check-become-work-for-whoever-last-committed
+  (with-shipped-task
+    (fn [{:keys [dir poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (let [r (poll)]
+        (is (zero? (:exit r)) (:err r))
+        (is (= 3 (count (re-seq #"handoff " (:out r))))
+            "the unresolved thread, the reviewer's comment, the failing check — and nothing else")
+        (is (not (str/includes? (:out r) "cirdan")) "cirdan's PR has nothing on it"))
+      (deliver!)
+      (testing "each one is a handoff to the session that last handed off in that repo"
+        (let [files (inbox "implement_gobel")]
+          (is (= 3 (count files))
+              "three queued in the same millisecond, three arrived — the stamp is the filename's uniqueness")
+          (is (empty? (inbox "implement_cirdan")))
+          (is (empty? (inbox "review_gobel")) "review never handed off, so the diff under review is not its")
+          (let [hs (map headers-of files)]
+            (is (= #{"pr_comment" "pr_check"} (set (map #(get % "type") hs))))
+            (is (every? #(= "gobel" (get % "origin_repo")) hs)
+                "the repo it is about, so a session in another repo is never confused by it")
+            (is (every? #(str/includes? (get % "pr_url") "/pull/") hs))
+            (is (some #(str/includes? (get % "message") "needs an answer") hs))
+            (is (some #(str/includes? (get % "message") "check build is failing") hs)))))
+      (testing "a resolved thread and our own comment are not work"
+        (let [bodies (map #(slurp (str %)) (inbox "implement_gobel"))]
+          (is (not-any? #(str/includes? % "already dealt with") bodies))
+          (is (not-any? #(str/includes? % "Opened by swarmkhazad") bodies))))
+      (testing "the reply and the resolve are runnable, with the thread id filled in"
+        (let [body (first (filter #(str/includes? % "THREAD_1")
+                                  (map #(slurp (str %)) (inbox "implement_gobel"))))]
+          (is (str/includes? body "addPullRequestReviewThreadReply"))
+          (is (str/includes? body "resolveReviewThread"))
+          (is (str/includes? body "If you disagree, reply with the reason and leave it open.")
+              "resolving means the role agreed; a tool that resolved on delivery would agree for it"))))))
+
+(deftest polling-again-does-not-make-the-same-comment-into-work-twice
+  (with-shipped-task
+    (fn [{:keys [poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (poll)
+      (deliver!)
+      (let [r (poll)]
+        (is (str/includes? (:out r) "nothing new on the pull requests")))
+      (deliver!)
+      (is (= 3 (count (inbox "implement_gobel"))) "a poll every 60s must not be a handoff every 60s"))))
+
+(deftest a-check-failing-twice-on-one-commit-escalates-instead-of-waking-anyone
+  (with-shipped-task
+    (fn [{:keys [dir poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (poll)
+      ;; The pipeline is still red on the same commit, so the check comes round
+      ;; again — the state file remembers it failed once already.
+      (let [f (fs/path dir "state" "pr" "gobel.seen.json")
+            m (json/parse-string (slurp (str f)) true)]
+        (spit (str f) (json/generate-string
+                       (update m :handled #(vec (remove (fn [h] (str/starts-with? h "check:")) %))))))
+      (let [r (poll)]
+        (is (str/includes? (:out r) "escalated  gobel  build")))
+      (deliver!)
+      (is (= 3 (count (inbox "implement_gobel"))) "nobody is woken a second time about the same red commit")
+      (let [esc (slurp (str (fs/path dir "escalation.md")))]
+        (is (str/includes? esc "[gobel]") "tagged, because a two-repo task's escalation has to say which")
+        (is (str/includes? esc "check build has failed 2 times on the same commit"))
+        (is (str/includes? esc "nobody is being woken for it any more"))))))
+
+(deftest an-outage-does-nothing-rather-than-reading-silence-as-no-comments
+  (with-shipped-task
+    (fn [{:keys [dir poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (let [r (poll {"GH_STUB_API_FAILS" "1"})]
+        (is (zero? (:exit r)) "a poll that cannot reach GitHub is not a crash")
+        (is (str/includes? (:out r) "could not reach api.github.com")))
+      (is (not (fs/exists? (fs/path dir "state" "pr" "gobel.seen.json")))
+          "nothing was marked handled — an empty answer read as `no comments` would lose every one of them")
+      (is (empty? (handoff-lib-files (fs/path dir "mail" "_system" "outbox")))
+          "and nothing was queued")
+      (testing "and the comments still arrive once GitHub is back"
+        (poll)
+        (deliver!)
+        (is (= 3 (count (inbox "implement_gobel"))))))))
+
+(deftest each-repo-is-asked-about-its-own-pull-request
+  (with-shipped-task
+    (fn [{:keys [poll graphql! inbox deliver!] :as h}]
+      (ship! h)
+      ;; Only cirdan's PR has anything on it. `gh` picks its repo from the
+      ;; directory it runs in, so a poller that ran everything from one place
+      ;; answered gobel's poll with cirdan's PR and woke the wrong session.
+      (graphql! nil quiet-pr)
+      (graphql! "cirdan" live-pr)
+      (poll)
+      (deliver!)
+      (is (= 3 (count (inbox "implement_cirdan"))))
+      (is (empty? (inbox "implement_gobel")))
+      (is (every? #(= "cirdan" (get (headers-of %) "origin_repo")) (inbox "implement_cirdan"))))))
+
+(deftest the-role-that-last-committed-in-that-repo-is-the-one-woken
+  (with-shipped-task
+    (fn [{:keys [dir graphql! inbox deliver!] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      ;; review handed off after implement did. It is the session whose archive,
+      ;; verdict and evidence are all about the diff now under review, so the
+      ;; comment is its to answer — not the first session the table happens to
+      ;; list for that repo.
+      (write! (fs/path dir "mail" "review_gobel" "sent"
+                       "50_29991231T235959999Z_from_review_gobel_to_run.handoff")
+              "id: later\nfrom: review_gobel\nto: run\ntype: git_handoff\n\nlater\n")
+      ;; handoffd's own loop does the polling; nothing here calls pr_watch.
+      (deliver!)
+      (deliver!)
+      (is (= 3 (count (inbox "review_gobel")))
+          "handoffd polls the PRs itself — the portal's button only skips the wait")
+      (is (empty? (inbox "implement_gobel"))))))
+
+(deftest the-daemon-polls-the-prs-on-its-own-loop
+  ;; Every other test here drives `handoffd --once`. This one runs the real
+  ;; daemon, because the loop is the thing that runs in the field and `--once`
+  ;; is only a debugging door into it.
+  (with-shipped-task
+    (fn [{:keys [dir env graphql! inbox] :as h}]
+      (ship! h)
+      (graphql! nil live-pr)
+      (graphql! "cirdan" quiet-pr)
+      (let [proc (process/process {:dir repo-root :extra-env env :out :string :err :string}
+                                  "bb" (str (fs/path scripts "handoffd.bb")) "t-ship")
+            deadline (+ (System/currentTimeMillis) 60000)]
+        (try
+          (while (and (empty? (inbox "implement_gobel")) (< (System/currentTimeMillis) deadline))
+            (Thread/sleep 200))
+          (finally
+            (spit (str (fs/path dir "state" "daemon" "stop")) "")
+            (deref proc 20000 nil)
+            (when (.isAlive (:proc proc)) (.destroy (:proc proc))))))
+      (is (= 3 (count (inbox "implement_gobel")))
+          "the daemon asked GitHub itself — nothing in the field calls pr_watch by hand")
+      (is (str/includes? (slurp (str (fs/path dir "state" "daemon" "handoffd.log"))) "pr handoff")
+          "and said so in its own log"))))

@@ -174,6 +174,18 @@
     (spit (str tmp) (render-message (assoc headers field value) body))
     (fs/move tmp file {:replace-existing true})))
 
+(defn fresh-stamp
+  "A millisecond stamp no other file in this outbox carries for this sender.
+   The stamp IS the filename's uniqueness, so two handoffs queued in the same
+   millisecond silently overwrote each other — measured: six queued, four
+   arrived. Anything that writes into an outbox has to come through here."
+  [out sender]
+  (loop []
+    (let [s (stamp)]
+      (if (seq (fs/glob out (str "*_" s "_from_" sender "_to_*.handoff")))
+        (do (Thread/sleep 1) (recur))
+        s))))
+
 (defn recipient-list [headers]
   (some->> (get headers "to")
            (#(str/split % #","))

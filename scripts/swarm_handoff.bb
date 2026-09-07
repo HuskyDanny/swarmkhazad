@@ -153,15 +153,6 @@
                        " on your branch; if it is not, read the diff there rather than pulling it.\n")
     "note" (str "Re-read your instructions.\n\n" message "\n")))
 
-(defn fresh-stamp
-  "A millisecond stamp no other file in this outbox carries."
-  [out sender]
-  (loop []
-    (let [s (handoff-lib/stamp)]
-      (if (seq (fs/glob out (str "*_" s "_from_" sender "_to_*.handoff")))
-        (do (Thread/sleep 1) (recur))
-        s))))
-
 (defn origin-repo
   "The repo the sender worked in, but only when the task holds more than one.
    A recipient with no session in that repo still has to be told which tree
@@ -172,7 +163,7 @@
 
 (defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet repo]}]
   (let [out (handoff-lib/outbox-dir ctx sender)
-        stamp (fresh-stamp out sender)
+        stamp (handoff-lib/fresh-stamp out sender)
         type (get headers "type")
         priority (or (get headers "priority") "50")
         filename (str priority "_" stamp "_from_" sender "_to_" (str/join "_" recipients) ".handoff")

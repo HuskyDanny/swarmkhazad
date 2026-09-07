@@ -5,6 +5,9 @@
 #   GH_STUB_LOG        every call, as `<repo> <args>`
 #   GH_STUB_EXISTING   `pr list` answers with an open PR at this URL
 #   GH_STUB_PR_FAILS   `pr create` fails in the repo of this name
+#   GH_STUB_GRAPHQL    `api graphql` answers with this file's contents; the
+#                      per-repo file `<it>.<repo>` wins when it exists
+#   GH_STUB_API_FAILS  `api graphql` fails, the way an outage looks
 set -u
 here=$(basename "$PWD")
 printf '%s %s\n' "$here" "$*" >> "${GH_STUB_LOG:-/dev/null}"
@@ -30,6 +33,14 @@ case "$1 $2" in
     done
     # What a real gh prints on success: the URL, nothing else.
     echo "https://github.com/acme/$here/pull/1" ;;
+  "api graphql")
+    if [ -n "${GH_STUB_API_FAILS:-}" ]; then
+      echo "stub gh: could not reach api.github.com" >&2
+      exit 1
+    fi
+    f="${GH_STUB_GRAPHQL:-}"
+    [ -f "$f.$here" ] && f="$f.$here"
+    if [ -f "$f" ]; then cat "$f"; else echo '{"data":{"repository":null}}'; fi ;;
   *)
     echo "stub gh: unhandled: $*" >&2; exit 1 ;;
 esac
