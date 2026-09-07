@@ -313,7 +313,7 @@
               final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
                                          :commit commit :artifacts artifacts :base base :unmet unmet
                                          :repo (when git? (origin-repo ctx row))
-                                         :non-forwarding? (and git? (handoff-lib/last-session? ctx sender))})]
+                                         :non-forwarding? (and git? (handoff-lib/last-role? ctx sender))})]
           (fs/delete draft)
           ;; The budget is about one piece of work. Once it is handed over the
           ;; next attempt starts at zero, or a session that struggled early

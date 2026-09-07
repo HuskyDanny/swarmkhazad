@@ -411,3 +411,54 @@
         (let [r (run {:env env :ok? false} cli "frobnicate")]
           (is (= 1 (:exit r)))
           (is (str/includes? (:err r) "Usage:")))))))
+
+(deftest a-task-opened-before-the-repos-file-can-still-be-reopened
+  ;; A reboot kills the tmux socket, and `open` is how anyone gets a running
+  ;; task back. Requiring the `repos` file unconditionally turned that into a
+  ;; hard failure for every task that started before the file existed — which
+  ;; is every task on disk when this branch lands.
+  (with-home
+    (fn [{:keys [env] :as h}]
+      (let [dir (scaffold-task! h "t-old" "implement claude\nreview claude\n")]
+        (run {:env env} cli "prepare" "t-old")
+        (let [wt (fs/path dir "worktrees" "fixture")
+              ;; A commit the old task made, so a rebuilt worktree would be
+              ;; visibly the wrong one rather than an identical empty tree.
+              _ (do (spit (str (fs/path wt "work.txt")) "x\n")
+                    (git wt "add" "work.txt")
+                    (git wt "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "work"))
+              sha (git wt "rev-parse" "HEAD")]
+          ;; Roll the folder back to the old shape: the runtime table is
+          ;; roles.tsv, in its own columns, and nothing on disk says which repos
+          ;; the task covers.
+          ;; role, harness, repo, worktree, receive-mode, model, branch, extra
+          (fs/delete (fs/path dir "state" "sessions.tsv"))
+          (spit (str (fs/path dir "state" "roles.tsv"))
+                (str "implement\tclaude\t" (:src h) "\t" wt "\ttask\tkimi\tnone\t--flag\n"
+                     "review\tclaude\t" (:src h) "\t" wt "\tbatch\tanthropic\tnone\t\n"))
+          (fs/delete (fs/path dir "repos"))
+          (let [r (run {:env env :ok? false} cli "prepare" "t-old")]
+            (is (zero? (:exit r)) (str "an old task must reopen, not fail: " (:err r))))
+          (testing "the old rows become the session table, unchanged in what they say"
+            (let [rows (tsv-rows dir)]
+              (is (= ["implement" "review"] (mapv first rows))
+                  "an old row is one session named after its role — its mail dir and pane already carry that name")
+              (is (= ["implement" "implement" "fixture" (str wt) "claude" "task" "kimi" "--flag"]
+                     (first rows)))
+              (is (= "batch" (nth (second rows) 5)) "and the second row keeps its own receive mode")))
+          (testing "no worktree was rebuilt underneath it"
+            (is (= sha (git wt "rev-parse" "HEAD"))
+                "rebuilding sessions the new way would add worktrees beside these and point the task at the empty ones")
+            (is (fs/exists? (fs/path wt "work.txt"))))
+          (testing "and its mail dirs are there for the sessions it actually has"
+            (is (fs/directory? (fs/path dir "mail" "implement")))
+            (is (fs/directory? (fs/path dir "mail" "review"))))))))
+  (testing "a task with neither repos nor roles.tsv is not a legacy task, it is broken"
+    (with-home
+      (fn [{:keys [env] :as h}]
+        (let [dir (scaffold-task! h "t-nothing" "a claude\n")]
+          (fs/delete (fs/path dir "repos"))
+          (let [r (run {:env env :ok? false} cli "prepare" "t-nothing")]
+            (is (not= 0 (:exit r)))
+            (is (str/includes? (:err r) "missing repos"))))))))
+

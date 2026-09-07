@@ -102,14 +102,25 @@
       (let [current (rows ctx)
             row (some #(when (= name (:name %)) %) current)]
         (when-not row (throw (ex-info (str "Unknown card: " name) {})))
-        (let [expected (set (get role->sessions (:lane row)))
-              done (conj (handed row) session)
-              moving? (every? done expected)
-              update (if moving?
-                       {:lane next-lane :handed ""}
-                       {:handed (str/join "," (sort done))})]
-          (write-rows! ctx (mapv #(if (= name (:name %))
-                                    (merge % update {:updated-at (timestamp)})
-                                    %)
-                                 current))
-          moving?)))))
+        (let [expected (set (get role->sessions (:lane row)))]
+          (if (and (seq expected) (not (contains? expected session)))
+            ;; The sender's role is not the lane's, so its turn is already over:
+            ;; the card moved on when the last of its siblings handed off, and
+            ;; this is one of them catching up. Counting it against the role
+            ;; running NOW would hold it for a turn it never belonged to, and
+            ;; put its name in that role's tally.
+            true
+            (let [done (conj (handed row) session)
+                  moving? (every? done expected)
+                  update (if moving?
+                           {:lane next-lane :handed ""}
+                           {:handed (str/join "," (sort done))})]
+              ;; A held handoff comes back through here on every daemon tick,
+              ;; and rewriting the board once a second would bury the one
+              ;; timestamp a reader wants — when the turn last actually moved.
+              (when (or moving? (not= done (handed row)))
+                (write-rows! ctx (mapv #(if (= name (:name %))
+                                          (merge % update {:updated-at (timestamp)})
+                                          %)
+                                       current)))
+              moving?)))))))

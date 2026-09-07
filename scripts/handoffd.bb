@@ -80,24 +80,38 @@
     (fs/path (task-lib/system-mail-dir ctx) "sent")
     (fs/path (handoff-lib/mail-dir ctx sender) "sent")))
 
-(defn deliver! [ctx path]
+(defn deliver!
+  "One outbox file to every recipient's inbox — unless it is a git_handoff and
+   the sender's role has not finished.
+
+   A role is one column of the pipeline, however many repos it holds. Delivering
+   the first session's handoff the moment it lands started the next role on a
+   set of trees still being written by that role's siblings — the hazard the
+   board's own join exists to describe, which until now it only described.
+   `update-board!` already computes the answer and threw it away.
+
+   Holding means leaving the file where it is: the daemon sees it again next
+   tick, and the same code delivers it once the last sibling has handed off."
+  [ctx path]
   (let [{:keys [headers body]} (handoff-lib/parse-message path)
         sender (get headers "from")
         recipients (handoff-lib/recipient-list headers)]
     (when-not recipients (throw (ex-info "missing to header" {})))
     (doseq [r recipients :when (not (handoff-lib/session-known? ctx r))]
       (throw (ex-info (str "unknown recipient " r) {})))
-    (update-board! ctx headers recipients)
-    (doseq [r recipients]
-      (let [target (fs/path (handoff-lib/new-dir ctx r) (fs/file-name path))]
-        (fs/create-dirs (fs/parent target))
-        (when-not (fs/exists? target)
-          (spit (str target) (handoff-lib/render-message (assoc headers "recipient" r "enqueued_at" (now)) body)))
-        (notify! ctx r)))
-    (let [dir (sent-dir ctx sender)]
-      (fs/create-dirs dir)
-      (fs/move path (fs/path dir (fs/file-name path))))
-    (log! ctx "delivered" (str path) "to" (str/join "," recipients))))
+    (if (false? (update-board! ctx headers recipients))
+      (log! ctx "held" (str path) "until the rest of" (str (get headers "from")) "'s role hands off")
+      (do
+        (doseq [r recipients]
+          (let [target (fs/path (handoff-lib/new-dir ctx r) (fs/file-name path))]
+            (fs/create-dirs (fs/parent target))
+            (when-not (fs/exists? target)
+              (spit (str target) (handoff-lib/render-message (assoc headers "recipient" r "enqueued_at" (now)) body)))
+            (notify! ctx r)))
+        (let [dir (sent-dir ctx sender)]
+          (fs/create-dirs dir)
+          (fs/move path (fs/path dir (fs/file-name path))))
+        (log! ctx "delivered" (str path) "to" (str/join "," recipients))))))
 
 (defn outbox-files [ctx]
   (->> (conj (mapv #(handoff-lib/outbox-dir ctx %) (handoff-lib/session-names ctx))
@@ -107,15 +121,29 @@
        distinct
        sort))
 
-(defn poll-once! [ctx]
-  (doseq [path (outbox-files ctx)
-          :while (not (should-stop? ctx))]
-    (try
-      (deliver! ctx (fs/path path))
-      (catch Exception e
-        (log! ctx "error" path (.getMessage e))
-        (try (fail! ctx (fs/path path) (.getMessage e))
-             (catch Exception nested (log! ctx "failed-to-archive" path (.getMessage nested))))))))
+(defn poll-once!
+  "Every outbox, until a pass moves nothing.
+
+   A handoff held for its role's siblings becomes deliverable the moment the
+   last of them lands, and that can happen later in this same pass — files go in
+   stamp order, and the sibling that completes the turn is usually not the first
+   one. A single pass would leave the earlier ones sitting for another tick; the
+   loop lets a finished turn go out as one piece."
+  [ctx]
+  (loop [before nil]
+    (doseq [path (outbox-files ctx)
+            :while (not (should-stop? ctx))]
+      (try
+        (deliver! ctx (fs/path path))
+        (catch Exception e
+          (log! ctx "error" path (.getMessage e))
+          (try (fail! ctx (fs/path path) (.getMessage e))
+               (catch Exception nested (log! ctx "failed-to-archive" path (.getMessage nested)))))))
+    (let [after (set (outbox-files ctx))]
+      ;; Stop as soon as a pass leaves the same files behind: they are held on
+      ;; something no further pass of this loop can change.
+      (when (and (seq after) (not= after before) (not (should-stop? ctx)))
+        (recur after)))))
 
 (def last-pr-poll (atom 0))
 

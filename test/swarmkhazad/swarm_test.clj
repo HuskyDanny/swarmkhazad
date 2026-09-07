@@ -158,7 +158,7 @@
                 (is (= ["--model" "sonnet"] (filterv #{"--model" "sonnet"} argv)))
                 (is (str/includes? (last argv) "ready_for_next.bb") "the initial prompt tells the role how to start")
                 (is (str/includes? (slurp (str (fs/path dir "prompts" "a.md"))) "Forward finished work to `b`"))
-                (is (str/includes? (slurp (str (fs/path dir "prompts" "b.md"))) "You are the last session"))))
+                (is (str/includes? (slurp (str (fs/path dir "prompts" "b.md"))) "You are the last role"))))
             (testing "nothing was written to the source checkout"
               (is (= "" (git src "status" "--porcelain")))
               (is (= "one\n" (slurp (str (fs/path src "README.md")))))
@@ -191,5 +191,93 @@
       (let [result (run {:env (assoc env "PATH" "/usr/bin:/bin:/opt/homebrew/bin") :ok? false} cli "open" "t-noharness")]
         (is (not= 0 (:exit result)))
         (is (str/includes? (:err result) "'copilot' is required")))
+      (finally
+        (fs/delete-tree sandbox)))))
+
+(deftest a-prompt-past-one-repo-points-at-the-next-role-and-its-own-draft
+  ;; The two things a session reads out of its prompt and cannot derive: who to
+  ;; forward to, and what to call its write-up. Both were session-major and both
+  ;; were wrong past one repo — sessions.tsv is ordered role-major, so "the next
+  ;; row" is a sibling of your own role, and `draft-<role>.md` is a file two
+  ;; sessions of that role would each write and the judge would read from
+  ;; neither. One repo hides both: session and role are the same string.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-prompt."})
+        home (str (fs/path sandbox "home"))
+        gobel (str (fs/path sandbox "src" "gobel"))
+        cirdan (str (fs/path sandbox "src" "cirdan"))
+        env {"SWARMKHAZAD_HOME" home}
+        dir (fs/path home "tasks" "t-pr")]
+    (try
+      (make-source-repo! gobel)
+      (make-source-repo! cirdan)
+      (write! (fs/path dir "goal.md")
+              "## Goal\n- [ ] implement — the change\n- [ ] tidy — sweep it\n- [ ] review — read it\n")
+      (write! (fs/path dir "metrics.md") "# bars\n")
+      ;; `tidy` has no prompts/tidy.prompt, so it falls back to default.prompt —
+      ;; the only stage prompt carrying the bare `draft-<role>.md` placeholder.
+      ;; With only roles that ship their own file, that placeholder is never
+      ;; loaded and a rewrite that missed it would look tested and not be.
+      (write! (fs/path dir "roles") "implement claude\ntidy claude\nreview claude\n")
+      (write! (fs/path dir "repos") (str gobel "\n" cirdan "\n"))
+      (run {:env env} cli "prepare" "t-pr")
+      ;; write-prompt! runs at open, which boots tmux and a harness. The prompt
+      ;; text is what this is about, so call it directly with the real rows.
+      (run {:env env}
+           "bb" "-e" (str "(load-file \"" repo-root "/scripts/swarm_lib.bb\") "
+                          "(let [ctx (task-lib/task-ctx \"t-pr\") "
+                          "      rows (task-lib/read-sessions-tsv ctx)] "
+                          "  (doseq [r rows] (swarm-lib/write-prompt! ctx rows r)))"))
+      (let [prompt #(slurp (str (fs/path dir "prompts" (str % ".md"))))]
+        (testing "the lineup is roles, and the address is the next ROLE"
+          (is (str/includes? (prompt "implement_gobel") "Roles in order: implement → tidy → review"))
+          (is (str/includes? (prompt "implement_gobel") "Forward finished work to `tidy`")
+              "not `implement_cirdan` — a sibling of its own role, which moved the card into the lane it was already in")
+          (is (str/includes? (prompt "implement_cirdan") "Forward finished work to `tidy`")
+              "every session of a role forwards to the same next role")
+          (is (str/includes? (prompt "review_cirdan") "You are the last role")
+              "and every session of the LAST role broadcasts — not only the last row of the table"))
+        (testing "each session is told to write its own draft"
+          (is (str/includes? (prompt "implement_gobel") "`draft-implement_gobel.md`"))
+          (is (str/includes? (prompt "implement_cirdan") "`draft-implement_cirdan.md`"))
+          (is (not (str/includes? (prompt "implement_gobel") "draft-<your role>.md"))
+              "no placeholder survives into a prompt an agent reads literally"))
+        (testing "including the one in the fallback stage prompt"
+          (is (str/includes? (prompt "tidy_gobel") "`draft-tidy_gobel.md`"))
+          (is (not (str/includes? (prompt "tidy_gobel") "draft-<role>.md"))))
+        (testing "a cross-role reference resolves to the sibling in the SAME repo"
+          (is (str/includes? (prompt "review_gobel") "`draft-implement_gobel.md`")
+              "review wants the implement that worked on the tree it is reviewing")
+          (is (str/includes? (prompt "review_cirdan") "`draft-implement_cirdan.md`"))
+          (is (not (str/includes? (prompt "review_gobel") "draft-implement.md"))
+              "which nobody wrote"))
+        (testing "the session's own repo is still what the header pins it to"
+          (is (str/includes? (prompt "review_gobel") "- Your repo: gobel"))
+          (is (str/includes? (prompt "review_cirdan") "- Your repo: cirdan"))))
+      (finally
+        (fs/delete-tree sandbox)))))
+
+(deftest a-one-repo-prompt-still-reads-the-way-it-always-did
+  ;; The rewrite above is a no-op when session and role are the same string, and
+  ;; every task already on disk is that shape.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-prompt1."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home}
+        dir (fs/path home "tasks" "t-pr1")]
+    (try
+      (make-source-repo! src)
+      (write! (fs/path dir "goal.md") "## Goal\n- [ ] implement — x\n- [ ] review — y\n")
+      (write! (fs/path dir "metrics.md") "# bars\n")
+      (write! (fs/path dir "roles") "implement claude\nreview claude\n")
+      (write! (fs/path dir "repos") (str src "\n"))
+      (run {:env env} cli "prepare" "t-pr1")
+      (run {:env env}
+           "bb" "-e" (str "(load-file \"" repo-root "/scripts/swarm_lib.bb\") "
+                          "(let [ctx (task-lib/task-ctx \"t-pr1\") "
+                          "      rows (task-lib/read-sessions-tsv ctx)] "
+                          "  (doseq [r rows] (swarm-lib/write-prompt! ctx rows r)))"))
+      (let [p (slurp (str (fs/path dir "prompts" "implement.md")))]
+        (is (str/includes? p "Forward finished work to `review`"))
+        (is (str/includes? p "`draft-implement.md`") "the name every task on disk already uses"))
       (finally
         (fs/delete-tree sandbox)))))

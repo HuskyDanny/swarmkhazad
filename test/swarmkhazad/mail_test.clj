@@ -459,7 +459,10 @@
       (testing "one repo of two: the card records the handoff and stays put"
         (is (str/starts-with? (card) "t-two\timplement\t") (card))
         (is (str/ends-with? (card) "\timplement_gobel")
-            "a review that started here would be reading a tree that is still moving"))
+            "a review that started here would be reading a tree that is still moving")
+        (is (empty? (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))
+            "and the mail is held, not only the card — a review woken now would read a tree its sibling is still writing")
+        (is (empty? (handoffs (fs/path dir "mail" "review_cirdan" "inbox" "new")))))
       (testing "the other repo's sibling moves it"
         (is (zero? (:exit (helper "implement_cirdan" "cirdan" "swarm_handoff.bb"
                                   (draft! dir "two.txt" "type: git_handoff\nto: review\npriority: 50\n")))))
@@ -484,3 +487,69 @@
         (is (= 2 (:exit r)) (:out r))
         (is (str/includes? (:err r) "Unknown recipient role 'implement'")
             "its own sibling drops out of the expansion, which leaves nobody — refused, not silently sent to itself")))))
+
+(deftest every-session-of-the-last-role-closes-the-task-not-just-the-last-row
+  ;; What ends a task is the last ROLE finishing, not the last row of
+  ;; sessions.tsv. Keyed on the row, only `review_cirdan` was terminal:
+  ;; `review_gobel`'s `to: all` went out FORWARDING, so the board moved the card
+  ;; into whichever lane the first recipient's role happened to be — backwards,
+  ;; into implement — and no recipient saw a terminal inbound to stop on.
+  (with-two-repo-task
+    (fn [{:keys [dir env helper commit! card]}]
+      (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                     "(board-lib/create-card! (task-lib/task-ctx \"t-two\") \"t-two\" \"review\")"))
+      (commit! "gobel" "a.txt")
+      (commit! "cirdan" "b.txt")
+      (testing "the first session of the last role broadcasts, and it is terminal"
+        (is (zero? (:exit (helper "review_gobel" "gobel" "swarm_handoff.bb"
+                                  (draft! dir "one.txt" "type: git_handoff\nto: all\npriority: 50\n")))))
+        (let [h (headers (first (handoffs (fs/path dir "mail" "review_gobel" "outbox"))))]
+          (is (= "true" (get h "non-forwarding"))
+              "not `review_cirdan`'s alone — every session of the last role ends its own repo")
+          (is (not (str/includes? (get h "to") "review_gobel")) "and not to itself")))
+      (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+      (testing "one repo of two, so the task is not over"
+        (is (str/starts-with? (card) "t-two\treview\t") (card))
+        (is (str/ends-with? (card) "\treview_gobel")))
+      (testing "the sibling's broadcast is what closes it"
+        (is (zero? (:exit (helper "review_cirdan" "cirdan" "swarm_handoff.bb"
+                                  (draft! dir "two.txt" "type: git_handoff\nto: all\npriority: 50\n")))))
+        (is (= "true" (get (headers (first (handoffs (fs/path dir "mail" "review_cirdan" "outbox"))))
+                           "non-forwarding")))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (str/starts-with? (card) "t-two\tdone\t") (card))
+        (is (not (str/includes? (card) "\timplement"))
+            "never backwards into a lane the task already left"))
+      (testing "implement heard about both repos and has nothing to forward"
+        (doseq [session ["implement_gobel" "implement_cirdan"]]
+          (let [inbound (handoffs (fs/path dir "mail" session "inbox" "new"))]
+            (is (= 2 (count inbound)) session)
+            (is (every? #(= "true" (get (headers %) "non-forwarding")) inbound)
+                (str session " must stop, not forward"))))))))
+
+(deftest a-turn-that-completes-inside-one-pass-goes-out-in-that-pass
+  ;; Both siblings hand off before the daemon looks. Files are processed in
+  ;; stamp order, so the one that completes the turn is the LAST one seen — the
+  ;; earlier siblings were held moments before, in the same pass. A single pass
+  ;; would leave them for the next tick, and `--once` has no next tick.
+  (with-two-repo-task
+    (fn [{:keys [dir env helper commit!]}]
+      (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                     "(board-lib/create-card! (task-lib/task-ctx \"t-two\") \"t-two\" \"implement\")"))
+      (commit! "gobel" "a.txt")
+      (commit! "cirdan" "b.txt")
+      (is (zero? (:exit (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                                (draft! dir "one.txt" "type: git_handoff\nto: review\npriority: 50\n")))))
+      (is (zero? (:exit (helper "implement_cirdan" "cirdan" "swarm_handoff.bb"
+                                (draft! dir "two.txt" "type: git_handoff\nto: review\npriority: 50\n")))))
+      (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+      (testing "one pass, and both repos' work is in both review inboxes"
+        (is (= 2 (count (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))))
+        (is (= 2 (count (handoffs (fs/path dir "mail" "review_cirdan" "inbox" "new")))))
+        (is (= #{"gobel" "cirdan"}
+               (set (keep #(get (headers %) "origin_repo")
+                          (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))))))
+      (testing "and nothing is left waiting in an outbox"
+        (doseq [session ["implement_gobel" "implement_cirdan"]]
+          (is (empty? (handoffs (fs/path dir "mail" session "outbox"))) session))))))
+

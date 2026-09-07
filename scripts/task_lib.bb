@@ -583,8 +583,20 @@
 
 ;; ---------------------------------------------------------------- prepare
 
+(defn legacy-task?
+  "A task opened before `repos` existed: no repos file, but a roles.tsv from the
+   old shape. It is still running, and `open` is how anyone resumes it after a
+   reboot kills its tmux socket."
+  [ctx]
+  (and (not (fs/regular-file? (:repos-file ctx)))
+       (fs/regular-file? (:roles-tsv ctx))))
+
 (defn require-truth! [ctx]
-  (doseq [f [(:goal-file ctx) (:metrics-file ctx) (:roles-file ctx) (:repos-file ctx)]]
+  (doseq [f (cond-> [(:goal-file ctx) (:metrics-file ctx) (:roles-file ctx)]
+              ;; A legacy task predates this file. Demanding it turned "resume
+              ;; the task you already have" into a hard failure on the one
+              ;; command that resumes it.
+              (not (legacy-task? ctx)) (conj (:repos-file ctx)))]
     (when-not (fs/regular-file? f)
       (throw (ex-info (str "task is missing " (fs/file-name f) ": " f) {})))))
 
@@ -601,16 +613,31 @@
    runs: layout, worktrees, sessions.tsv, mail dirs. Idempotent."
   [ctx]
   (require-truth! ctx)
-  (let [roles (parse-roles ctx)
-        repos (parse-repos ctx)
-        role->repos (goal-repos (slurp (str (:goal-file ctx))) roles (mapv :name repos))]
-    (create-layout! ctx)
-    (let [worktrees (prepare-worktrees! ctx repos)
-          rows (sessions ctx roles repos role->repos)]
+  (if (legacy-task? ctx)
+    ;; Migrate on read, and touch nothing else. Its worktrees exist, at paths
+    ;; its own rows record — one per ROLE, not one per repo. Rebuilding sessions
+    ;; the new way here would add fresh worktrees beside them and point the task
+    ;; at the empty ones, which is how a resume loses a day of work.
+    (let [rows (read-sessions-tsv ctx)]
+      (create-layout! ctx)
       (prepare-mail-dirs! ctx rows)
       (write-sessions-tsv! ctx rows)
       {:task-id (:task-id ctx)
        :task-dir (str (:task-dir ctx))
-       :roles roles
-       :repos worktrees
-       :sessions rows})))
+       :roles (parse-roles ctx)
+       :repos (vec (for [r (distinct (keep :repo rows))] {:name r}))
+       :sessions rows
+       :legacy true})
+    (let [roles (parse-roles ctx)
+          repos (parse-repos ctx)
+          role->repos (goal-repos (slurp (str (:goal-file ctx))) roles (mapv :name repos))]
+      (create-layout! ctx)
+      (let [worktrees (prepare-worktrees! ctx repos)
+            rows (sessions ctx roles repos role->repos)]
+        (prepare-mail-dirs! ctx rows)
+        (write-sessions-tsv! ctx rows)
+        {:task-id (:task-id ctx)
+         :task-dir (str (:task-dir ctx))
+         :roles roles
+         :repos worktrees
+         :sessions rows}))))

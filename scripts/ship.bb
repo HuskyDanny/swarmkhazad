@@ -189,8 +189,20 @@
   [{:keys [repo source branch base account]}]
   (when (or (= branch base) (not (str/starts-with? branch "sk/")))
     (fail! (str "refusing to push " branch " in " source ": ship only ever pushes sk/<task-id>")))
-  (let [helper (str "!f(){ echo username=" account "; echo password=" (or (gh-token account) "") "; };f")
-        r (process/sh {:continue true :dir (str source)}
+  (let [;; The helper reads the credential out of the environment rather than
+        ;; carrying it. Spelled into the `-c` value, the token was an argv
+        ;; element of `git` — readable in `ps` by anything running as this user,
+        ;; which is what a swarm of unattended agents is — and git re-exports
+        ;; every `-c` to its children in GIT_CONFIG_PARAMETERS, so every hook
+        ;; the push ran saw it too. The variable names are ours, so git has no
+        ;; reason to put them in config.
+        helper "!f(){ echo username=\"$SK_GH_ACCOUNT\"; echo password=\"$SK_GH_TOKEN\"; };f"
+        r (process/sh {:continue true :dir (str source)
+                       :extra-env {"SK_GH_ACCOUNT" (str account)
+                                   "SK_GH_TOKEN" (or (gh-token account) "")
+                                   ;; Nothing here can answer a prompt, and a
+                                   ;; push that blocks on one hangs the run.
+                                   "GIT_TERMINAL_PROMPT" "0"}}
                       "git" "-c" (str "credential.helper=" helper)
                       "push" "--set-upstream" "origin" (str branch ":refs/heads/" branch))]
     (when-not (zero? (:exit r))

@@ -68,8 +68,18 @@
 
 (defn session-names [ctx] (task-lib/session-names ctx))
 
-(defn last-session? [ctx name]
-  (= name (last (session-names ctx))))
+(defn last-role?
+  "Whether this session belongs to the last role in the lineup.
+
+   The pipeline is role-major: every session of `implement` runs, then every
+   session of `review`. So the thing that closes a task is a ROLE finishing,
+   not one row of sessions.tsv finishing. Comparing against the last session
+   made only `run`'s alphabetically-last repo close the task; its siblings
+   forwarded to nobody, and the card walked backwards into whichever lane
+   `expand-recipient` happened to resolve first."
+  [ctx name]
+  (let [row (task-lib/session-row ctx name)]
+    (= (:role row) (last (task-lib/role-names ctx)))))
 
 ;; ---------------------------------------------------------------- dirs
 

@@ -177,9 +177,9 @@
     (slurp (str (if (fs/regular-file? specific) specific fallback)))))
 
 (defn role-header [ctx rows row]
-  (let [names (mapv :session rows)
-        idx (.indexOf names (:session row))
-        next-session (get names (inc idx))
+  (let [roles (vec (distinct (map :role rows)))
+        idx (.indexOf roles (:role row))
+        next-role (get roles (inc idx))
         mine (->> rows (filter #(= (:role row) (:role %))) (mapv :repo))]
     (str "# swarmkhazad · task " (:task-id ctx) " · " (:session row) "\n\n"
          "- Task folder: " (:task-dir ctx) "\n"
@@ -188,25 +188,61 @@
          (when (> (count mine) 1)
            (str "- As " (:role row) " you cover " (str/join ", " mine)
                 " — one session each, run in that order. This one is only " (:repo row) ".\n"))
-         "- Sessions in order: " (str/join " → " names) ". You are #" (inc idx) " of " (count names) "."
-         (if next-session
-           (str " Forward finished work to `" next-session "`.\n")
-           " You are the last session: your git_handoff goes to every other session and closes the task.\n")
+         ;; The lineup names ROLES, and so does the address. A session that was
+         ;; told to forward to the next row of sessions.tsv was told to forward
+         ;; to a sibling of its own role — the card then moved into the lane it
+         ;; was already in, and the task never advanced past `implement`.
+         "- Roles in order: " (str/join " → " roles) ". You are `" (:role row) "`, #" (inc idx) " of " (count roles) "."
+         (if next-role
+           (str " Forward finished work to `" next-role "` — the role, not a session. Every session it has gets it.\n")
+           " You are the last role: your git_handoff goes to every other session and closes the task.\n")
          "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb\n\n")))
+
+(defn own-drafts
+  "Rewrite every `draft-<role>.md` a prompt names into the draft of that role's
+   session IN THIS REPO.
+
+   The prompts name roles, because that is what a reader understands and what
+   `draft-implement.md` means to a person. The judge (goal_judge.bb) and the
+   handoff (swarm_handoff.bb) both read `draft-<session>.md`, because two
+   sessions of one role would otherwise overwrite each other's write-up. Past
+   one repo those two names differ, so a role that followed its own instructions
+   literally wrote a file nothing read — the judge reports `(not written)` for
+   real work and the handoff drops it from `artifacts:`.
+
+   A cross-role reference is rewritten to the sibling in THIS repo: review is
+   told to read implement's draft, and it wants the implement that worked on the
+   tree it is reviewing. In a one-repo task session and role are the same string
+   and every replacement here is a no-op."
+  [text rows row]
+  (let [in-repo (fn [role]
+                  (or (some #(when (and (= role (:role %)) (= (:repo row) (:repo %))) (:session %)) rows)
+                      (some #(when (= role (:role %)) (:session %)) rows)
+                      role))]
+    (reduce (fn [t role] (str/replace t (str "draft-" role ".md") (str "draft-" (in-repo role) ".md")))
+            (reduce #(str/replace %1 %2 (str "draft-" (:session row) ".md"))
+                    text
+                    ;; Both spellings of "your own draft" a prompt uses. A
+                    ;; placeholder left unresolved is the same defect as a role
+                    ;; name left unresolved: the agent writes a file whose name
+                    ;; nothing downstream reads.
+                    ["draft-<your role>.md" "draft-<role>.md"])
+            (distinct (map :role rows)))))
 
 (defn write-prompt!
   "prompts/<session>.md: the session header, the constitution, the stage prompt.
 
    The stage prompt is the ROLE's — every repo gets the same instructions for
-   what implement or review means; only the header differs."
+   what implement or review means; only the header and the draft names differ."
   [ctx rows row]
   (fs/create-dirs (:prompts-dir ctx))
   (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))]
     (spit (str file)
           (str (role-header ctx rows row)
-               (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
-               "\n## Stage: " (:role row) "\n\n"
-               (stage-prompt (:role row))))
+               (own-drafts (str (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
+                                "\n## Stage: " (:role row) "\n\n"
+                                (stage-prompt (:role row)))
+                           rows row)))
     file))
 
 ;; ---------------------------------------------------------------- hooks

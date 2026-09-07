@@ -256,24 +256,27 @@
                              text))
                  out)))))))
 
-(defn pane-state
-  "Whether the pane the rail shows is a running tmux session, the capture taken
+(defn pane-view
+  "The pane, and where it came from: the running tmux session, the capture taken
    when the task closed, or nothing yet. A closed task still has a terminal to
-   read — that is the whole point of archiving it at close."
-  [ctx role]
-  (cond
-    (not-empty (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))) :live
-    (text (fs/path (:sessions-dir ctx) role "pane.txt")) :archived
-    :else :none))
+   read — that is the whole point of archiving it at close.
+
+   One capture answers both. Asking tmux separately for the text and for whether
+   the session is live was two subprocesses for one question, on a page that
+   refreshes every five seconds for every session the task has — and sessions
+   are the axis a multi-repo task multiplies."
+  ([ctx role] (pane-view ctx role {}))
+  ([ctx role {:keys [ansi]}]
+   (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
+         archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))]
+     {:state (cond (not-empty live) :live archived :archived :else :none)
+      :text (str/join "\n" (take-last pane-tail-lines
+                                      (str/split-lines (or (not-empty live) archived ""))))})))
 
 (defn pane-text
   "The live pane when the task's tmux server is up, else the archived capture."
-  ([ctx role] (pane-text ctx role {}))
-  ([ctx role {:keys [ansi]}]
-  (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
-        archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))
-        s (or (not-empty live) archived "")]
-    (str/join "\n" (take-last pane-tail-lines (str/split-lines s))))))
+  ([ctx role] (:text (pane-view ctx role)))
+  ([ctx role opts] (:text (pane-view ctx role opts))))
 
 (defn session-cards [ctx]
   (let [vs (verdicts ctx)]
@@ -872,7 +875,8 @@
   (let [id (:task-id ctx)
         names (map :session (sessions ctx))
         watching (or (some #{watching} names) (first names))
-        state (when watching (pane-state ctx watching))]
+        view (when watching (pane-view ctx watching {:ansi true}))
+        state (:state view)]
     [:aside.rail
      [:div.tabs
       (for [r names]
@@ -885,7 +889,7 @@
           (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
          [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
         [:pre#pane.term {:data-task id :data-role watching}
-         (ansi->hiccup (pane-text ctx watching {:ansi true}))]
+         (ansi->hiccup (:text view))]
         ;; The pane is the only way to reach an agent mid-turn: it owns the
         ;; terminal, and the inbox it reads between turns is no use to a role
         ;; that is already running. Until now that meant a tmux attach in
