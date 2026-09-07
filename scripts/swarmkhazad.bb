@@ -22,6 +22,8 @@
        "  swarmkhazad paths <task-id>                    print the path map\n"
        "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"
        "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"
+       "  swarmkhazad summary <task-id>                  ask whether the work is ready to merge, for its goals\n"
+       "  swarmkhazad ship <task-id> [--yes]             push each repo's branch and open a draft PR, in the summary's merge order\n"
        "  swarmkhazad reap [--force]                     prune stale worktrees and delete orphaned sk/* branches from your checkouts\n"))
 
 (defn usage! []
@@ -151,6 +153,10 @@
                    (apply (resolve 'portal/-main) (rest args)))
       "telemetry" (do (load-file (str (fs/path script-dir "telemetry.bb")))
                       (apply (resolve 'telemetry/-main) (rest args)))
+      "summary" (do (load-file (str (fs/path script-dir "summary.bb")))
+                    (apply (resolve 'summary/-main) (rest args)))
+      "ship" (do (load-file (str (fs/path script-dir "ship.bb")))
+                 (apply (resolve 'ship/-main) (rest args)))
       "reap" (do (load-file (str (fs/path script-dir "reap.bb")))
                  (apply (resolve 'reap/-main) (rest args)))
       (usage!))

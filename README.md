@@ -150,6 +150,8 @@ swarmkhazad open <task-id>                     prepare, then spawn exactly the d
 swarmkhazad open --linear <KEY> [--repo <path>]...
                                                scaffold from a Linear issue, then open
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
+swarmkhazad summary <task-id>                  ask whether the work is ready to merge, for its goals
+swarmkhazad ship <task-id> [--yes]             push each repo's branch and open a draft PR, in the summary's merge order
 swarmkhazad reap [--force]                     prune stale worktrees, delete orphaned sk/* branches from your checkouts
 swarmkhazad paths <task-id>                    print the path map
 swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
@@ -198,6 +200,20 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 ### The turn moves as a role
 
 A role with three repos hands off three times. `handoffd` records each one in the board card's `handed` column and moves the card only when the set covers every session that role has. A review that started on the first handoff would be reading two trees that are still moving. The lane is therefore always a role name — one swimlane column per role, whatever the repo count — and the portal shows the progress inside it as a fraction.
+
+## Shipping
+
+`swarmkhazad ship <task-id>` is the only thing here that leaves the machine, and every guard on it is about that.
+
+It **requires the summary** — `swarmkhazad summary <id>`, or the portal's "Ready to merge?" button. That is where a person reads a verdict, so requiring it means nothing ships unread. The **merge order comes from that summary's `## Merge order` section**, never from a second inference: two things working an order out will disagree at the worst moment, and the summarizer is the one that has read every diff. An order that skips a repo with commits is a refusal, not a guess.
+
+Then it prints the plan — repo, branch, base, the GitHub repo it resolved, the **account it will push as**, and the commit count — and waits for `yes`. Nothing before that point touches the keychain. `--yes` skips the prompt and prints the same plan.
+
+The account comes from an owner→account map read off `remote.origin.url` (`MithraAI → allen-mithra`, default `allen-mithra`, `SWARMKHAZAD_GH_ACCOUNT` overrides). `config --get`, not `git remote get-url`, because get-url applies `url.<x>.insteadOf` and a checkout that mirrors GitHub would report no owner at all and silently take the default. The token is fetched per command with `gh auth token -u <account>`; `gh auth switch` is never called, because rewriting the operator's global gh state to push one branch is not a thing a tool should do.
+
+Per repo, in order: push `sk/<task-id>` with an explicit refspec (checked against the source's default branch first — never main), then open a **draft** PR whose body carries the summary's verdict and that repo's own goal lines. What was opened is recorded in `state/pr/<repo>.json`, and the card moves to its own `in-review` lane: a shipped task and a finished task are different states.
+
+**It stops at the first failure.** Re-running is how you continue — a branch already at the remote is not pushed again, and a repo that already has an open PR for this head prints it instead of opening a second. A pushed branch with a draft PR is not damage needing a rollback; continuing past a failed push would open a PR on work nobody has.
 
 ## The portal
 

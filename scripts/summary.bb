@@ -21,6 +21,12 @@
 (load-file (str (fs/path script-dir "task_lib.bb")))
 (load-file (str (fs/path script-dir "ask.bb")))
 
+(def merge-order-heading
+  "The section ship reads its order from. One name, in one place: the prompt
+   asks for this heading and ship parses this heading, so a rename cannot
+   leave the two disagreeing about a section that then silently goes missing."
+  "Merge order")
+
 (def diff-budget 60000)
 (def file-budget 12000)
 
@@ -124,6 +130,15 @@
    "the reason, not a finding.\n"
    "- Treat gotcha.md as known. Do not report something the roles already wrote "
    "down and worked around.\n\n"
+   "## Per repo\n"
+   "One line per repo you were given a diff for, `<repo>: <verdict> — <why>`, "
+   "using the same verdict words as above. A repo whose diff is empty says "
+   "`no change`. Skip this section entirely when there is only one repo.\n\n"
+   "## " merge-order-heading "\n"
+   "The repos, one per line, in the order they must merge, each `<repo> — "
+   "<why it goes here>`. Name every repo that has a diff, even when the order "
+   "does not matter — say so as the reason. A repo that depends on another "
+   "merges after it. Skip this section entirely when there is only one repo.\n\n"
    "## Risk\n"
    "What could go wrong if this merges as it stands. Blast radius: who else "
    "moves with this change, what breaks if it is wrong, and how it is noticed. "
