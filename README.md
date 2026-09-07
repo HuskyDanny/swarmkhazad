@@ -78,6 +78,7 @@ Then run it:
 ./swarmkhazad portal              # http://127.0.0.1:8765 — watch it work
 ./swarmkhazad telemetry my-task   # cost, tokens and sessions per role
 ./swarmkhazad close my-task       # archive the panes, stop the daemon
+./swarmkhazad close my-task --reclaim   # ...and give the disk back
 ```
 
 Attach to any role directly: `tmux -S /tmp/swarmkhazad-$USER/my-task.sock attach -t sk-implement`.
@@ -138,7 +139,9 @@ There is no clone. Each repo gets one worktree, added from the checkout itself, 
 
 The cost of not cloning is that `git worktree add` registers the worktree and the branch **in the source checkout**. Nothing else there is touched: the working tree stays clean and on its own branch.
 
-`close` clears both. `swarmkhazad reap` is for the tasks whose close never ran — it prunes stale registrations and deletes every `sk/<task-id>` branch whose task folder is gone, across the checkouts under `SWARMKHAZAD_REPO_ROOTS` (default `~/repos`). A branch holding commits is listed with what deleting it would lose and left alone until `--force`, because an orphaned branch is also what an unmerged, unpushed day of work looks like. Live tasks and anything a checkout currently has checked out are never candidates.
+`close --reclaim` clears both: it cleans each worktree (`git clean -xdf`), removes it, and deletes `sk/<task-id>` from the source. That is where the space is — a worktree that has built anything is mostly untracked output, 6.4G across three of them in the task this design came from, none of it in git. A repo whose branch is not on `origin` is kept and said so, because that is also what an unpushed day of work looks like; `--force` takes it anyway. Plain `close` removes nothing: it has always meant *stop the swarm*, and the task folder — notes, evidence, PR records — outlives its checkouts either way.
+
+`swarmkhazad reap` is for the tasks whose close never ran — it prunes stale registrations and deletes every `sk/<task-id>` branch whose task folder is gone, across the checkouts under `SWARMKHAZAD_REPO_ROOTS` (default `~/repos`). A branch holding commits is listed with what deleting it would lose and left alone until `--force`, because an orphaned branch is also what an unmerged, unpushed day of work looks like. Live tasks, and any branch a worktree still holds — this checkout's or another's, which git reports directly rather than being inferred from the source's own HEAD — are never candidates.
 
 ## Commands
 
@@ -149,7 +152,10 @@ swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, ses
 swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
 swarmkhazad open --linear <KEY> [--repo <path>]...
                                                scaffold from a Linear issue, then open
-swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
+swarmkhazad close <task-id> [--reclaim] [--force]
+                                               archive panes, stop the daemon, kill the tmux server;
+                                               --reclaim also cleans and removes the worktrees and
+                                               deletes the task branch (kept if not on origin)
 swarmkhazad summary <task-id>                  ask whether the work is ready to merge, for its goals
 swarmkhazad ship <task-id> [--yes]             push each repo's branch and open a draft PR, in the summary's merge order
 swarmkhazad reap [--force]                     prune stale worktrees, delete orphaned sk/* branches from your checkouts
@@ -219,7 +225,9 @@ A task used to end at the handoff; now it waits in review, and what arrives ther
 
 The handoff body carries the exact `gh` commands with the thread id already in them. It never replies and never resolves on the role's behalf: resolving means the role agreed, and a thread it disagrees with gets a reply with the reason and stays open.
 
-Two things it refuses to do. A check that has failed twice on the same commit stops waking anyone and becomes an escalation instead — a pipeline broken for a reason nobody in the task can fix would otherwise spin a role for as long as it stays broken. And a poll that cannot reach GitHub does nothing at all rather than reading silence as "no comments", which would mark every one of them handled and lose them.
+**Only people with write access wake a role.** A queued handoff is delivered into a session's pane and read as its instructions, and that session runs with permissions bypassed in your own checkout with `gh` authenticated — so a PR comment is a prompt, and on a public repo anyone can write one. GitHub already answers the question that settles it: only `OWNER`, `MEMBER` and `COLLABORATOR` comments become work. Everything else becomes one line in `escalation.md` naming the author and the PR, never the body, and a human reads it there. What does get through is wrapped in `BEGIN UNTRUSTED TEXT` / `END UNTRUSTED TEXT` with those markers stripped from the body first, so a comment cannot close its own fence, and the constitution tells every role that anything between them is data.
+
+Three things it refuses to do. A check that has failed on two commits in a row — the role pushed a fix and it failed again — stops waking anyone and becomes an escalation instead, because a pipeline broken for a reason nobody in the task can fix would otherwise spin a role for as long as it stays broken. A poll that cannot reach GitHub does nothing at all rather than reading silence as "no comments", which would mark every one of them handled and lose them. And it never settles a task on one repo's PR: the same poll records each PR's `state`, and only when the last one is `MERGED` or `CLOSED` does the card leave `in-review` for `done`.
 
 **It stops at the first failure.** Re-running is how you continue — a branch already at the remote is not pushed again, and a repo that already has an open PR for this head prints it instead of opening a second. A pushed branch with a draft PR is not damage needing a rollback; continuing past a failed push would open a PR on work nobody has.
 

@@ -17,7 +17,10 @@
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
        "  swarmkhazad open --linear <KEY> [--repo <path>]...\n"
        "                                                 scaffold from a Linear issue, then open\n"
-       "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
+       "  swarmkhazad close <task-id> [--reclaim] [--force]\n"
+       "                                                 archive panes, stop the daemon, kill the tmux server;\n"
+       "                                                 --reclaim also cleans and removes the worktrees and\n"
+       "                                                 deletes the task branch (kept if not on origin)\n"
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"
        "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"
@@ -124,8 +127,10 @@
       (new! task-id args))
     (open! task-id)))
 
-(defn close! [task-id]
-  (swarm-lib/close! task-id)
+(defn close! [task-id args]
+  (swarm-lib/close! task-id
+                    (boolean (some #{"--reclaim"} args))
+                    (boolean (some #{"--force"} args)))
   (println "swarm closed:" task-id))
 
 (defn smoke! [task-id]
@@ -146,7 +151,7 @@
       "new" (if (second args) (new! (second args) (drop 2 args)) (usage!))
       "prepare" (if (second args) (prepare! (second args)) (usage!))
       "open" (open-cmd! (rest args))
-      "close" (if (second args) (close! (second args)) (usage!))
+      "close" (if (second args) (close! (second args) args) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
       "portal" (do (load-file (str (fs/path script-dir "portal.bb")))

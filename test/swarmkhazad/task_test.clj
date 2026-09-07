@@ -339,10 +339,25 @@
           (run {:dir src} "git" "checkout" "-q" "sk/t-work")
           (let [r (reap "--force")]
             (is (zero? (:exit r)) (:err r))
-            (is (str/includes? (:out r) "the checkout has it checked out"))
+            (is (str/includes? (:out r) "a worktree still has it: "))
             (is (some #{"sk/t-work"} (branches))
                 "git refuses the delete anyway; saying so beats an error nobody can act on"))
           (run {:dir src} "git" "checkout" "-q" "main"))
+        (testing "and so is one held by a worktree that is not this checkout"
+          ;; The case the old check could not see: it compared the SOURCE's own
+          ;; HEAD, so a branch checked out in any other linked worktree read as
+          ;; deletable. `git branch -D` refused, task-lib/git threw on the
+          ;; non-zero exit, and the sweep ended there — with the checkouts it
+          ;; had already reaped reaped, and the rest never looked at.
+          (let [elsewhere (str (fs/path sandbox "elsewhere"))]
+            (run {:dir src} "git" "worktree" "add" "-q" elsewhere "sk/t-work")
+            (let [r (reap "--force")]
+              (is (zero? (:exit r)) (str "one held branch must not end the sweep: " (:err r)))
+              (is (str/includes? (:out r) (str "a worktree still has it: "
+                                              (str (fs/canonicalize elsewhere))))
+                  "named, so the operator knows which worktree to close")
+              (is (some #{"sk/t-work"} (branches)) "and it is still there"))
+            (run {:dir src} "git" "worktree" "remove" "--force" elsewhere)))
         (testing "--force takes the one holding work, and nothing else"
           (is (str/includes? (:out (reap "--force")) "sk/t-work"))
           (is (= ["keepme" "main" "scratch" "sk/t-live"] (branches))

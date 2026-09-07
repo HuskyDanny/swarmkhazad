@@ -493,14 +493,72 @@
     (write-shims! ctx)
     (doall (pmap #(smoke-role! ctx sessions %) one-each))))
 
+(defn pushed?
+  "Whether the source already has this branch on its remote, at the same commit.
+
+   The one question worth asking before deleting a worktree: work that is on
+   origin can be got back, and work that is not cannot. A task that shipped
+   answers yes for every repo, which is the case task.md §10 describes."
+  [source branch]
+  (let [remote (str "refs/remotes/origin/" branch)]
+    (boolean (and (task-lib/git-ok? source "rev-parse" "--verify" "--quiet" (str remote "^{commit}"))
+                  (= (task-lib/git source "rev-parse" (str remote "^{commit}"))
+                     (task-lib/git source "rev-parse" (str branch "^{commit}")))))))
+
+(defn reclaim!
+  "Give the disk back: clean each worktree, remove it, drop the task branch from
+   the source it was added to. Returns a line per repo, for the caller to print.
+
+   This is where the space is. A worktree is a checkout, and a checkout that has
+   built anything is mostly untracked build output — 6.4G across three of them
+   in the task that started all this, none of it in git. Nothing else removes
+   it: `reap` only fires on tasks whose folder is already gone, so a task folder
+   that is kept for its notes keeps three checkouts alive with it.
+
+   A worktree holding commits the source's remote has never seen is KEPT, and
+   said so, because that is also what an unpushed day of work looks like. Same
+   rule reap uses, and `--force` is the same override."
+  [ctx force?]
+  (let [rows (task-lib/read-sessions-tsv ctx)
+        branch (task-lib/task-branch ctx)
+        by-repo (into {} (for [r rows :when (:repo r)] [(:repo r) r]))
+        sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
+                           [(:name r) (:path r)]))]
+    (vec
+     (for [[repo row] (sort by-repo)
+           :let [worktree (:worktree-path row)
+                 source (get sources repo)]]
+       (cond
+         (not (and worktree (fs/directory? worktree)))
+         (str "  " repo ": already gone")
+
+         (and source (not force?) (not (pushed? source branch)))
+         (str "  " repo ": kept — " branch " is not on origin; --force to remove it anyway")
+
+         :else
+         (do
+           ;; `worktree remove` refuses a tree with untracked files in it, and a
+           ;; worktree that has built anything is nothing but untracked files.
+           (process/sh {:continue true :dir (str worktree)} "git" "clean" "-xdf")
+           (process/sh {:continue true :dir (str worktree)} "git" "worktree" "remove" "--force" (str worktree))
+           (when (fs/directory? worktree) (fs/delete-tree worktree))
+           (when source
+             (process/sh {:continue true :dir (str source)} "git" "worktree" "prune")
+             (process/sh {:continue true :dir (str source)} "git" "branch" "-D" branch))
+           (str "  " repo ": worktree removed, " branch " deleted from " (or source "its source"))))))))
+
 (defn close!
   "Tear the swarm down: archive panes, stop the daemon, kill the tmux server,
-   drop the trust entries open added."
-  [task-id]
-  (let [ctx (task-lib/task-ctx task-id)]
-    (when (server-up? ctx)
-      (handoff-lib/archive-all! ctx))
-    (stop-handoffd! ctx)
-    (kill-server! ctx)
-    (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
-    ctx))
+   drop the trust entries open added. With `reclaim?`, also give the disk back."
+  ([task-id] (close! task-id false false))
+  ([task-id reclaim? force?]
+   (let [ctx (task-lib/task-ctx task-id)]
+     (when (server-up? ctx)
+       (handoff-lib/archive-all! ctx))
+     (stop-handoffd! ctx)
+     (kill-server! ctx)
+     (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
+     (when reclaim?
+       (println "reclaiming:")
+       (doseq [line (reclaim! ctx force?)] (println line)))
+     ctx)))

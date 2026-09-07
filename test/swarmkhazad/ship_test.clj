@@ -712,3 +712,86 @@
         (is (str/includes? (slurp (str (fs/path dir "state" "pr" "gobel.json"))) "pull/1")
             "and the push still worked, so this is not a guard that passes by doing nothing")))))
 
+(def merged-pr
+  (str "{\"data\":{\"repository\":{\"pullRequest\":{\"headRefOid\":\"a\",\"isDraft\":false,"
+       "\"state\":\"MERGED\",\"reviewThreads\":{\"nodes\":[]},\"comments\":{\"nodes\":[]},"
+       "\"commits\":{\"nodes\":[]}}}}}"))
+
+(deftest a-task-leaves-in-review-when-github-says-every-pr-has-landed
+  ;; `state` has been in the query since the first version and was discarded on
+  ;; every poll, so a shipped task sat in `in-review` for ever — and a lane that
+  ;; exists to say "waiting, not stalled" became the stall it was distinguishing
+  ;; itself from.
+  (with-shipped-task
+    (fn [{:keys [dir poll graphql!] :as h}]
+      (ship! h)
+      (let [card #(first (str/split-lines (slurp (str (fs/path dir "state" "board" "tasks.tsv")))))]
+        (is (str/starts-with? (card) "t-ship\tin-review\t") (card))
+        (testing "one merged and one still open is still in review"
+          (graphql! "gobel" merged-pr)
+          (graphql! "cirdan" quiet-pr)
+          (let [r (poll)]
+            (is (zero? (:exit r)))
+            (is (not (str/includes? (:out r) "settled"))
+                "a task ships one branch per repo and is over when the LAST one lands"))
+          (is (str/starts-with? (card) "t-ship\tin-review\t") (card))
+          (is (str/includes? (slurp (str (fs/path dir "state" "pr" "gobel.json"))) "\"state\" : \"MERGED\"")
+              "though what GitHub said about each one is recorded as it arrives"))
+        (testing "and done once the last one does"
+          (graphql! "cirdan" (str/replace merged-pr "MERGED" "CLOSED"))
+          (let [r (poll)]
+            (is (str/includes? (:out r) "settled")
+                (str "the card should have moved: " (:out r))))
+          (is (str/starts-with? (card) "t-ship\tdone\t") (card)))
+        (testing "and it does not keep re-settling a card that already moved"
+          (let [r (poll)]
+            (is (not (str/includes? (:out r) "settled")))))))))
+
+(deftest close-reclaim-gives-the-disk-back-but-never-unpushed-work
+  ;; Where the space is: a worktree is a checkout, and a checkout that has built
+  ;; anything is mostly untracked output — 6.4G across three of them in the task
+  ;; that started this, none of it in git. `reap` cannot reach it, because reap
+  ;; only fires on tasks whose folder is already gone.
+  (with-shipped-task
+    (fn [{:keys [dir sandbox env] :as h}]
+      (let [wt (fs/path dir "worktrees" "gobel")
+            close (fn [& args]
+                    (apply run {:env env :ok? false} cli "close" "t-ship" args))
+            branches (fn [name]
+                       (->> (str/split-lines (git (fs/path sandbox "src" name)
+                                                  "for-each-ref" "--format=%(refname:short)" "refs/heads/"))
+                            (remove str/blank?) set))]
+        (write! (fs/path wt "build" "huge.bin") "untracked build output\n")
+        (testing "nothing shipped yet, so nothing is removed"
+          (let [r (close "--reclaim")]
+            (is (zero? (:exit r)) (:err r))
+            (is (str/includes? (:out r) "is not on origin; --force to remove it anyway"))
+            (is (fs/directory? wt) "an unpushed worktree is a day of work nobody can get back")
+            (is (contains? (branches "gobel") "sk/t-ship"))))
+        (ship! h)
+        (testing "once it is on origin the worktree, its build output and the branch all go"
+          (let [r (close "--reclaim")]
+            (is (zero? (:exit r)) (:err r))
+            (is (str/includes? (:out r) "worktree removed"))
+            (is (not (fs/directory? wt)))
+            (is (not (fs/exists? (fs/path wt "build" "huge.bin"))))
+            (is (not (contains? (branches "gobel") "sk/t-ship"))
+                "and the branch it left in the operator's own checkout")
+            (is (not (fs/directory? (fs/path sandbox "src" "gobel" ".git" "worktrees")))
+                "with its registration pruned, which is what reap otherwise has to come back for")))
+        (testing "the task folder itself is untouched — its notes outlive its checkouts"
+          (is (fs/regular-file? (fs/path dir "goal.md")))
+          (is (fs/regular-file? (fs/path dir "state" "pr" "gobel.json"))))
+        (testing "and a second close says so rather than failing"
+          (let [r (close "--reclaim")]
+            (is (zero? (:exit r)))
+            (is (str/includes? (:out r) "already gone"))))))))
+
+(deftest close-without-reclaim-removes-nothing
+  (with-shipped-task
+    (fn [{:keys [dir env] :as h}]
+      (ship! h)
+      (is (zero? (:exit (run {:env env :ok? false} cli "close" "t-ship"))))
+      (is (fs/directory? (fs/path dir "worktrees" "gobel"))
+          "close has always meant `stop the swarm`; giving the disk back is asked for, never assumed"))))
+

@@ -37,22 +37,38 @@
        "  Without --force, only branches holding no commits are deleted; one\n"
        "  that holds work is listed and left alone.\n"))
 
+(defn- lines [text]
+  (remove str/blank? (str/split-lines (str text))))
+
 (defn sk-branches
-  "The sk/* branches in a checkout, each with how far it is ahead of the base
-   it was started from — the count of commits that deleting it would lose."
+  "The sk/* branches in a checkout: which worktree holds each, and how far it is
+   ahead of the base it started from — the commits deleting it would lose.
+
+   `%(worktreepath)` rather than a comparison against the source's own HEAD.
+   That comparison saw only the checkout reap is standing in, so a branch held
+   by any OTHER linked worktree — one of yours, or one this tool left behind —
+   read as deletable; `git branch -D` refused, `task-lib/git` threw on the
+   non-zero exit, and the sweep died there, with some checkouts reaped and the
+   rest untouched. git knows the answer and gives it in the same call.
+
+   `--merged` gives the safe set in one more call, so `rev-list` runs only for
+   the branches that actually hold work — usually none of them."
   [repo]
   (let [base (task-lib/source-default-branch repo)
-        current (task-lib/git repo "rev-parse" "--abbrev-ref" "HEAD")]
-    (for [b (str/split-lines (task-lib/git repo "for-each-ref" "--format=%(refname:short)" "refs/heads/sk/"))
-          :when (not (str/blank? b))]
+        merged (set (lines (task-lib/git repo "for-each-ref" "--merged" base
+                                         "--format=%(refname:short)" "refs/heads/sk/")))]
+    (for [line (lines (task-lib/git repo "for-each-ref"
+                                    "--format=%(refname:short)%09%(worktreepath)"
+                                    "refs/heads/sk/"))
+          :let [[b worktree] (str/split line #"\t" -1)]]
       {:branch b
        :task-id (subs b (count "sk/"))
-       ;; The branch a worktree has checked out is not ours to delete, and git
-       ;; would refuse anyway. Saying so beats an error nobody can act on.
-       :checked-out (= b current)
-       :ahead (let [r (process/sh {:continue true :dir (str repo)}
-                                  "git" "rev-list" "--count" (str base ".." b))]
-                (if (zero? (:exit r)) (parse-long (str/trim (:out r))) 0))})))
+       :worktree (not-empty worktree)
+       :ahead (if (merged b)
+                0
+                (let [r (process/sh {:continue true :dir (str repo)}
+                                    "git" "rev-list" "--count" (str base ".." b))]
+                  (if (zero? (:exit r)) (parse-long (str/trim (:out r))) 0)))})))
 
 (defn live-task? [task-id]
   (fs/directory? (fs/path (task-lib/tasks-dir) task-id)))
@@ -65,11 +81,13 @@
   ;; is what makes the branch deletable.
   (task-lib/git repo "worktree" "prune")
   (vec
-   (for [{:keys [branch task-id ahead checked-out]} (sk-branches repo)]
+   (for [{:keys [branch task-id ahead worktree]} (sk-branches repo)]
      (let [live (live-task? task-id)
            reason (cond
                     live "its task folder is still there"
-                    checked-out "the checkout has it checked out"
+                    ;; Not ours to delete, and git would refuse anyway. Saying
+                    ;; which worktree holds it beats an error nobody can act on.
+                    worktree (str "a worktree still has it: " worktree)
                     (and (pos? ahead) (not force?)) (str "it holds " ahead " commit(s); --force to delete anyway")
                     :else nil)]
        (when-not reason
@@ -83,7 +101,15 @@
     (System/exit 0))
   (let [force? (boolean (some #{"--force"} args))
         repos (project-lib/available-repos)
-        rows (mapcat #(reap-repo! % force?) repos)
+        ;; A checkout that cannot be read is one line of output, not the end of
+        ;; the sweep: reap exists to clean up after things that went wrong, so
+        ;; it has to survive finding one.
+        rows (mapcat (fn [r]
+                       (try (reap-repo! r force?)
+                            (catch Exception e
+                              [{:repo (task-lib/repo-name r) :branch "-" :ahead 0 :deleted false
+                                :kept (str "could not be read: " (.getMessage e))}])))
+                     repos)
         {deleted true kept false} (group-by :deleted rows)]
     (println (str "scanned " (count repos) " checkout(s) under "
                   (str/join ", " (project-lib/default-repo-roots))))

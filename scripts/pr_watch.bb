@@ -34,6 +34,7 @@
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
+(load-file (str (fs/path script-dir "board_lib.bb")))
 
 (def sender
   "The phantom sender for machine-originated mail. handoffd files a phantom's
@@ -319,8 +320,8 @@
 
 (defn poll-repo!
   "One PR. Returns a line per thing it did, for the caller to print or log."
-  [ctx pr-row]
-  (let [pr (fetch pr-row)]
+  [ctx pr-row pr]
+  (let []
     (if (:error pr)
       [(str "pr " (:repo pr-row) ": " (:error pr))]
       (let [repo (:repo pr-row)
@@ -376,13 +377,47 @@
                     (recur more (update state :handled conj (:id item))
                            (conj out (str "handoff    " repo "  " (:kind item) " → " recipient))))))))))))
 
+(def settled-states
+  "A PR nobody is waiting on any more. GitHub already tells us on every poll —
+   the query has asked for `state` since the first version and threw it away, so
+   a task sat in `in-review` for ever and the lane that exists to say \"waiting,
+   not stalled\" became the stall."
+  #{"MERGED" "CLOSED"})
+
+(defn settle!
+  "Record each PR's state, and move the card to done once none is open.
+
+   Every repo, not the first: a task ships one branch per repo and is over when
+   the last of them lands. `set-lane!` rather than `hand-off!` — no session is
+   handing anything off, GitHub is."
+  [ctx states]
+  (when (seq states)
+    (doseq [[repo state] states]
+      (let [f (fs/path (pr-dir ctx) (str repo ".json"))]
+        (when (fs/regular-file? f)
+          (when-let [m (try (json/parse-string (slurp (str f)) true) (catch Exception _ nil))]
+            (spit (str f) (str (json/generate-string (assoc m :state state) {:pretty true}) "\n"))))))
+    (when (every? settled-states (vals states))
+      (let [lane (try (board-lib/card-lane ctx (:task-id ctx)) (catch Exception _ nil))]
+        (when (= board-lib/review-lane lane)
+          (board-lib/set-lane! ctx (:task-id ctx) "done")
+          [(str "settled    every PR is " (str/join "/" (distinct (vals states)))
+                " — the card is done")])))))
+
 (defn poll!
   "Every shipped PR, once. Never throws: this runs inside handoffd's loop, and
    a GitHub outage must not take the daemon down with it."
   [ctx]
-  (vec (mapcat (fn [row] (try (poll-repo! ctx row)
-                              (catch Exception e [(str "pr " (:repo row) ": " (.getMessage e))])))
-               (shipped ctx))))
+  (let [rows (shipped ctx)
+        states (atom {})
+        out (vec (mapcat (fn [row]
+                           (try
+                             (let [pr (fetch row)]
+                               (when-let [s (:state pr)] (swap! states assoc (:repo row) s))
+                               (poll-repo! ctx row pr))
+                             (catch Exception e [(str "pr " (:repo row) ": " (.getMessage e))])))
+                         rows))]
+    (into out (when (= (count @states) (count rows)) (settle! ctx @states)))))
 
 (defn -main [& args]
   (when (some #{"--help" "-h"} args) (print usage-text) (System/exit 0))
