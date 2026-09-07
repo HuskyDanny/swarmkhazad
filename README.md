@@ -156,7 +156,7 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 - `/` — every task with its board lane, roles and attention count, plus the kickstart form: task id, one local checkout per line, the `roles` declaration (stage prompts, harnesses and vendors listed under it). Submitting runs `new`, writes `roles`, starts `open` in the background (`state/portal-open.log`) and redirects to the task page.
 - `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
 - `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
-- `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`allowed-doc?`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
+- `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`doc-file`: canonical path under the task folder, never under `repos/` or `worktrees/`, never through a symlink that leaves it).
 
 ## Intake from Linear
 
