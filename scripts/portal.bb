@@ -9,12 +9,19 @@
 ;;                              files, the board card, Attention, role cards
 ;;   /tasks/<id>/roles/<role>   the role's pane, streamed by polling
 ;;   /tasks/<id>/roles/<role>/pane   text/plain: live tmux capture, else the archive
+;;   POST /tasks/<id>/roles/<role>/keys  type into that pane, or Escape to interrupt it
+;;   POST /projects/<name>/review    sort a pasted brief, then show it for review
+;;   POST /tasks/<id>/summary   ask whether the work is ready to merge, for its goals
+;;   /projects                  POST: create a project (checkouts + role lineup)
+;;   /projects/<name>/new       the only task form: goal, not-goal, bars
+;;   /projects/<name>/tasks     POST: scaffold from the project, then open
 ;;   /tasks/<id>/doc?path=<rel> any text file inside the task folder (doc-file)
 ;;   POST /tasks                kickstart: new + roles + open, then redirect
 ;;
 ;; Nothing here writes into a task folder except kickstart, which only calls the
 ;; CLI. The portal never ticks a goal box: the checkboxes show what the judge
-;; said, and goal.md itself stays 444.
+;; said, and goal.md itself stays 444. The keys route writes nothing either —
+;; it types into a terminal the page already prints the attach command for.
 
 (ns portal
   (:require [babashka.fs :as fs]
@@ -26,10 +33,13 @@
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "task_lib.bb")))
+(load-file (str (fs/path script-dir "project_lib.bb")))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 (load-file (str (fs/path script-dir "board_lib.bb")))
 (load-file (str (fs/path script-dir "run_evidence.bb")))
 (load-file (str (fs/path script-dir "telemetry.bb")))
+(load-file (str (fs/path script-dir "ask.bb")))
+(load-file (str (fs/path script-dir "summary.bb")))
 
 (def cli (str (fs/path script-dir "swarmkhazad.bb")))
 (def default-port 8765)
@@ -125,16 +135,121 @@
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
 
+(defn- assoc-or-dissoc [m k on?]
+  (if on? (assoc m k (str (java.time.Instant/now))) (dissoc m k)))
+
+(defn attention-key
+  "A stable id for one attention item. Escalations are append-only bullets and
+   the other kinds are derived from files, so the text is the only thing that
+   survives a re-render — there is no row id to use. Hashed because the raw text
+   is a paragraph and this goes in a form field."
+  [{:keys [kind text]}]
+  (let [d (java.security.MessageDigest/getInstance "SHA-1")
+        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
+    (apply str (map #(format "%02x" %) (take 8 b)))))
+
+(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
+
+(defn handled
+  "key → when it was crossed off. A separate file, never escalation.md: the
+   roles own that one and append to it, and a portal that edited it would be
+   rewriting what a role said rather than recording what a person did about it."
+  [ctx]
+  (into {} (for [l (nonblank-lines (text (handled-file ctx)))
+                 :let [[k at] (str/split l #"\t" 2)]
+                 :when (seq k)]
+             [k (or at "")])))
+
+(defn set-handled!
+  "Cross one off, or put it back. Rewrites the file rather than appending, so
+   unticking actually removes the row instead of leaving both states in it."
+  [ctx key on?]
+  (let [now (assoc-or-dissoc (handled ctx) key on?)]
+    (fs/create-dirs (:state-dir ctx))
+    (spit (str (handled-file ctx))
+          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))
+
+(defn open-attention
+  "What still needs a human: the list minus what someone has crossed off. Both
+   the swimlane card and the task page count this, so `3 needs you` on the board
+   and `Attention 3` on the page cannot disagree."
+  [ctx]
+  (let [done (handled ctx)]
+    (remove #(contains? done (attention-key %)) (attention ctx))))
+
 (defn roles [ctx]
   (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
 
+(def sgr-class
+  "The SGR codes an agent TUI actually emits, and the class each becomes.
+   Anything else — 256-colour, truecolour, underline, blink — is dropped rather
+   than guessed at, because a wrong colour reads as meaning that is not there."
+  {"1" "b" "2" "d" "3" "i"
+   "30" "f0" "31" "f1" "32" "f2" "33" "f3" "34" "f4" "35" "f5" "36" "f6" "37" "f7"
+   "90" "f8" "91" "f9" "92" "f10" "93" "f11" "94" "f12" "95" "f13" "96" "f14" "97" "f15"
+   "40" "g0" "41" "g1" "42" "g2" "43" "g3" "44" "g4" "45" "g5" "46" "g6" "47" "g7"})
+
+(defn ansi->hiccup
+  "Turn a pane capture into hiccup, one span per run of styling. Escapes that
+   are not SGR are dropped: tmux emits cursor moves and title sets that mean
+   nothing inside a <pre>. The text itself is never touched, so hiccup escapes
+   it exactly as it escapes any other string.
+
+   Walks the string with a Matcher rather than a regex that also matches the
+   text between escapes. A pattern like `(?:[^\u001b]|...)+` recurses once per
+   character in Java's engine, so a pane holding a few thousand plain characters
+   threw StackOverflowError and the whole page 500'd — which is what a task
+   whose panes are spinning on an error looks like, i.e. exactly the page you
+   most want to load.
+
+   Returns a SEQ, not a vector — hiccup reads a vector as an element, so
+   returning one renders the first child as a tag name."
+  [s]
+  (let [s (str/replace (or s "") #"\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)" "")
+        m (re-matcher #"\u001b\[([0-9;]*)m" s)
+        clean #(str/replace % #"\u001b\[[0-9;?]*[@-~]" "")]
+    (loop [pos 0 active #{} out []]
+      (if (.find m)
+        (let [text (clean (subs s pos (.start m)))
+              out (if (seq text)
+                    (conj out (if (seq active)
+                                [:span {:class (str/join " " (sort active))} text]
+                                text))
+                    out)]
+          (recur (.end m)
+                 (reduce (fn [acc c]
+                           (cond
+                             (contains? #{"" "0"} c) #{}
+                             (contains? sgr-class c) (conj acc (sgr-class c))
+                             :else acc))
+                         active
+                         (str/split (.group m 1) #";"))
+                 out))
+        (let [text (clean (subs s pos))]
+          (seq (if (seq text)
+                 (conj out (if (seq active)
+                             [:span {:class (str/join " " (sort active))} text]
+                             text))
+                 out)))))))
+
+(defn pane-state
+  "Whether the pane the rail shows is a running tmux session, the capture taken
+   when the task closed, or nothing yet. A closed task still has a terminal to
+   read — that is the whole point of archiving it at close."
+  [ctx role]
+  (cond
+    (not-empty (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))) :live
+    (text (fs/path (:sessions-dir ctx) role "pane.txt")) :archived
+    :else :none))
+
 (defn pane-text
   "The live pane when the task's tmux server is up, else the archived capture."
-  [ctx role]
-  (let [live (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))
+  ([ctx role] (pane-text ctx role {}))
+  ([ctx role {:keys [ansi]}]
+  (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
         archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))
         s (or (not-empty live) archived "")]
-    (str/join "\n" (take-last pane-tail-lines (str/split-lines s)))))
+    (str/join "\n" (take-last pane-tail-lines (str/split-lines s))))))
 
 (defn role-cards [ctx]
   (let [vs (verdicts ctx)]
@@ -168,30 +283,72 @@
                  (not (fs/starts-with? file (fs/path root "worktrees"))))
         file))))
 
-;; ---------------------------------------------------------------- kickstart
+;; ---------------------------------------------------------------- projects
 
 (defn parse-form [body]
   (into {} (for [pair (str/split (or body "") #"&") :when (not (str/blank? pair))
                  :let [[k v] (str/split pair #"=" 2)]]
              [(java.net.URLDecoder/decode k "UTF-8") (java.net.URLDecoder/decode (or v "") "UTF-8")])))
 
-(defn kickstart!
-  "new <id> --repo … ; write roles ; open in the background. Returns {:ok id} or {:error msg}."
-  [{:strs [task-id repos roles]}]
+(defn create-project!
+  "Write a project from the form. Repos come from the checkbox list plus any
+   typed paths; roles come from the cards that were ticked, in the order the
+   stage prompts are listed, which is the order the swimlane columns take."
+  [{:strs [name extra-repos] :as params}]
+  (let [nm (str/trim (or name ""))
+        picked (->> (keys params)
+                    (keep #(second (re-matches #"repo:(.+)" %)))
+                    sort)
+        repos (vec (distinct (concat picked (nonblank-lines extra-repos))))
+        roles (vec (for [stage (project-lib/stage-prompts)
+                         :when (get params (str "role:" stage))]
+                     {:role stage
+                      :harness (or (get params (str "harness:" stage)) "claude")
+                      :model (or (get params (str "model:" stage)) "anthropic")
+                      :repo (or (not-empty (get params (str "repo-of:" stage))) (first repos))}))]
+    (cond
+      (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
+      (project-lib/read-project nm) {:error (str "project already exists: " nm)}
+      (empty? repos) {:error "pick at least one checkout"}
+      (empty? roles) {:error "pick at least one role"}
+      (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
+                                                              (first (remove task-lib/git-checkout? repos)))}
+      (not (every? #(contains? (set repos) (:repo %)) roles))
+      {:error "a role was pointed at a checkout this project does not hold"}
+      (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
+      :else (do (project-lib/write-project! {:name nm :repos repos :roles roles})
+                {:ok nm}))))
+
+(defn kickstart-project!
+  "A task inside a project: the repos and the role lineup come from the project,
+   so the form contributes only the brief — one pasted block that parse-brief
+   splits into the goal, the not-goals and the bars."
+  [project {:strs [task-id brief]}]
   (let [id (str/trim (or task-id ""))
-        repo-list (nonblank-lines repos)
-        roles-text (str (str/trim (or roles "")) "\n")]
+        {:keys [goal not-goal bars seen]} (project-lib/parse-brief brief)
+        ctx (when (task-lib/valid-task-id? id) (task-lib/task-ctx id))]
     (cond
       (not (task-lib/valid-task-id? id)) {:error (str "invalid task id: " (pr-str id))}
-      (fs/exists? (:task-dir (task-lib/task-ctx id))) {:error (str "task already exists: " id)}
-      (str/blank? (str/trim roles-text)) {:error "declare at least one role"}
+      (fs/exists? (:task-dir ctx)) {:error (str "task already exists: " id)}
+      ;; Refusing here is the point. Taking an unstructured paste as goal lines
+      ;; is what turned one brief into twenty-five checkboxes, and a task opens
+      ;; with those locked 444 — the swarm then runs against them for an hour.
+      (empty? seen) {:error (str "no section headings found — give the brief a `Goal` heading "
+                                 "(and `Not-goal` / `Bars` if it has them). "
+                                 "Near spellings are fine; the text above the first heading is ignored.")}
+      (empty? goal) {:error (str "the Goal section is empty — found "
+                                 (str/join ", " (sort (map name seen))))}
       :else
-      (let [ctx (task-lib/task-ctx id)
-            new (apply process/sh {:continue true} "bb" cli "new" id (mapcat #(vector "--repo" %) repo-list))]
+      (let [new (apply process/sh {:continue true} "bb" cli "new" id
+                       (mapcat #(vector "--repo" %) (:repos project)))]
         (if-not (zero? (:exit new))
           {:error (str "new failed: " (:err new))}
           (do
-            (spit (str (:roles-file ctx)) roles-text)
+            (spit (str (:goal-file ctx)) (project-lib/goal-md id goal not-goal))
+            (when (seq bars)
+              (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
+            (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
+            (spit (str (:roles-file ctx)) (project-lib/roles-text project))
             (fs/create-dirs (:state-dir ctx))
             (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
               (process/process ["bb" cli "open" id] {:out log :err log}))
@@ -234,6 +391,15 @@
    .lane{font-size:.9rem;color:var(--blue);white-space:nowrap}
    .lane.done{color:var(--green)}
    .muted{color:var(--muted);font-size:.85rem}
+   .att{display:flex;align-items:flex-start;gap:.55rem;margin-bottom:.4rem}
+   .att .item{flex:1;min-width:0;margin-bottom:0}
+   .att form{flex:none;padding-top:.72rem}
+   button.tick{width:17px;height:17px;padding:0;border-radius:5px;background:var(--surface);
+     border:1px solid var(--muted);color:#fff;font-size:11px;line-height:1;cursor:pointer}
+   button.tick:hover{border-color:var(--accent)}
+   .att.off button.tick{background:var(--green);border-color:var(--green)}
+   .att.off .kind{color:var(--muted)}
+   .att.off summary .grow{text-decoration:line-through;color:var(--muted)}
    .attention .item{border:1px solid var(--line);border-radius:12px;margin-bottom:.4rem}
    .attention summary{display:flex;align-items:center;gap:.75rem;padding:.7rem 1.1rem;
      cursor:pointer;list-style:none}
@@ -275,6 +441,68 @@
      border-radius:10px;padding:.6rem 1.2rem;cursor:pointer;white-space:nowrap;flex:none}
    .err{color:var(--red);font-size:.9rem;margin:0 0 .5rem}
    .empty{color:var(--muted);font-size:.9rem;padding:.6rem 0}
+   main.wide{max-width:1560px}
+   .split{display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,600px);gap:1.6rem;
+     align-items:start}
+   .rail{position:sticky;top:1.4rem}
+   .tabs{display:flex;gap:.3rem;margin-bottom:.5rem;flex-wrap:wrap}
+   .tab{font-size:.82rem;color:var(--muted);text-decoration:none;padding:.28rem .7rem;
+     border:1px solid var(--line);border-radius:999px;white-space:nowrap}
+   .tab.on{color:var(--ink);background:var(--row);border-color:var(--row)}
+   .railhead{display:flex;align-items:baseline;gap:.75rem;margin-bottom:.35rem}
+   .railhead .status{flex:1;min-width:0}
+   .rail pre{margin:0;max-height:72vh;min-height:320px}
+   .nudge{display:flex;gap:.4rem;margin-top:.5rem}
+   .nudge input[type=text]{padding:.45rem .7rem;font-size:.85rem}
+   .nudge button{padding:.45rem .95rem;font-size:.85rem}
+   button.ghost{color:var(--muted);background:none;border:1px solid var(--line)}
+   button.ghost:hover{color:var(--red);border-color:var(--red)}
+   pre.term{background:#16150f;border-color:#2a2822;color:#d6d2c4;font-size:12px;
+     line-height:1.45;padding:.9rem 1rem}
+   pre.term .b{font-weight:700}
+   pre.term .d{opacity:.62}
+   pre.term .i{font-style:italic}
+   pre.term .f0{color:#5c5850}pre.term .f1{color:#e06c5f}pre.term .f2{color:#88b874}
+   pre.term .f3{color:#d5a24a}pre.term .f4{color:#6f9bd1}pre.term .f5{color:#b98cc9}
+   pre.term .f6{color:#5fb3b3}pre.term .f7{color:#d6d2c4}
+   pre.term .f8{color:#7d7871}pre.term .f9{color:#f0897c}pre.term .f10{color:#a4d18f}
+   pre.term .f11{color:#e8bf6a}pre.term .f12{color:#8fb7e3}pre.term .f13{color:#cfa7dd}
+   pre.term .f14{color:#7fcdcd}pre.term .f15{color:#f2efe6}
+   pre.term .g0{background:#2a2822}pre.term .g1{background:#5a2b26}
+   pre.term .g2{background:#31462a}pre.term .g3{background:#5a4520}
+   pre.term .g4{background:#2c3f57}pre.term .g5{background:#452f4d}
+   pre.term .g6{background:#26494a}pre.term .g7{background:#403c34}
+   @media(max-width:1100px){.split{grid-template-columns:minmax(0,1fr)}
+     .rail{position:static;margin-top:1.6rem}}
+   .project{margin:0 0 2.4rem}
+   .project-head{display:flex;align-items:baseline;gap:.75rem;margin:0 0 .7rem}
+   .pname{font-size:1.05rem;font-weight:600;color:var(--ink);margin:0;letter-spacing:-.01em}
+   .project-head .muted{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+   .btn{font-size:.85rem;font-weight:500;color:#fff;background:var(--accent);border-radius:8px;
+     padding:.35rem .8rem;text-decoration:none;white-space:nowrap}
+   .btn:hover{filter:brightness(1.06)}
+   .swim{display:flex;gap:.5rem;min-width:min-content}
+   .col{flex:1 0 190px;min-width:190px}
+   .colname{font-size:.72rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--muted);padding:0 .2rem .4rem}
+   .slot{min-height:96px;border:1px dashed var(--line);border-radius:12px;padding:.4rem;
+     background:transparent}
+   .col.live .slot{border-style:solid}
+   .tcard{display:block;background:var(--surface);border:1px solid var(--line);border-radius:10px;
+     padding:.6rem .7rem;margin-bottom:.4rem;text-decoration:none;color:inherit}
+   .tcard:hover{background:var(--row)}
+   .tcard .name{font-weight:600;font-size:.92rem;margin-bottom:.15rem}
+   .picklist{max-height:210px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;
+     background:var(--surface);padding:.35rem .5rem;margin-top:.25rem}
+   .pick{display:flex;align-items:center;gap:.5rem;padding:.18rem 0;font-size:.85rem;color:var(--ink)}
+   .pick input{flex:none}
+   .rolepick{margin:.3rem 0 .7rem;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
+   .rolecard{cursor:pointer}
+   .rolecard .card-top{margin-bottom:.4rem}
+   select{font:inherit;font-size:.85rem;color:inherit;background:var(--surface);
+     border:1px solid var(--line);border-radius:8px;padding:.3rem .4rem;width:100%}
+   .fields.stack{display:block}
+   .fields.stack>label{display:block;min-width:0;margin-bottom:.7rem}
    .composer summary{max-width:1040px;margin:0 auto;list-style:none;cursor:pointer;
      background:var(--surface);border:1px solid var(--line);border-radius:12px;
      padding:.75rem 1rem;color:var(--muted);font-size:.95rem}
@@ -286,11 +514,39 @@
    .card-top{display:flex;align-items:center;justify-content:space-between}
    .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}")
 
+(def poll-script
+  "Two loops. The pane is appended to every two seconds and keeps its scroll
+   unless the reader had it at the bottom; the detail column is re-fetched every
+   five and swapped whole. They never touch each other's DOM, which is why the
+   terminal survives a page that is still live.
+
+   The swap has to carry two things across, because the server has no idea they
+   exist. An unchanged column is not swapped at all — most polls change nothing,
+   and replacing the node drops the reader's text selection every five seconds.
+   And an escalation the reader opened is re-opened afterwards: a fresh <details>
+   has no `open` attribute, so expanding one used to snap shut on the next poll,
+   which reads as the page fighting you. The key is the summary text rather than
+   a position, so an escalation appended above another does not hand its open
+   state to a different row."
+  (str "const P=()=>document.getElementById('pane');"
+       "setInterval(async()=>{const p=P();if(!p)return;"
+       "const r=await fetch('/tasks/'+encodeURIComponent(p.dataset.task)+'/roles/'+encodeURIComponent(p.dataset.role)+'/pane');"
+       "if(!r.ok)return;const stick=p.scrollTop+p.clientHeight>=p.scrollHeight-8;"
+       "p.textContent=await r.text();if(stick)p.scrollTop=p.scrollHeight;},2000);"
+       "const K=x=>x.querySelector('summary')?.textContent;"
+       "setInterval(async()=>{const d=document.getElementById('detail');if(!d)return;"
+       "const r=await fetch(location.href);if(!r.ok)return;"
+       "const n=new DOMParser().parseFromString(await r.text(),'text/html').getElementById('detail');"
+       "if(!n||n.innerHTML===d.innerHTML)return;"
+       "const open=new Set([...d.querySelectorAll('details[open]')].map(K));"
+       "n.querySelectorAll('details').forEach(x=>{if(open.has(K(x)))x.open=true});"
+       "d.replaceWith(n);},5000);"))
+
 (defn page
   "One shell: an accent mark, the product name linking home, and a crumb —
    no nav bar, because there are only three kinds of page. The composer is a
    plain child; being position:fixed it needs no help from here."
-  [{:keys [crumb title refresh]} & body]
+  [{:keys [crumb title refresh rail wide poll]} & body]
   (str "<!doctype html>"
        (h/html [:html [:head [:meta {:charset "utf-8"}]
                        [:meta {:name "viewport" :content "width=device-width,initial-scale=1"}]
@@ -298,10 +554,13 @@
                        [:title (str title " · swarmkhazad")]
                        [:style (h/raw css)]]
                 [:body
-                 [:main
+                 [:main {:class (when wide "wide")}
                   [:h1.title [:span.mark "✳"] [:a {:href "/"} "swarmkhazad"]
                    (when crumb [:span.sub crumb])]
-                  body]]])))
+                  (if rail
+                    [:div.split [:div#detail body] rail]
+                    body)]
+                 (when poll [:script (h/raw poll-script)])]])))
 
 (defn html [status & body] {:status status :headers {"Content-Type" "text/html; charset=utf-8"} :body (apply str body)})
 (defn plain [status s] {:status status :headers {"Content-Type" "text/plain; charset=utf-8"} :body (str s)})
@@ -310,52 +569,259 @@
 (def default-roles
   "implement claude <repo-path> task\nreview claude <repo-path> task\nrun claude <repo-path> task")
 
-(defn kickstart-form
-  "A composer pinned to the bottom, closed until you reach for it — <details>
-   does the toggle, so the page still carries no script. An error forces it open
-   and keeps what was typed, or the reason costs the reader their input."
+(defn project-form
+  "New project: a name, the checkouts found under the repo roots, and the role
+   cards. The roles are picked once here so no task ever asks for them again."
   [error params]
-  (let [stages (->> (fs/glob (fs/path (fs/parent script-dir) "prompts") "*.prompt") (map #(str/replace (fs/file-name %) #"\.prompt$" "")) sort)]
+  (let [available (project-lib/available-repos)
+        picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
+        first-run? (empty? params)
+        default (set (map :role project-lib/default-roles))]
     [:details.composer {:open (boolean error)}
-     [:summary "Start a task — a task id, the checkouts, and who is in the swarm"]
+     [:summary "New project — the checkouts and the swarm, set once"]
      [:div.inner
       (when error [:p.err error])
-      [:form {:method "post" :action "/tasks"}
+      [:form {:method "post" :action "/projects"}
        [:div.fields
-        [:label "task id"
-         [:input {:type "text" :name "task-id" :placeholder "2026-09-06-something" :required true
-                  :value (get params "task-id" "")}]]
-        [:label "repos — one local checkout path per line"
-         [:textarea {:name "repos" :rows 2 :placeholder "/Users/you/repos/thing"} (get params "repos")]]
-        [:label (str "roles — " (str/trim task-lib/roles-grammar-comment))
-         [:textarea {:name "roles" :rows 3} (or (not-empty (get params "roles")) default-roles)]]]
+        [:label "project name"
+         [:input {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
+                  :value (get params "name" "")}]]
+        [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
+         [:div.picklist
+          (if (seq available)
+            (for [r available]
+              [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
+                                    :checked (contains? picked r)}]
+               [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
+            [:p.empty "no git checkouts found — type a path below"])]]
+        [:label "or paths not under those roots, one per line"
+         [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
+          (get params "extra-repos")]]]
+       [:p.muted "roles — the swimlane's columns, in this order"]
+       [:div.cards.rolepick
+        (for [stage (project-lib/stage-prompts)
+              :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
+          [:label.card.rolecard
+           [:div.card-top [:span.name stage]
+            [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
+           [:select {:name (str "model:" stage)}
+            (for [v (sort task-lib/known-vendors)]
+              [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
+           ;; Which checkout this role works in. One repo and there is nothing
+           ;; to choose; several and the choice is the whole point — a lineup
+           ;; silently pinned to repo one is how multi-repo stops being real.
+           (when (> (count picked) 1)
+             [:select {:name (str "repo-of:" stage)}
+              (for [r (sort picked)]
+                [:option {:value r :selected (= r (get params (str "repo-of:" stage)))}
+                 (task-lib/repo-name r)])])])]
        [:div.go
-        [:button {:type "submit"} "Open the swarm"]
-        [:span.muted "stage prompts: " (str/join ", " stages) " · harnesses: " (str/join ", " (sort task-lib/known-agents))
-         " · vendors: " (str/join ", " (sort task-lib/known-vendors))]]]]]))
+        [:button {:type "submit"} "Create project"]
+        [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]]]))
+
+(defn project-section
+  "One project: its role lanes as columns, its tasks as cards in the lane each
+   one is actually in. The lane comes from the task's own board, so a card moves
+   because a git handoff moved it, never because the portal said so."
+  [project]
+  (let [columns (conj (mapv :role (:roles project)) "done")
+        cards (for [id (project-lib/tasks-for (:name project))
+                    :let [ctx (task-lib/task-ctx id)]]
+                {:id id :lane (lane ctx) :attention (count (open-attention ctx))})
+        placed (set (map :lane cards))
+        stray (remove #(contains? (set columns) (:lane %)) cards)]
+    [:section.project
+     [:div.project-head
+      [:h2.pname (:name project)]
+      [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
+      (let [idle (project-lib/unused-repos project)]
+        (when (seq idle)
+          [:span.status.unmet "no role opens " (str/join ", " (map task-lib/repo-name idle))]))
+      [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
+     [:div.scroll
+      [:div.swim
+       (for [col columns]
+         [:div.col {:class (when (contains? placed col) "live")}
+          [:div.colname col]
+          [:div.slot
+           (for [c cards :when (= col (:lane c))]
+             [:a.tcard {:href (str "/tasks/" (:id c))}
+              [:div.name.trunc (:id c)]
+              (if (pos? (:attention c))
+                [:span.status.unmet (:attention c) " needs you"]
+                [:span.status.met "clear"])])]])]]
+     (when (seq stray)
+       [:p.muted "not in a lane yet: "
+        (interpose ", " (for [c stray] [:a {:href (str "/tasks/" (:id c))} (:id c) " (" (:lane c) ")"]))])]))
 
 (defn index-page [error params]
-  (let [ids (task-lib/list-task-ids)]
-    (page {:title "tasks"}
-          [:section
-           [:h2 "Tasks"]
-           (if (seq ids)
-             (for [id ids :let [ctx (task-lib/task-ctx id) att (attention ctx) l (lane ctx)]]
+  (let [projects (project-lib/list-projects)
+        owned (set (mapcat #(project-lib/tasks-for (:name %)) projects))
+        loose (remove owned (task-lib/list-task-ids))]
+    (page {:title "projects"}
+          (if (seq projects)
+            (for [p projects] (project-section p))
+            [:section [:h2 "Projects"]
+             [:p.empty "no projects yet — a project holds the checkouts and the swarm, so a task only has to say what it wants done. Open the composer below."]])
+          (when (seq loose)
+            [:section [:h2 "Tasks outside a project"]
+             (for [id loose :let [ctx (task-lib/task-ctx id) att (open-attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
-                [:div.grow
-                 [:div.name.trunc id]
+                [:div.grow [:div.name.trunc id]
                  [:div.muted.trunc (str/join ", " (map :role (roles ctx)))]]
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
-                  [:span.status.met "0 waiting"])
-                [:span.lane {:class (when (= "done" l) "done")} l]
-                [:span.chev "›"]])
-             [:p.empty "no tasks under " (str (task-lib/tasks-dir)) " — open the composer below to start one"])]
-          (kickstart-form error params))))
+                  [:span.status.met "clear"])
+                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane ctx)]
+                [:span.chev "›"]])])
+          ;; a plain child: .composer is position:fixed, so it needs no help
+          ;; from the shell to sit at the bottom of the viewport.
+          (project-form error (or params {})))))
 
-(defn task-page [ctx]
+(def brief-placeholder
+  "The shape a brief already has when it is written elsewhere, so the box asks
+   for nothing to be reformatted — headings, bullets, and the bars as a table."
+  (str "## Goal\n"
+       "- implement — superset mcp run starts on the built image, endpoints non-empty\n"
+       "- run — the staging pod goes 1/1 Ready and stays Ready\n\n"
+       "## Not-goal\n"
+       "- No ingress, no public origin, no DNS.\n"
+       "- Don't upgrade Superset to fix an import. Pin the dependency.\n\n"
+       "## Quantitative bars\n"
+       "| bar | measure |\n"
+       "|---|---|\n"
+       "| the import that fails now, resolves | `docker run --rm <img> -c '...'` |\n"
+       "| the failing string is gone | `kubectl -n superset logs deploy/superset-mcp` |"))
+
+(defn new-task-page
+  "The only form a task needs: what to do, what not to do, and how it is
+   measured. Repos and roles are the project's, shown but not asked for."
+  [project error params]
+  (page {:title (str "new task · " (:name project)) :crumb (:name project)}
+        [:section
+         [:h2 "New task in " (:name project)]
+         (when error [:p.err error])
+         [:div.row.head
+          [:div.grow
+           [:div.name "the swarm"]
+           [:div.muted (str/join " · " (for [{:keys [role model repo]} (:roles project)]
+                                         (str role " (" model ") in " (task-lib/repo-name (or repo "none")))))]]]
+         [:div.row.head
+          [:div.grow
+           [:div.name "checkouts"]
+           [:div.muted (str/join " · " (:repos project))
+            (let [idle (project-lib/unused-repos project)]
+              (when (seq idle)
+                [:span.status.pending "no role works in " (str/join ", " (map task-lib/repo-name idle))]))]]]
+         [:form {:method "post" :action (str "/projects/" (:name project) "/review")}
+          [:div.fields.stack
+           [:label "task id"
+            [:input {:type "text" :name "task-id" :required true
+                     :placeholder (str (java.time.LocalDate/now) "-something")
+                     :value (get params "task-id" "")}]]
+           ;; One box, because a brief is written somewhere else and arrives as
+           ;; one block. Three boxes asked the writer to take it apart by hand,
+           ;; and the way that fails is silent: paste everything into the first
+           ;; and every line of it becomes a goal.
+           [:label (str "the brief — paste it whole. Sections are found by their heading "
+                        "(Goal, Not-goal, Bars — near spellings are fine), and each line "
+                        "under one is an item. A goal line starting with a role is graded "
+                        "against that role.")
+            [:textarea {:name "brief" :rows 16 :placeholder brief-placeholder}
+             (get params "brief")]]]
+          [:div.go [:button {:type "submit"} "Sort it"]
+           [:span.muted "one model call splits it into goals, not-goals and bars; "
+            "you review before anything opens"]]]]))
+
+(defn review-page
+  "The step between pasting a brief and opening a swarm. The model sorted the
+   paste; this is where a person disagrees with it.
+
+   What is shown is the markdown itself, in one editable box, and it is parsed
+   again on submit by exactly the parser that read the paste. There is no path
+   from the model's answer into goal.md that does not go through the box — so
+   an edit here is the last word, and a model that added a goal nobody asked
+   for is one keystroke from gone."
+  [project {:keys [markdown parsed note cost model fell-back]} params]
+  (let [{:keys [goal not-goal bars]} parsed]
+    (page {:title (str "review · " (:name project)) :crumb (:name project)}
+          [:section
+           [:h2 "Review before the swarm opens"]
+           [:p.muted
+            (str (count goal) " goal, " (count not-goal) " not-goal, " (count bars) " bar")
+            (when-not (= 1 (count goal)) "s")
+            (cond
+              note (list " · " [:span.status.pending note])
+              cost (list " · sorted by " (or model "the model")
+                         (format " · $%.4f" (double cost))))]
+           (when (empty? goal)
+             [:p.err "No goal line survived. Edit the box below — a task cannot open without one."])
+           [:form {:method "post" :action (str "/projects/" (:name project) "/tasks")}
+            [:div.fields.stack
+             [:label "task id"
+              [:input {:type "text" :name "task-id" :required true
+                       :placeholder (str (java.time.LocalDate/now) "-something")
+                       :value (get params "task-id" "")}]]
+             [:label "the brief, sorted — edit anything, this is what opens"
+              [:textarea {:name "brief" :rows 20} markdown]]]
+            [:div.go
+             [:button {:type "submit"} "Open the swarm"]
+             [:span.muted "goal.md becomes read-only the moment it opens"]]]
+           ;; The paste is kept so Back is not the only way to start over from
+           ;; the original, which the model has by then already reworded.
+           [:details.item
+            [:summary [:span.kind "the paste"] [:span.muted "what was sorted"]]
+            [:div.full [:pre (get params "paste" "")]]]]
+          (when fell-back
+            [:p.muted "The model was not reached, so this is the parser's own split. "
+             "It only finds sections that already carry a heading."]))))
+
+(defn pane-rail
+  "The task's terminal, beside the task. `watching` is a role name; the tabs are
+   plain links carrying it in the query string, so which pane you are on is in
+   the URL and survives a reload rather than living in a variable."
+  [ctx watching]
+  (let [id (:task-id ctx)
+        names (map :role (roles ctx))
+        watching (or (some #{watching} names) (first names))
+        state (when watching (pane-state ctx watching))]
+    [:aside.rail
+     [:div.tabs
+      (for [r names]
+        [:a.tab {:href (str "/tasks/" id "?pane=" r) :class (when (= r watching) "on")} r])]
+     (if-not watching
+       [:p.empty "no roles declared"]
+       (list
+        [:div.railhead
+         [:span.status {:class (case state :live "met" :archived "pending" "unmet")}
+          (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
+         [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
+        [:pre#pane.term {:data-task id :data-role watching}
+         (ansi->hiccup (pane-text ctx watching {:ansi true}))]
+        ;; The pane is the only way to reach an agent mid-turn: it owns the
+        ;; terminal, and the inbox it reads between turns is no use to a role
+        ;; that is already running. Until now that meant a tmux attach in
+        ;; another window, which is why the attach line below has always been
+        ;; here. It stays — this is the same thing without leaving the page.
+        (when (= state :live)
+          [:form.nudge {:method "post" :action (str "/tasks/" id "/roles/" watching "/keys")}
+           [:input {:type "text" :name "text" :autocomplete "off"
+                    :placeholder (str "say something to " watching "…")}]
+           [:button {:name "do" :value "send"} "Send"]
+           [:button.ghost {:name "do" :value "stop"
+                           :title "Escape — interrupt the turn it is in the middle of"}
+            "Stop"]])
+        [:p.muted "attach: " [:code (str "tmux -S " (:tmux-socket ctx) " attach -t " (task-lib/session-name watching))]]))]))
+
+(defn task-page [ctx watching]
   (let [id (:task-id ctx) vs (verdicts ctx) l (lane ctx) att (attention ctx)]
-    (page {:title id :crumb id :refresh 5}
+    (page {:title id :crumb id :wide true
+           ;; No meta refresh here. A full reload every five seconds throws away
+           ;; the terminal's scroll position and any text being selected in it,
+           ;; which is exactly what this page now exists to show. The script at
+           ;; the foot polls the pane and swaps the detail column instead.
+           :rail (pane-rail ctx watching)
+           :poll id}
           [:section
            [:div.row.head
             [:div.grow [:div.name "Board"]
@@ -363,14 +829,37 @@
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
             [:span.lane {:class (when (= "done" l) "done")} l]]]
-          [:section.attention
-           [:h2 "Attention " [:span.status {:class (if (seq att) "unmet" "met")} (count att)]]
-           (if (seq att)
-             (for [a att]
-               [:details.item
-                [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
-                [:div.full (:text a)]])
-             [:p.empty "nothing needs a human"])]
+          (let [done (handled ctx)
+                keyed (for [a att] (assoc a :key (attention-key a) :done (get done (attention-key a))))
+                ;; crossed-off items sink to the bottom and stop counting, the
+                ;; way a checklist behaves. They are never deleted: the whole
+                ;; point of the list is that it survives someone deciding an
+                ;; item is fine, so the next reader can see what was decided.
+                open-items (remove :done keyed)
+                shut-items (filter :done keyed)]
+            [:section.attention
+             [:h2 "Attention "
+              [:span.status {:class (if (seq open-items) "unmet" "met")} (count open-items)]
+              (when (seq shut-items) [:span.muted " · " (count shut-items) " crossed off"])]
+             (if (seq keyed)
+               (for [a (concat open-items shut-items)]
+                 [:div.att {:class (when (:done a) "off")}
+                  ;; The tick is a sibling of the <details>, not inside its
+                  ;; <summary>: anything inside a summary toggles the disclosure
+                  ;; when clicked, so a checkbox there would expand the item
+                  ;; every time you crossed it off.
+                  [:form {:method "post" :action (str "/tasks/" id "/attention")}
+                   [:input {:type "hidden" :name "key" :value (:key a)}]
+                   [:input {:type "hidden" :name "do" :value (if (:done a) "open" "handle")}]
+                   [:button.tick {:type "submit"
+                                  :title (if (:done a)
+                                           (str "crossed off " (:done a) " — put it back")
+                                           "cross it off")}
+                    (if (:done a) "✓" " ")]]
+                  [:details.item
+                   [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
+                   [:div.full (:text a)]]])
+               [:p.empty "nothing needs a human"])])
           [:section [:h2 "Goal"]
            [:ul.plain
             (for [g (goal-lines (text (:goal-file ctx))) :let [{:keys [status roles]} (goal-status g vs)]]
@@ -380,7 +869,13 @@
            [:div.scroll
             [:table.bars [:tr [:th "bar"] [:th "threshold"] [:th "latest evidence"]]
             (for [b (bars-with-evidence ctx)]
-              [:tr [:td (:name b) [:div.muted [:code (:command b)]]] [:td (:threshold b)]
+              [:tr [:td (:name b)
+                    [:div.muted (if (:command b)
+                                  [:code (:command b)]
+                                  ;; prose, not a command: say so rather than
+                                  ;; showing an empty cell that reads as a bug.
+                                  (list "by hand — " (:measure b)))]]
+               [:td (:threshold b)]
                [:td (if-let [e (:evidence b)]
                       [:div (if (:exit e)
                               [:span.status {:class (if (= "0" (:exit e)) "met" "unmet")} "exit " (:exit e)]
@@ -388,6 +883,18 @@
                        " " [:span.muted (:at e)]
                        (when (seq (:tail e)) [:pre (:tail e)])]
                       [:span.status.pending "no evidence yet"])]])]]]
+          (let [cached (summary/read-summary ctx)]
+            [:section
+             [:h2 "Ready to merge?"
+              (when-let [h (:headers cached)]
+                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
+             [:form {:method "post" :action (str "/tasks/" id "/summary")}
+              [:button {:type "submit"} (if cached "Ask again" "Ask")]
+              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
+               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
+             (if cached
+               [:pre (:body cached)]
+               [:p.empty "not asked yet"])])
           (let [t (telemetry/task-totals id)]
             [:section [:h2 "Telemetry"
                        (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]
@@ -451,14 +958,38 @@
   (let [method (or request-method :get)]
     (or
      (when (and (= :get method) (= "/" uri)) (html 200 (index-page nil nil)))
-     (when (and (= :post method) (= "/tasks" uri))
+     (when (and (= :post method) (= "/projects" uri))
        (let [params (parse-form (if (string? body) body (some-> body slurp)))
-             result (kickstart! params)]
-         (if-let [id (:ok result)]
-           {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}
+             result (create-project! params)]
+         (if (:ok result)
+           {:status 303 :headers {"Location" "/"} :body ""}
            (html 400 (index-page (:error result) params)))))
+     (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/new" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (html 200 (new-task-page project nil {}))
+         (not-found)))
+     ;; The brief goes to the model first and to a person second; only the
+     ;; person's copy reaches /tasks. Two routes rather than a flag, because
+     ;; "open a swarm" and "sort some text" fail in completely different ways.
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/review" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               paste (get params "brief" "")
+               sorted (project-lib/normalize-brief ask/ask paste)]
+           (html 200 (review-page project sorted (assoc params "paste" paste))))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/tasks" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               result (kickstart-project! project params)]
+           (if-let [id (:ok result)]
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}
+             (html 400 (new-task-page project (:error result) params))))
+         (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)" uri))]
-       (if-let [ctx (ctx-for id)] (html 200 (task-page ctx)) (not-found)))
+       (if-let [ctx (ctx-for id)]
+         (html 200 (task-page ctx (query-value query-string "pane")))
+         (not-found)))
      (when-let [[_ id] (and (= :get method) (re-matches #"/tasks/([^/]+)/doc" uri))]
        (let [ctx (ctx-for id) rel (query-value query-string "path")]
          (if-let [f (and ctx (doc-file ctx rel))] (plain 200 (slurp (str f))) (not-found))))
@@ -468,6 +999,42 @@
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/pane" uri))]
        (let [ctx (ctx-for id)]
          (if (and ctx (some #{role} (map :role (roles ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
+     ;; Typing into a pane is what an attached operator already does, and the
+     ;; attach command is printed beside the box — this route is that reach,
+     ;; not a new one. The text is passed as one argv element to `tmux
+     ;; send-keys -l`, never through a shell, so it is typed and never run; the
+     ;; role must be one this task declared, like every other role route here.
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/attention" uri))]
+       (if-let [ctx (ctx-for id)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               key (get params "key")]
+           ;; Only a key this task's own attention list currently produces. The
+           ;; file is keys and timestamps, so a made-up one would just sit
+           ;; there, but a store that accepts arbitrary strings from a form is
+           ;; a store that grows without bound.
+           (when (some #(= key (attention-key %)) (attention ctx))
+             (set-handled! ctx key (= "handle" (get params "do"))))
+           {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
+         (not-found)))
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/summary" uri))]
+       (if-let [ctx (ctx-for id)]
+         (let [r (summary/summarize! ctx)]
+           (if (:error r)
+             (html 200 (page {:title (str id " · summary") :crumb id}
+                             [:section [:h2 "Ready to merge?"]
+                              [:p.err (:error r)]
+                              [:p [:a.doc {:href (str "/tasks/" id)} "← back to " id]]]))
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}))
+         (not-found)))
+     (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
+       (let [ctx (ctx-for id)]
+         (if (and ctx (some #{role} (map :role (roles ctx))))
+           (let [params (parse-form (if (string? body) body (some-> body slurp)))]
+             (if (= "stop" (get params "do"))
+               (handoff-lib/press-key! ctx role "Escape")
+               (handoff-lib/type-into-pane! ctx role (get params "text")))
+             {:status 303 :headers {"Location" (str "/tasks/" id "?pane=" role)} :body ""})
+           (not-found))))
      (not-found))))
 
 (defn -main [& args]

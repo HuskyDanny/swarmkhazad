@@ -79,6 +79,61 @@
   (is (= "moonshotai/kimi-k3:exacto" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
   (is (= "" (:ctx-tokens (get ((resolve 'task-lib/read-vendors)) "qwen"))) "an empty last column survives"))
 
+(deftest a-wrapper-shim-on-path-is-skipped-not-pinned
+  (load-file (str (fs/path repo-root "scripts" "swarm_lib.bb")))
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-wrapper."})
+        ;; The shape cmux puts first on PATH: $TMPDIR/cmux-cli-shims/<uuid>/claude.
+        ;; It forwards our argv after rewriting it, and `--settings <path>` comes
+        ;; back inline — the exec dies with "Argument list too long" and the role
+        ;; relaunches forever, so pinning it is worse than not resolving at all.
+        shimdir (fs/path sandbox "cmux-cli-shims" "abc-123")
+        realdir (fs/path sandbox "bin")]
+    (try
+      (fs/create-dirs shimdir)
+      (fs/create-dirs realdir)
+      (executable! (fs/path shimdir "claude") "#!/bin/bash\necho wrapper\n")
+      (executable! (fs/path realdir "claude") "#!/bin/bash\necho real\n")
+      (let [wrapper? (resolve 'task-lib/wrapper-shim?)]
+        (is (@wrapper? (str (fs/path shimdir "claude"))) "a cmux-cli-shims path is a wrapper")
+        (is (not (@wrapper? (str (fs/path realdir "claude")))) "an ordinary bin directory is not")
+        (is (not (@wrapper? (str (fs/path sandbox "stubbin" "claude"))))
+            "and neither is a stub in a temp dir — the first version of this test rejected those and sent the smoke suite at the live vendors")
+        (let [path (str shimdir ":" realdir)]
+          ;; harness-candidates reads PATH from the environment, so drive it in a
+          ;; child bb with the PATH under test rather than mutating this process.
+          (let [out (:out (process/sh {:continue true
+                                       :extra-env {"PATH" path}
+                                       :dir repo-root}
+                                      "bb" "-e"
+                                      (str "(load-file \"scripts/swarm_lib.bb\")"
+                                           "(prn (task-lib/harness-candidates \"claude\"))"
+                                           "(prn (:path (task-lib/resolve-harness \"claude\")))")))]
+            (is (str/includes? out "cmux-cli-shims") "the wrapper is a candidate")
+            (is (str/includes? out (str (fs/path realdir "claude"))) "and so is the real binary")
+            (is (str/ends-with? (str/trim out) (str "\"" (fs/path realdir "claude") "\""))
+                "but the one chosen is the real binary, not the wrapper that came first")))
+        (let [out (:out (process/sh {:continue true
+                                     :extra-env {"PATH" (str shimdir)
+                                                 "SWARMKHAZAD_HARNESS_CLAUDE" (str (fs/path realdir "claude"))}
+                                     :dir repo-root}
+                                    "bb" "-e"
+                                    (str "(load-file \"scripts/swarm_lib.bb\")"
+                                         "(prn (task-lib/resolve-harness \"claude\"))")))]
+          (is (str/includes? out ":pinned true") "SWARMKHAZAD_HARNESS_<NAME> wins outright")
+          (is (str/includes? out (str (fs/path realdir "claude")))))
+        (let [r (process/sh {:continue true
+                             :extra-env {"PATH" (str shimdir)}
+                             :dir repo-root}
+                            "bb" "-e"
+                            (str "(load-file \"scripts/swarm_lib.bb\")"
+                                 "(swarm-lib/resolve-harnesses! (task-lib/task-ctx \"t-none\") [{:harness \"claude\"}])"))]
+          (is (not (zero? (:exit r))) "nothing but wrappers is a failure at open, not a swarm that loops")
+          (is (str/includes? (str (:err r)) "resolves only to wrapper shims"))
+          (is (str/includes? (str (:err r)) "SWARMKHAZAD_HARNESS_CLAUDE")
+              "and the message says how to pin the real one")))
+      (finally
+        (fs/delete-tree sandbox)))))
+
 (deftest smoke-runs-every-role-through-its-shim-with-its-own-model-env
   (with-sandbox
     (fn [{:keys [env src home claude-json]}]

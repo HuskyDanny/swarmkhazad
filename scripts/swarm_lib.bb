@@ -48,14 +48,35 @@
    record it in state/harnesses.tsv for the shims. The tmux login shell
    re-sources rc files and rebuilds PATH, so a bare `claude` typed into the pane
    could resolve to a different binary than the one the operator ran `open`
-   with — or to nothing."
+   with — or to nothing.
+
+   Wrapper shims are skipped rather than pinned. `open` is often run from inside
+   a terminal that puts its own wrapper first on PATH, and pinning that wrapper
+   is worse than not resolving at all: every role launches, dies on an argv the
+   wrapper rewrote, and relaunches, which reads as a swarm that started and did
+   nothing. Skipping is reported, and a harness with nothing but wrappers fails
+   here with the paths it rejected."
   [ctx roles]
-  (let [paths (into {} (for [h (distinct (map :harness roles))]
-                         [h (or (command-path h)
-                                (throw (ex-info (str "'" h "' is required but not on PATH") {})))]))]
+  (let [resolved (into {} (for [h (distinct (map :harness roles))]
+                            [h (task-lib/resolve-harness h)]))]
+    (doseq [[h r] resolved]
+      (when-not r
+        (let [all (task-lib/harness-candidates h)]
+          (throw (ex-info (if (seq all)
+                            (str "'" h "' resolves only to wrapper shims, which rewrite the argv we pass:\n  "
+                                 (str/join "\n  " all)
+                                 "\nRun `open` outside that terminal, or pin the real binary with "
+                                 "SWARMKHAZAD_HARNESS_" (str/upper-case h) "=/path/to/" h)
+                            (str "'" h "' is required but not on PATH"))
+                          {:harness h :candidates all}))))
+      (doseq [skipped (:skipped r)]
+        (binding [*out* *err*]
+          (println (str "swarmkhazad: " h ": skipped wrapper shim " skipped))))
+      (binding [*out* *err*]
+        (println (str "swarmkhazad: " h " -> " (:path r) (when (:pinned r) " (pinned)")))))
     (spit (str (fs/path (:state-dir ctx) "harnesses.tsv"))
-          (apply str (for [[h p] paths] (str h "\t" p "\n"))))
-    paths))
+          (apply str (for [[h r] resolved] (str h "\t" (:path r) "\n"))))
+    (into {} (for [[h r] resolved] [h (:path r)]))))
 
 (defn write-shims!
   "Install scripts/shim.sh as <task>/bin/<harness> for every known harness, and

@@ -47,8 +47,14 @@
       (as-> s (if (str/blank? s) "bar" s))))
 
 (defn parse-bar
-  "`- <name> — bar: <threshold> — measure: `<command>` …` → {:name :threshold :command},
-   or nil when the line carries no measure command."
+  "`- <name> — bar: <threshold> — measure: `<command>` …`
+   → {:name :threshold :measure :command}.
+
+   `:command` is the backticked part and is nil when the measure is prose. Such
+   a bar is still a bar — someone has to run it and write the evidence — so it
+   is returned rather than dropped. Dropping it made two of a brief's seven bars
+   vanish from the page while sitting in metrics.md, which is the worst place
+   for an acceptance criterion to be: recorded, and invisible."
   [line]
   (let [body (subs line 2)
         [name & rest] (str/split body #"\s+—\s+")
@@ -56,11 +62,12 @@
                               :let [[k v] (str/split part #":\s*" 2)]
                               :when v]
                           [(str/lower-case (str/trim k)) (str/trim v)]))
-        command (some->> (get fields "measure") (re-find #"`([^`]+)`") second)]
-    (when command
+        measure (get fields "measure")]
+    (when (seq (str/trim (or name "")))
       {:name (str/trim name)
        :threshold (get fields "bar")
-       :command command})))
+       :measure measure
+       :command (some->> measure (re-find #"`([^`]+)`") second)})))
 
 (defn substitute [command ctx]
   (-> command
@@ -69,14 +76,17 @@
       (str/replace "<task-dir>" (str (:task-dir ctx)))))
 
 (defn bars
-  "Every Quantitative bar with a measure command, names made unique."
+  "Every Quantitative bar, names made unique. A bar whose measure is prose comes
+   back with a nil :command; callers that run things check for it."
   [ctx metrics-md]
   (let [parsed (keep parse-bar (quantitative-lines metrics-md))]
     (loop [todo parsed seen #{} out []]
       (if-let [b (first todo)]
         (let [base (slug (:name b))
               id (first (remove seen (cons base (map #(str base "-" %) (iterate inc 2)))))]
-          (recur (rest todo) (conj seen id) (conj out (assoc b :id id :command (substitute (:command b) ctx)))))
+          (recur (rest todo) (conj seen id)
+                 (conj out (assoc b :id id
+                                  :command (some-> (:command b) (substitute ctx))))))
         out))))
 
 ;; ---------------------------------------------------------------- repo tests
@@ -147,7 +157,12 @@
     (vec (for [bar rows]
            (let [result (if (:command bar)
                           (run-command (:command bar) worktree)
-                          {:exit "none" :output "no test command detected in the worktree (no package.json, bb.edn, pyproject.toml, go.mod, Cargo.toml or Makefile test target)\n"
+                          {:exit "none"
+                           :output (if (= repo-tests-bar (:id bar))
+                                     "no test command detected in the worktree (no package.json, bb.edn, pyproject.toml, go.mod, Cargo.toml or Makefile test target)\n"
+                                     (str "this bar has no command to run — its measure is prose, so the run role\n"
+                                          "has to satisfy it and overwrite this file with what it observed:\n\n"
+                                          "  " (or (:measure bar) (:name bar)) "\n"))
                            :duration-ms 0 :started-at (str (java.time.Instant/now))})
                  file (write-evidence! ctx bar worktree result)]
              {:id (:id bar) :exit (:exit result) :duration-ms (:duration-ms result) :file (str file)})))))

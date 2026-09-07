@@ -210,10 +210,54 @@
   (when (fs/regular-file? (:tmux-socket-file ctx))
     (not-empty (str/trim (slurp (str (:tmux-socket-file ctx)))))))
 
-(defn capture-pane [ctx role-name]
+(defn capture-pane
+  "The pane's scrollback. `-e` keeps the SGR escapes, without which an agent TUI
+   arrives as flat grey text and every colour it used to mean something with is
+   gone. Callers that want plain text strip them; the portal renders them."
+  [ctx role-name & {:keys [ansi] :or {ansi false}}]
   (when-let [socket (tmux-socket ctx)]
-    (let [r (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" (task-lib/session-name role-name) "-S" "-")]
+    (let [args (concat ["tmux" "-S" socket "capture-pane" "-p"]
+                       (when ansi ["-e"])
+                       ["-t" (task-lib/session-name role-name) "-S" "-"])
+          r (apply process/sh {:continue true} args)]
       (when (zero? (:exit r)) (:out r)))))
+
+(defn- tmux-send!
+  [ctx role-name args]
+  (when-let [socket (tmux-socket ctx)]
+    (zero? (:exit (apply process/sh {:continue true}
+                        (concat ["tmux" "-S" socket "send-keys"
+                                 "-t" (task-lib/session-name role-name)]
+                                args))))))
+
+(defn type-into-pane!
+  "Type text into a role's pane and submit it — the only way to reach an agent
+   that is already running, since it owns the terminal.
+
+   The text goes with `-l` so nothing inside it is read as a tmux key name, then
+   Enter, then C-j: the harness input boxes differ on which one submits, and a
+   spare newline in a box that took the first is harmless. The pauses are what
+   makes it land in a TUI that redraws between keystrokes.
+
+   Best-effort. A role whose session is gone returns false, and the caller
+   decides whether that matters — handoffd logs it and moves on, because the
+   inbox file is delivered either way."
+  [ctx role-name text]
+  (boolean
+   (when (seq (or text ""))
+     (when (tmux-send! ctx role-name ["-l" text])
+       (Thread/sleep 150)
+       (tmux-send! ctx role-name ["C-m"])
+       (Thread/sleep 50)
+       (tmux-send! ctx role-name ["C-j"])
+       true))))
+
+(defn press-key!
+  "Send one tmux key name — Escape to interrupt the turn a role is in the middle
+   of, C-c to signal it. A key name cannot go through `type-into-pane!`, which
+   sends literally by design."
+  [ctx role-name key]
+  (boolean (tmux-send! ctx role-name [key])))
 
 (defn archive-role!
   "Snapshot the role's pane to state/sessions/<role>/pane.txt — what the portal

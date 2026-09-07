@@ -83,9 +83,17 @@
             ev (fs/path dir "evidence")]
         (is (= 1 (:exit r)) "one measure exited 3, so the run reports failure")
         (testing "one file per bar, names slugged and made unique; the Qualitative measure never ran"
-          (is (= #{"repo-tests.txt" "every-role-called.txt" "wall-clock.txt" "spend-usd.txt" "wall-clock-2.txt"}
+          (is (= #{"repo-tests.txt" "every-role-called.txt" "wall-clock.txt" "spend-usd.txt"
+                   "wall-clock-2.txt" "a-bar-with-no-command-yet.txt"}
                  (set (map fs/file-name (fs/list-dir ev)))))
           (is (not (str/includes? (str/join (map slurp (map str (fs/list-dir ev)))) "never-run"))))
+        (testing "a bar whose measure is prose still gets a file saying who has to run it"
+          ;; It was dropped before, which left an acceptance criterion recorded
+          ;; in metrics.md and visible nowhere else.
+          (let [f (fs/path ev "a-bar-with-no-command-yet.txt")]
+            (is (= "none" (get (headers f) "exit")))
+            (is (str/includes? (output f) "no command to run"))
+            (is (str/includes? (output f) "the run role"))))
         (testing "the repo's own test command was detected from bb.edn and run in the worktree"
           (let [h (headers (fs/path ev "repo-tests.txt"))]
             (is (= "bb test" (get h "command")))
@@ -110,7 +118,7 @@
         (testing "the summary names each bar with its exit"
           (is (str/includes? (:out r) "repo-tests"))
           (is (re-find #"spend-usd\s+exit=3" (:out r)))
-          (is (str/includes? (:out r) "evidence: 5 files in")))))))
+          (is (str/includes? (:out r) "evidence: 6 files in")))))))
 
 (deftest a-repo-without-a-test-command-is-recorded-as-such-and-a-timeout-is-exit-124
   (with-task {"README.md" "one\n"}
