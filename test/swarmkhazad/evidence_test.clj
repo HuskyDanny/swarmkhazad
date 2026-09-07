@@ -162,3 +162,73 @@
     (is (= "go test ./..." (detect {"go.mod" ""})))
     (is (= "make test" (detect {"Makefile" "build:\n\techo\ntest:\n\techo\n"})))
     (is (= "nil" (detect {"Makefile" "build:\n\techo\n"})) "a Makefile without a test target is not a test command")))
+
+;; --------------------------------------------------------- more than one repo
+
+(defn with-two-repo-task
+  "gobel has a bb.edn so `bb test` is its test command; cirdan has nothing, so
+   its own answer is `no test command detected`. One shared `repo tests` bar
+   could only ever have carried one of those two answers."
+  [metrics f]
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-evidence2."})
+        home (str (fs/path sandbox "home"))
+        gobel (str (fs/path sandbox "src" "gobel"))
+        cirdan (str (fs/path sandbox "src" "cirdan"))
+        id "t-ev2"
+        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" id}]
+    (try
+      (make-source-repo! gobel {"README.md" "g\n"
+                                "bb.edn" "{:tasks {test (println \"gobel tests ran\")}}\n"})
+      (make-source-repo! cirdan {"README.md" "c\n"})
+      (run {:env env} cli "new" id "--repo" gobel "--repo" cirdan)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles")) "run claude task\n")
+        (spit (str (fs/path dir "repos")) (str gobel "\n" cirdan "\n"))
+        (spit (str (fs/path dir "metrics.md")) metrics)
+        (run {:env env} cli "prepare" id)
+        (f {:dir dir
+            :measure (fn [session repo]
+                       (run {:dir (str (fs/path dir "worktrees" repo))
+                             :env (merge env {"SWARMKHAZAD_SESSION" session
+                                              "SWARMKHAZAD_TASK_DIR" (str dir)})
+                             :ok? false}
+                            "bb" (str (fs/path scripts "run_evidence.bb"))))}))
+      (finally
+        (fs/delete-tree sandbox)))))
+
+(deftest a-bar-tagged-with-a-repo-is-measured-in-that-repo-and-nowhere-else
+  (with-two-repo-task
+    (str "# t-ev2 — bars\n\n## Quantitative\n"
+         "- the exporter is repointed @gobel — bar: no matches — measure: `echo GOBEL-BAR`\n"
+         "- the image is pinned @cirdan — bar: pinned — measure: `echo CIRDAN-BAR`\n"
+         "- the cluster answers — bar: endpoints exist — measure: `echo CLUSTER-BAR`\n")
+    (fn [{:keys [dir measure]}]
+      (let [ev (fs/path dir "evidence")
+            files #(set (map (comp str fs/file-name) (fs/list-dir ev)))]
+        (measure "run_gobel" "gobel")
+        (testing "gobel's session runs gobel's bar and the untagged one, not cirdan's"
+          (is (= #{"repo-tests-gobel.txt" "the-exporter-is-repointed.txt" "the-cluster-answers.txt"}
+                 (files))
+              "a bar measured in the wrong worktree is a wrong answer nobody can see is wrong"))
+        (measure "run_cirdan" "cirdan")
+        (testing "cirdan's session adds its own, and its own repo tests"
+          (is (= #{"repo-tests-gobel.txt" "repo-tests-cirdan.txt"
+                   "the-exporter-is-repointed.txt" "the-image-is-pinned.txt"
+                   "the-cluster-answers.txt"}
+                 (files))))
+        (testing "each repo's test command is recorded against its own name"
+          (is (str/includes? (output (fs/path ev "repo-tests-gobel.txt")) "gobel tests ran"))
+          (is (str/includes? (output (fs/path ev "repo-tests-cirdan.txt")) "no test command detected")
+              "one shared file would have had the second session overwrite the first, and the last writer's repo would silently be the task's answer"))
+        (testing "the tagged bars ran where they were tagged"
+          (is (str/includes? (output (fs/path ev "the-exporter-is-repointed.txt")) "GOBEL-BAR"))
+          (is (str/includes? (output (fs/path ev "the-image-is-pinned.txt")) "CIRDAN-BAR"))
+          (is (str/includes? (headers (fs/path ev "the-image-is-pinned.txt")) "cirdan")
+              "and the header says the worktree it ran in"))))))
+
+(deftest a-one-repo-task-keeps-the-name-every-reader-already-uses
+  (with-task {"README.md" "one\n"} (str "# t-ev — bars\n\n## Quantitative\n- x — bar: y — measure: `echo z`\n")
+    (fn [{:keys [dir measure]}]
+      (measure)
+      (is (fs/regular-file? (fs/path dir "evidence" "repo-tests.txt"))
+          "one repo, so there is nothing to disambiguate and the suffix would only break old readers"))))

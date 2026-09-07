@@ -47,8 +47,13 @@
       (as-> s (if (str/blank? s) "bar" s))))
 
 (defn parse-bar
-  "`- <name> — bar: <threshold> — measure: `<command>` …`
-   → {:name :threshold :measure :command}.
+  "`- <name> [@<repo>…] — bar: <threshold> — measure: `<command>` …`
+   → {:name :repos :threshold :measure :command}.
+
+   The `@repo` tags read like a goal line's and mean the same thing: this bar
+   is measured in that repo's worktree. A bar with none is cluster-scoped —
+   `kubectl get endpoints` is nobody's repo — and is measured wherever the
+   session that runs it happens to stand.
 
    `:command` is the backticked part and is nil when the measure is prose. Such
    a bar is still a bar — someone has to run it and write the evidence — so it
@@ -57,14 +62,18 @@
    for an acceptance criterion to be: recorded, and invisible."
   [line]
   (let [body (subs line 2)
-        [name & rest] (str/split body #"\s+—\s+")
+        [head & rest] (str/split body #"\s+—\s+")
+        tokens (remove str/blank? (str/split (str head) #"\s+"))
+        tag? #(str/starts-with? % "@")
         fields (into {} (for [part rest
                               :let [[k v] (str/split part #":\s*" 2)]
                               :when v]
                           [(str/lower-case (str/trim k)) (str/trim v)]))
-        measure (get fields "measure")]
-    (when (seq (str/trim (or name "")))
-      {:name (str/trim name)
+        measure (get fields "measure")
+        name (str/join " " (remove tag? tokens))]
+    (when (seq (str/trim name))
+      {:name name
+       :repos (mapv #(subs % 1) (filter tag? tokens))
        :threshold (get fields "bar")
        :measure measure
        :command (some->> measure (re-find #"`([^`]+)`") second)})))
@@ -147,18 +156,32 @@
                (when-not (str/ends-with? (:output result) "\n") "\n")))
     file))
 
+(defn mine?
+  "A bar is this session's when it tags no repo or tags this one. Untagged is
+   the same default a goal line has: a line that never said belongs to
+   everyone."
+  [repo bar]
+  (or (empty? (:repos bar)) (some #{repo} (:repos bar))))
+
 (defn measure-all!
-  "Run everything; return [{:id :exit :file}]."
-  [ctx worktree metrics-md]
+  "Run everything this session owns; return [{:id :exit :file}]."
+  [ctx worktree metrics-md repo]
   (let [test-command (detect-test-command worktree)
-        repo-tests {:id repo-tests-bar :name "repo tests" :command test-command
+        ;; One `repo tests` per repo, named after it. detect-test-command reads
+        ;; ONE worktree, so a single shared bar meant every session overwrote
+        ;; one file and the last writer's repo silently became the task's
+        ;; answer — `bun run test` in gobel reported as `repo tests` for all
+        ;; three. The id says which repo, so N repos leave N files.
+        repo-tests {:id (if repo (str repo-tests-bar "-" repo) repo-tests-bar)
+                    :name (str "repo tests" (when repo (str " — " repo)))
+                    :command test-command
                     :threshold "the repo's own test command exits 0"}
-        rows (cons repo-tests (bars ctx metrics-md))]
+        rows (cons repo-tests (filter #(mine? repo %) (bars ctx metrics-md)))]
     (vec (for [bar rows]
            (let [result (if (:command bar)
                           (run-command (:command bar) worktree)
                           {:exit "none"
-                           :output (if (= repo-tests-bar (:id bar))
+                           :output (if (str/starts-with? (:id bar) repo-tests-bar)
                                      "no test command detected in the worktree (no package.json, bb.edn, pyproject.toml, go.mod, Cargo.toml or Makefile test target)\n"
                                      (str "this bar has no command to run — its measure is prose, so the run role\n"
                                           "has to satisfy it and overwrite this file with what it observed:\n\n"
@@ -178,7 +201,11 @@
         row (task-lib/session-row ctx session)
         worktree (or (:worktree-path row) (str (fs/cwd)))
         metrics-md (if (fs/regular-file? (:metrics-file ctx)) (slurp (str (:metrics-file ctx))) "")
-        results (measure-all! ctx worktree metrics-md)]
+        ;; Only past one repo: a one-repo task's `repo-tests.txt` is the name
+        ;; every reader and every old task already uses.
+        repo (when (> (count (distinct (keep :repo (task-lib/read-sessions-tsv ctx)))) 1)
+               (:repo row))
+        results (measure-all! ctx worktree metrics-md repo)]
     (doseq [{:keys [id exit duration-ms file]} results]
       (println (format "%-24s exit=%-5s %6d ms  %s" id (str exit) duration-ms file)))
     (println (str "evidence: " (count results) " files in " (:evidence-dir ctx)))
