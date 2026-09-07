@@ -19,6 +19,13 @@
 #                 redirect target. Reads pass. chmod 444 alone only stops a plain
 #                 write; this stops the chmod.
 #
+# The ceiling, so nobody reads this as airtight: it parses a shell command
+# WITHOUT a shell, so every expansion bash performs and this does not is a door.
+# Name and inode matching closes aliasing — a second name for the same file.
+# It does not close indirection: `eval`, a heredoc written out and then run, a
+# path assembled across several commands. Roles are held there by the prompt and
+# by having no reason to try, not by this file.
+#
 # No SWARMKHAZAD_TASK_DIR means an ad-hoc launch: silent exit, nothing to enforce.
 # Fails OPEN on malformed input — a role that cannot start because its contract
 # hook broke is worse than a role without the hook. Denials are appended to
@@ -117,6 +124,23 @@ deny() {
 # inside a variable is a LITERAL in a case pattern, not an alternation, so that
 # form matches nothing and the guard silently stops denying. Caught by the
 # suite, which is what it is for.
+# same_file <a> <b>: 0 when both paths are the same file on disk.
+#
+# A hard link is the reach `follow_link` cannot see: not a symlink, and named
+# whatever its maker chose. `stat` tells them apart, and it follows symlinks, so
+# this covers both kinds of alias. RAN: goal.md and a hard link to it both
+# report 16777233:64804583, and a Write to the link rewrote goal.md.
+#
+# Not on the hot path, which is why the cost objection I first made to this was
+# wrong: task_file only runs on words of a command that already named a truth
+# file or the task folder.
+same_file() {
+  local a b
+  a=$(stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null) || return 1
+  b=$(stat -f '%d:%i' "$2" 2>/dev/null || stat -c '%d:%i' "$2" 2>/dev/null) || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
 # follow_link <path>: <path> with a symlinked FINAL component resolved, up to
 # ten hops. Bounded rather than while-true: a symlink loop must not hang a hook
 # that every tool call waits on. `readlink -f` is not portable enough to rely on
@@ -155,6 +179,10 @@ task_file() {
   # operations — chmod the link, write the link — rewrote the acceptance
   # criteria the whole contract exists to keep still. RAN.
   p=$(follow_link "$p")
+  # Identity first, name second. The name check is still the fallback and still
+  # does the work: a Write creating a file that does not exist yet has no inode
+  # to compare, and cannot be an alias for anything either.
+  for f in $want; do same_file "$p" "$TASK_REAL/$f" && return 0; done
   base=$(basename "$p")
   for f in $want; do [ "$base" = "$f" ] && { hit=0; break; }; done
   [ "$hit" -eq 0 ] || return 1
@@ -202,10 +230,49 @@ pre_tool_use() {
       # the command with its quotes removed, because that is the name the shell
       # will open — `go""al.md` passed this untouched.
       bare=${cmd//\"/}; bare=${bare//\'/}
+      # Standing in the task folder, every bare filename is a candidate and the
+      # names below prove nothing — `printf x > hard.md` is goal.md when
+      # hard.md is a link to it. Roles work in a worktree, so this is the rare
+      # case and skipping the cheap screen costs nothing in the common one.
+      cwd_real=$(cd "$cwd" 2>/dev/null && pwd -P) || cwd_real=""
       case "$bare" in
         *goal.md*|*metrics.md*|*decision.md*|*gotcha.md*|*finding.md*|*escalation.md*|\
         *"$task_dir"*|*SWARMKHAZAD_TASK_DIR*) ;;
-        *) exit 0 ;;
+        *) [ "$cwd_real" = "$TASK_REAL" ] || exit 0 ;;
+      esac
+      # A `cd` changes what every relative path after it means, and the hook
+      # resolves relative paths against the cwd the tool call reported. When the
+      # cd target is a literal that resolves, this is harmless; when it is
+      # `$SWARMKHAZAD_HOME/tasks/$SWARMKHAZAD_TASK_ID` or a variable, the hook
+      # cannot follow it and `chmod 644 goal.md` looked like a file somewhere
+      # else entirely. RAN, allowed.
+      #
+      # So with a cd present, the name alone is enough to count as naming the
+      # truth. `mutating` still gates the denial, so `cd <task> && cat goal.md`
+      # keeps passing; only a mutating verb changes outcome. The cost is a repo
+      # that has its own goal.md: editing it after a cd is denied, and the
+      # message says which rule fired.
+      case " $bare " in
+        *" cd "*)
+          cd_prev=""
+          for w in $cmd; do
+            cd_word=${w//[\"\']/}
+            case "$cd_word" in ">>"*|">|"*|">"*) cd_redirect=${cd_word#>}; cd_redirect=${cd_redirect#>}; cd_redirect=${cd_redirect#|} ;; *) cd_redirect="" ;; esac
+            for cd_cand in "$cd_word" "$cd_redirect"; do
+              [ -n "$cd_cand" ] || continue
+              case "$(basename "$cd_cand")" in
+                goal.md|metrics.md) hit_kind="truth"; matched=1 ;;
+                decision.md|gotcha.md|finding.md|escalation.md) hit_kind="note"; matched=1 ;;
+                *) continue ;;
+              esac
+              # A redirect at it is a write, whatever verb the line uses. The
+              # main loop's redirect check only fires when the path resolves,
+              # and after a cd this one does not — that is the whole point.
+              case "$cd_prev" in ">"|">>"|">|") mutating=1 ;; esac
+              [ -n "$cd_redirect" ] && mutating=1
+            done
+            cd_prev="$w"
+          done ;;
       esac
       prev=""
       for w in $cmd; do
@@ -282,7 +349,7 @@ pre_tool_use() {
         case "$head_word" in
           cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|\
           awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
-          readlink|md5|shasum|true|false|nl|column|note.bb) ;;
+          readlink|md5|shasum|true|false|nl|column|note.bb|cd|pushd|popd) ;;
           *) mutating=1; break ;;
         esac
       done < <(printf '%s' "$bare" | tr '|;&\n' '\n\n\n\n')

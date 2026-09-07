@@ -268,14 +268,54 @@
                      (str "printf x > " task "/draft-implement.md")
                      (str "git -C " sandbox " status --short")]]
           (is (allowed? (bash task task cmd)) cmd)))
-      (testing "and a hard link cannot be made in the first place"
-        ;; A hard link is the one reach `follow_link` cannot see — it is not a
-        ;; symlink, and finding it means stat-ing every path-shaped word of
-        ;; every Bash command, on a hook every tool call waits for. It is closed
-        ;; at the other end instead: nothing inside a task can create one.
+      (testing "a hard link is the same file, by whatever name"
+        ;; The reach `follow_link` cannot see: not a symlink, and named whatever
+        ;; its maker chose. `stat` tells them apart. Closed at both ends —
+        ;; nothing in a task can make one, AND an existing one is recognised.
         (doseq [cmd [(str "ln " task "/goal.md " task "/hard.md")
                      "ln goal.md hard.md"
                      (str "cp -l " task "/goal.md " task "/hard.md")
                      (str "link " task "/metrics.md " task "/hard.md")]]
-          (is (denied? (bash task task cmd)) cmd))))))
+          (is (denied? (bash task task cmd)) cmd))
+        (let [hard (str task "/hard.md")]
+          ;; Made outside the hook, which is the only way it can exist.
+          (process/sh "ln" (str task "/goal.md") hard)
+          (is (denied? (edit task "Write" hard))
+              "a Write here rewrites goal.md, and the name gives nothing away")
+          (is (denied? (bash task task (str "chmod 644 " hard))))
+          (is (denied? (bash task task "printf x > hard.md")) "relative, too")
+          (fs/delete hard))
+        (let [hard (str task "/hardnote.md")]
+          (process/sh "ln" (str task "/decision.md") hard)
+          (is (denied? (edit task "Write" hard)) "and the bullet files the same way")
+          (fs/delete hard)))
+      (testing "a cd the hook cannot resolve does not move the truth out of reach"
+        ;; Relative paths resolve against the cwd the TOOL CALL reported, and a
+        ;; cd inside the command changes what they mean. A literal target the
+        ;; hook can resolve was fine; `$SWARMKHAZAD_HOME/tasks/$SWARMKHAZAD_TASK_ID`
+        ;; and a variable were not. RAN, both allowed.
+        (doseq [cmd ["cd $SWARMKHAZAD_TASK_DIR/../t-hook && chmod 644 goal.md"
+                     "D=$SWARMKHAZAD_TASK_DIR; cd $D; sed -i \"\" s/a/b/ goal.md"
+                     (str "cd " task " && chmod 644 goal.md")
+                     ;; Denied before this change too, but only because the
+                     ;; hook's own unquoted `for w in $cmd` expanded the glob
+                     ;; against the same disk — luck, not understanding.
+                     (str "cd " task " && chmod 644 goa?.md")
+                     (str "cd " task " && printf x >> decision.md")
+                     ;; Joined to the operator, which is a different word to the
+                     ;; scanner: `>>decision.md` is one token, so the previous
+                     ;; word is `printf` and the redirect has to be read off the
+                     ;; token itself.
+                     (str "cd " task " && printf x >>decision.md")
+                     (str "cd " task " && printf x >goal.md")]]
+          (is (denied? (bash task sandbox cmd)) cmd))
+        (testing "and reading after a cd is still reading"
+          ;; `cd` is not a writer. Denying `cd <task> && cat goal.md` is exactly
+          ;; the over-denial that gets a guard switched off — it was denied by
+          ;; the first version of this rule, because `cd` was not on the reader
+          ;; allowlist.
+          (doseq [cmd [(str "cd " task " && cat goal.md")
+                       (str "cd " task " && grep -n 'bar:' metrics.md")
+                       (str "cd " task " && head -5 goal.md")]]
+            (is (allowed? (bash task sandbox cmd)) cmd)))))))
 
