@@ -284,6 +284,38 @@
           (is (= 2 (:exit r)))
           (is (str/includes? (:err r) "TASK_IN_PROCESS_IS_BATCH")))))))
 
+(deftest note-bb-writes-the-bullet-so-every-reader-can-parse-it
+  (with-task
+    (fn [{:keys [dir helper]}]
+      (let [note (fn [& args] (apply helper "a" "note.bb" args))
+            lines (fn [f] (->> (str/split-lines (slurp (str (fs/path dir f))))
+                               (remove str/blank?) vec))]
+        (testing "one bullet per file, in the shape the portal and the summarizer split on"
+          (doseq [[kind file] [["decision" "decision.md"] ["gotcha" "gotcha.md"]
+                               ["escalation" "escalation.md"] ["finding" "finding.md"]]]
+            (is (zero? (:exit (note kind (str kind "-claim") (str kind "-why")))))
+            (is (= [(str "- **" kind "-claim** — " kind "-why")] (lines file)) file)))
+        (testing "a one-repo task gets no tag — there is nothing to disambiguate"
+          (is (not (str/includes? (first (lines "finding.md")) "["))))
+        (testing "appending, never replacing"
+          (is (zero? (:exit (note "finding" "second" "also true"))))
+          (is (= 2 (count (lines "finding.md")))))
+        (testing "a newline inside an argument is folded, not written through"
+          (is (zero? (:exit (note "gotcha" "line one\nline two" "why"))))
+          (is (= 2 (count (lines "gotcha.md"))) "two bullets, not three lines")
+          (is (str/includes? (last (lines "gotcha.md")) "line one line two")))
+        (testing "what it refuses"
+          (doseq [[label args needle]
+                  [["unknown kind" ["notes" "c" "w"] "unknown kind"]
+                   ["empty claim" ["finding" "" "w"] "the claim is empty"]
+                   ["blank why" ["finding" "c" "   "] "the why is empty"]
+                   ["a fourth argument" ["finding" "c" "w" "extra"] "too many arguments"]]]
+            (let [r (apply note args)]
+              (is (= 1 (:exit r)) label)
+              (is (str/includes? (:err r) needle) (str label ": " (:err r))))))
+        (testing "a refusal writes nothing"
+          (is (= 2 (count (lines "finding.md")))))))))
+
 (deftest a-shared-worktree-never-guesses-which-session-is-running
   ;; Roles working the same repo share its worktree, so the cwd names a REPO
   ;; and not a session. The pane exports SWARMKHAZAD_SESSION; a helper run by

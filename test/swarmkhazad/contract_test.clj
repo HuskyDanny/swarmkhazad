@@ -115,8 +115,11 @@
         (is (denied? (edit task "Write" (str task "/metrics.md"))))
         (is (denied? (edit task "MultiEdit" "goal.md")) "relative to the tool cwd")
         (is (denied? (edit task "Edit" (str task "/../t-hook/goal.md"))) "dot-dot path")
-        (is (allowed? (edit task "Edit" (str task "/decision.md"))))
-        (is (allowed? (edit task "Write" (str task "/draft-implement.md"))))
+        (is (denied? (edit task "Edit" (str task "/decision.md")))
+            "the bullet files are note.bb's to write — the tag and the format come from it")
+        (is (denied? (edit task "Write" (str task "/finding.md"))))
+        (is (allowed? (edit task "Write" (str task "/draft-implement.md")))
+            "a role's own write-up is its own to edit")
         (is (allowed? (edit task "Edit" (str sandbox "/elsewhere/goal.md"))) "a goal.md outside the task is not ours")
         (is (str/includes? (get-in (:json (edit task "Edit" (str task "/goal.md"))) ["hookSpecificOutput" "permissionDecisionReason"])
                            "escalation.md line")))
@@ -132,19 +135,32 @@
                      (str "rm -f " task "/goal.md")
                      (str "python3 -c \"open('" task "/goal.md','w').write('x')\"")]]
           (is (denied? (bash task task cmd)) cmd)))
+      (testing "the bullet files are locked in bash too, or the lock has a hole the shell walks through"
+        (doseq [cmd ["printf -- '- **x** — y\\n' >> decision.md"
+                     "chmod 644 escalation.md"
+                     (str "echo x > " task "/finding.md")
+                     (str "python3 -c \"open('" task "/gotcha.md','a').write('x')\"")]]
+          (is (denied? (bash task task cmd)) cmd))
+        (is (str/includes? (get-in (:json (bash task task "printf x >> decision.md"))
+                                   ["hookSpecificOutput" "permissionDecisionReason"])
+            "note.bb")
+            "and the denial says what to run instead"))
       (testing "bash reads and unrelated commands pass"
         (doseq [cmd [(str "cat " task "/goal.md 2>/dev/null")
                      "grep -c '^- \\[ \\]' goal.md"
                      "sed -n 1,5p metrics.md"
-                     "printf -- '- **x** — y\\n' >> decision.md"
-                     "chmod 644 escalation.md"
+                     "cat decision.md"
+                     "grep -c FIND finding.md"
                      "git status --short"]]
           (is (allowed? (bash task task cmd)) cmd))
         (is (allowed? (bash task sandbox "echo x > goal.md")) "a goal.md in some other cwd is not ours"))
-      (testing "denials are logged under the task's state"
+      (testing "denials are logged under the task's state, with the reason that fired"
         (let [log (fs/path task "state" "denials.jsonl")]
           (is (fs/regular-file? log))
-          (let [entry (json/parse-string (last (str/split-lines (slurp (str log)))))]
-            (is (= "implement" (get entry "role")))
-            (is (= "Bash" (get entry "tool")))
-            (is (str/includes? (get entry "reason") "truth"))))))))
+          (let [entries (mapv #(json/parse-string %) (str/split-lines (slurp (str log))))
+                reasons (mapv #(get % "reason") entries)]
+            (is (every? #(= "implement" (get % "role")) entries))
+            (is (some #(str/includes? % "truth") reasons) "the truth denials are logged")
+            (is (some #(str/includes? % "note.bb") reasons) "and so are the bullet-file ones")
+            (is (some #(= "Bash" (get % "tool")) entries))
+            (is (some #(= "Edit" (get % "tool")) entries))))))))

@@ -253,6 +253,22 @@
         (is (not (judge-called? dir "c")) "grok has no judge: nothing graded, nothing refused")
         (is (nil? (verdict-file dir "c")))))))
 
+;; ------------------------------------------------------------ note.bb
+
+(deftest a-note-in-a-multi-repo-task-says-which-repo
+  (with-task {:repo-names ["fixture" "other"]}
+    (fn [{:keys [dir in-session]}]
+      (is (zero? (:exit (in-session "a_other" "other" nil "note.bb"
+                                    "finding" "the exporter already retries"
+                                    "upstreams.py:88 wraps it, so the plan is redundant"))))
+      (is (= "- [other] **the exporter already retries** — upstreams.py:88 wraps it, so the plan is redundant"
+             (str/trim (slurp (str (fs/path dir "finding.md")))))
+          "past one repo a bullet has to say which, or a cross-repo finding has no home")
+      (testing "the tag follows the session, not the cwd"
+        (is (zero? (:exit (in-session "a_fixture" "fixture" nil "note.bb"
+                                      "gotcha" "the shim rewrites argv" "so resolve the binary first"))))
+        (is (str/starts-with? (str/trim (slurp (str (fs/path dir "gotcha.md")))) "- [fixture]"))))))
+
 ;; ------------------------------------------------------------ granularity
 
 (deftest a-session-is-graded-on-its-own-repo-s-goal-lines

@@ -73,6 +73,7 @@
         (write! (fs/path dir "evidence" "notes-only.txt") "a note the run role wrote by hand\nHAND-WRITTEN-TAIL\n")
         (write! (fs/path dir "evidence" "silent-measure.txt") "bar: silent measure\ncommand: echo -n\nexit: 0\nstarted_at: 2026-09-06T00:02:00Z\n--- output ---\n")
         (write! (fs/path dir "escalation.md") "- **needs Allen** — a bar cannot be met\n")
+        (write! (fs/path dir "finding.md") "- **FINDING-MARK the exporter already retries** — upstreams.py:88 wraps it\n")
         (write! (fs/path dir "gotcha.md") "- **PATH is rebuilt by tmux** — resolve binaries first\n")
         (write! (fs/path dir "mail" "run" "failed" "50_x_from_run_to_nobody.handoff") "id: x\n")
         (write! (fs/path dir "state" "denials.jsonl") "{\"tool\":\"Edit\"}\n{\"tool\":\"Bash\"}\n")
@@ -133,6 +134,12 @@
               (is (str/includes? body "role run: the goal judge was unavailable"))
               (is (str/includes? body "<details class=\"item\">")
                   "each attention item collapses to one line; the full text stays in the page"))
+            (testing "a finding has a section of its own and is not an attention item"
+              (is (str/includes? body "FINDING-MARK the exporter already retries")
+                  "findings are shown — one written nowhere anyone reads is worse than none")
+              (is (str/includes? body "finding.md"))
+              (is (not (str/includes? (subs body 0 (str/index-of body "finding.md")) "FINDING-MARK"))
+                  "and never above it, in Attention: a finding is not waiting on anyone"))
             (testing "bullets, drafts, role cards"
               (is (str/includes? body "PATH is rebuilt by tmux"))
               (is (str/includes? body "href=\"/tasks/t-portal/doc?path=draft-implement.md\""))

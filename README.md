@@ -97,7 +97,7 @@ Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is
   goal.md  metrics.md          the truth: what done means and how it is measured (locked 444)
   roles                        the lineup, one line per role (grammar below)
   repos                        the checkouts, one per line
-  decision.md gotcha.md escalation.md   roles append one bullet per line
+  decision.md gotcha.md finding.md escalation.md   one bullet per line, written by note.bb
   draft-<role>.md              a role's full write-up
   evidence/<bar>.txt           the run role's measurements
   worktrees/<repo>/            one worktree per repo, branch sk/<task-id>, added from the checkout itself
@@ -150,6 +150,9 @@ swarmkhazad open --linear <KEY> [--repo <path>]...
 swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server
 swarmkhazad paths <task-id>                    print the path map
 swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)
+
+note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'
+                                               append one bullet, tagged with the session's repo
 swarmkhazad telemetry <task-id>                cost, tokens and sessions per role
 ```
 
@@ -192,7 +195,7 @@ Files are the transport, tmux carries only the wake-up. A role writes a four-lin
 `swarmkhazad portal` serves a local, server-rendered page over `~/.swarmkhazad` (http-kit and hiccup ship inside `bb`; `SWARMKHAZAD_PORTAL_PORT` or `--port` picks the port; it binds 127.0.0.1 only). It is the one always-on process besides a task's own daemon, and it is read-mostly: nothing it shows is stored anywhere but the task folder.
 
 - `/` — every task with its board lane, roles and attention count, plus the kickstart form: task id, one local checkout per line, the `roles` declaration (stage prompts, harnesses and vendors listed under it). Submitting runs `new`, writes `roles`, starts `open` in the background (`state/portal-open.log`) and redirects to the task page.
-- `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the three bullet files and the drafts.
+- `/tasks/<id>` — refreshes every 5 s. **Attention** first: escalation lines, failed mail, contract denials, a down judge, a dead daemon. `finding.md` is deliberately not counted — a finding is something the swarm worked out, not something waiting on anyone, and counting it as an ask is how one task's badge read 22 when ten of those lines needed nobody. Then the board lane, `goal.md`'s Goal boxes with a live status per line — `unmet` when a role's latest verdict names it, `met` when every verdict is met, `pending` otherwise, `ticked` when control has ticked it in the file; the portal never edits the file — the metrics bars with each one's latest `evidence/<bar>.txt` (exit, time, last lines), the role cards (harness, vendor, verdict, mail counts, the pane's last line), the four bullet files and the drafts.
 - `/tasks/<id>/roles/<role>` — the role's pane, polled every 2 s from `/tasks/<id>/roles/<role>/pane`: the live tmux capture while the task's server is up, the archived `state/sessions/<role>/pane.txt` after `close`.
 - `/tasks/<id>/doc?path=<rel>` — any regular file inside the task folder (`doc-file`: canonical path under the task folder, never under `worktrees/`, never through a symlink that leaves it).
 

@@ -1,7 +1,7 @@
 ## The task folder is the contract
 
 - `goal.md` says what done means; `metrics.md` says how it is measured. Both are read-only truth. Never edit, move, or unlock them. A bar you cannot meet is a line in `escalation.md`, never a change to the bar.
-- Append one line per fact to `decision.md` (a fork you resolved and why), `gotcha.md` (something that cost you time and would again), `escalation.md` (something only a human can clear). Format: `- **<claim>** — <why>`.
+- Record facts with `note.bb <kind> '<claim>' '<why>'`, one line each. The four kinds: `decision` (a fork you resolved — name what you rejected), `gotcha` (something that cost you time and would cost the next one), `escalation` (something only a human can clear — an ASK), `finding` (something you established that nobody asked for — NOT an ask). It writes the bullet and stamps the repo, so the files stay parseable and a finding does not read as a problem waiting on someone. Editing those four files directly is denied.
 - Write your full write-up to `draft-<your role>.md` in the task folder before you hand off. The handoff names it in `artifacts:`.
 - Scratch and handoff drafts go under the task folder's `tmp/`. Never write under the human's `~/repos`; your worktree is the only repo you touch.
 - Do not ask questions in this pane. Nobody is reading it live. Decide, record the assumption in `decision.md`, and continue; if you truly cannot proceed, write the block to `escalation.md` and hand off what you have.

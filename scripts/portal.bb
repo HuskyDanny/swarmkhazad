@@ -114,7 +114,12 @@
 (defn opened? [ctx] (fs/regular-file? (:tmux-socket-file ctx)))
 
 (defn attention
-  "What needs a human: escalation lines, failed mail, denials, a down judge, a dead daemon."
+  "What needs a human: escalation lines, failed mail, denials, a down judge, a
+   dead daemon.
+
+   finding.md is deliberately NOT here. A finding is something the swarm worked
+   out, not something waiting on anyone — counted as an ask it reads as a
+   problem nobody is solving, which is how one task showed 22."
   [ctx]
   (let [esc (nonblank-lines (text (:escalation-file ctx)))
         failed (when (fs/directory? (:mail-dir ctx))
@@ -917,7 +922,9 @@
                                  [:span.status.pending "no verdict"])]
                [:div.muted "sent " (:sent c) " · inbox " (:inbox c)]
                [:div.muted.pane-line (:last-line c)]])]]
-          (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file] ["escalation.md" :escalation-file]]]
+          (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file]
+                           ["finding.md — what the swarm worked out, not an ask" :finding-file]
+                           ["escalation.md" :escalation-file]]]
             [:section [:h2 title]
              (let [ls (nonblank-lines (text (get ctx k)))]
                (if (seq ls) [:ul.plain (for [l ls] [:li (str/replace l #"^- " "")])] [:p.empty "empty"]))])

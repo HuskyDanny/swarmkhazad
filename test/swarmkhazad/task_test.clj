@@ -161,11 +161,11 @@
           (doseq [session ["implement_fixture" "review_fixture" "review_other"]
                   sub ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"]]
             (is (fs/directory? (fs/path dir "mail" session sub)) (str session "/" sub))))
-        (testing "the three bullet files exist and are empty; nothing clones into the task folder"
-          (doseq [f ["decision.md" "gotcha.md" "escalation.md"]]
+        (testing "the four bullet files exist and are empty; nothing clones into the task folder"
+          (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
-          (is (= #{"decision.md" "escalation.md" "evidence" "goal.md" "gotcha.md" "mail" "metrics.md"
-                   "prompts" "repos" "roles" "state" "tmp" "worktrees"}
+          (is (= #{"decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md" "mail"
+                   "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
                  (set (map fs/file-name (fs/list-dir dir))))))
         (testing "prepare is idempotent, and a re-prepare keeps a commit the role made"
           (spit (str (fs/path wt "probe.txt")) "x\n")

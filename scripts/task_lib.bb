@@ -110,6 +110,10 @@
      :decision-file (fs/path task-dir "decision.md")
      :gotcha-file (fs/path task-dir "gotcha.md")
      :escalation-file (fs/path task-dir "escalation.md")
+     ;; What the swarm worked out, as opposed to what it is waiting on. Kept
+     ;; apart from escalation.md because the portal counts asks, and a finding
+     ;; counted as an ask reads as a problem nobody is solving.
+     :finding-file (fs/path task-dir "finding.md")
      :evidence-dir (fs/path task-dir "evidence")
      :repos-file (fs/path task-dir "repos")
      :worktrees-dir (fs/path task-dir "worktrees")
@@ -588,7 +592,7 @@
   (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
              :evidence-dir :board-dir :daemon-dir :sessions-dir]]
     (fs/create-dirs (get ctx k)))
-  (doseq [k [:decision-file :gotcha-file :escalation-file]]
+  (doseq [k [:decision-file :gotcha-file :escalation-file :finding-file]]
     (when-not (fs/exists? (get ctx k))
       (spit (str (get ctx k)) ""))))
 
