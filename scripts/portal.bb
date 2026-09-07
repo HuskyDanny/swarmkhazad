@@ -135,6 +135,48 @@
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
 
+(defn- assoc-or-dissoc [m k on?]
+  (if on? (assoc m k (str (java.time.Instant/now))) (dissoc m k)))
+
+(defn attention-key
+  "A stable id for one attention item. Escalations are append-only bullets and
+   the other kinds are derived from files, so the text is the only thing that
+   survives a re-render — there is no row id to use. Hashed because the raw text
+   is a paragraph and this goes in a form field."
+  [{:keys [kind text]}]
+  (let [d (java.security.MessageDigest/getInstance "SHA-1")
+        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
+    (apply str (map #(format "%02x" %) (take 8 b)))))
+
+(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
+
+(defn handled
+  "key → when it was crossed off. A separate file, never escalation.md: the
+   roles own that one and append to it, and a portal that edited it would be
+   rewriting what a role said rather than recording what a person did about it."
+  [ctx]
+  (into {} (for [l (nonblank-lines (text (handled-file ctx)))
+                 :let [[k at] (str/split l #"\t" 2)]
+                 :when (seq k)]
+             [k (or at "")])))
+
+(defn set-handled!
+  "Cross one off, or put it back. Rewrites the file rather than appending, so
+   unticking actually removes the row instead of leaving both states in it."
+  [ctx key on?]
+  (let [now (assoc-or-dissoc (handled ctx) key on?)]
+    (fs/create-dirs (:state-dir ctx))
+    (spit (str (handled-file ctx))
+          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))
+
+(defn open-attention
+  "What still needs a human: the list minus what someone has crossed off. Both
+   the swimlane card and the task page count this, so `3 needs you` on the board
+   and `Attention 3` on the page cannot disagree."
+  [ctx]
+  (let [done (handled ctx)]
+    (remove #(contains? done (attention-key %)) (attention ctx))))
+
 (defn roles [ctx]
   (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
 
@@ -349,6 +391,15 @@
    .lane{font-size:.9rem;color:var(--blue);white-space:nowrap}
    .lane.done{color:var(--green)}
    .muted{color:var(--muted);font-size:.85rem}
+   .att{display:flex;align-items:flex-start;gap:.55rem;margin-bottom:.4rem}
+   .att .item{flex:1;min-width:0;margin-bottom:0}
+   .att form{flex:none;padding-top:.72rem}
+   button.tick{width:17px;height:17px;padding:0;border-radius:5px;background:var(--surface);
+     border:1px solid var(--muted);color:#fff;font-size:11px;line-height:1;cursor:pointer}
+   button.tick:hover{border-color:var(--accent)}
+   .att.off button.tick{background:var(--green);border-color:var(--green)}
+   .att.off .kind{color:var(--muted)}
+   .att.off summary .grow{text-decoration:line-through;color:var(--muted)}
    .attention .item{border:1px solid var(--line);border-radius:12px;margin-bottom:.4rem}
    .attention summary{display:flex;align-items:center;gap:.75rem;padding:.7rem 1.1rem;
      cursor:pointer;list-style:none}
@@ -576,7 +627,7 @@
   (let [columns (conj (mapv :role (:roles project)) "done")
         cards (for [id (project-lib/tasks-for (:name project))
                     :let [ctx (task-lib/task-ctx id)]]
-                {:id id :lane (lane ctx) :attention (count (attention ctx))})
+                {:id id :lane (lane ctx) :attention (count (open-attention ctx))})
         placed (set (map :lane cards))
         stray (remove #(contains? (set columns) (:lane %)) cards)]
     [:section.project
@@ -614,7 +665,7 @@
              [:p.empty "no projects yet — a project holds the checkouts and the swarm, so a task only has to say what it wants done. Open the composer below."]])
           (when (seq loose)
             [:section [:h2 "Tasks outside a project"]
-             (for [id loose :let [ctx (task-lib/task-ctx id) att (attention ctx)]]
+             (for [id loose :let [ctx (task-lib/task-ctx id) att (open-attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
                 [:div.grow [:div.name.trunc id]
                  [:div.muted.trunc (str/join ", " (map :role (roles ctx)))]]
@@ -778,14 +829,37 @@
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
             [:span.lane {:class (when (= "done" l) "done")} l]]]
-          [:section.attention
-           [:h2 "Attention " [:span.status {:class (if (seq att) "unmet" "met")} (count att)]]
-           (if (seq att)
-             (for [a att]
-               [:details.item
-                [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
-                [:div.full (:text a)]])
-             [:p.empty "nothing needs a human"])]
+          (let [done (handled ctx)
+                keyed (for [a att] (assoc a :key (attention-key a) :done (get done (attention-key a))))
+                ;; crossed-off items sink to the bottom and stop counting, the
+                ;; way a checklist behaves. They are never deleted: the whole
+                ;; point of the list is that it survives someone deciding an
+                ;; item is fine, so the next reader can see what was decided.
+                open-items (remove :done keyed)
+                shut-items (filter :done keyed)]
+            [:section.attention
+             [:h2 "Attention "
+              [:span.status {:class (if (seq open-items) "unmet" "met")} (count open-items)]
+              (when (seq shut-items) [:span.muted " · " (count shut-items) " crossed off"])]
+             (if (seq keyed)
+               (for [a (concat open-items shut-items)]
+                 [:div.att {:class (when (:done a) "off")}
+                  ;; The tick is a sibling of the <details>, not inside its
+                  ;; <summary>: anything inside a summary toggles the disclosure
+                  ;; when clicked, so a checkbox there would expand the item
+                  ;; every time you crossed it off.
+                  [:form {:method "post" :action (str "/tasks/" id "/attention")}
+                   [:input {:type "hidden" :name "key" :value (:key a)}]
+                   [:input {:type "hidden" :name "do" :value (if (:done a) "open" "handle")}]
+                   [:button.tick {:type "submit"
+                                  :title (if (:done a)
+                                           (str "crossed off " (:done a) " — put it back")
+                                           "cross it off")}
+                    (if (:done a) "✓" " ")]]
+                  [:details.item
+                   [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
+                   [:div.full (:text a)]]])
+               [:p.empty "nothing needs a human"])])
           [:section [:h2 "Goal"]
            [:ul.plain
             (for [g (goal-lines (text (:goal-file ctx))) :let [{:keys [status roles]} (goal-status g vs)]]
@@ -930,6 +1004,18 @@
      ;; not a new one. The text is passed as one argv element to `tmux
      ;; send-keys -l`, never through a shell, so it is typed and never run; the
      ;; role must be one this task declared, like every other role route here.
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/attention" uri))]
+       (if-let [ctx (ctx-for id)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               key (get params "key")]
+           ;; Only a key this task's own attention list currently produces. The
+           ;; file is keys and timestamps, so a made-up one would just sit
+           ;; there, but a store that accepts arbitrary strings from a form is
+           ;; a store that grows without bound.
+           (when (some #(= key (attention-key %)) (attention ctx))
+             (set-handled! ctx key (= "handle" (get params "do"))))
+           {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
+         (not-found)))
      (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/summary" uri))]
        (if-let [ctx (ctx-for id)]
          (let [r (summary/summarize! ctx)]

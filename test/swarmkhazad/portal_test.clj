@@ -273,6 +273,101 @@
         (is (empty? (:goal r))
             "this exact paste once became twenty-five goal checkboxes")))))
 
+(deftest an-attention-line-can-be-crossed-off-and-put-back
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-att."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home}
+        id "t-att"
+        page (fn [] (:body (request env :get (str "/tasks/" id))))
+        index (fn [] (:body (request env :get "/")))
+        keys-on-page (fn [b] (re-seq #"name=\"key\" type=\"hidden\" value=\"([0-9a-f]{16})\"" b))]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles")) (str "implement claude " src " task\n"))
+        (run {:env env} cli "prepare" id)
+        ;; In a project, so the assertions below run against the swimlane card
+        ;; and not the loose-task row — they count attention by different code
+        ;; paths, and only one of them was covered.
+        (write! (fs/path home "projects" "p-att.edn")
+                (pr-str {:name "p-att" :repos [src]
+                         :roles [{:role "implement" :harness "claude" :model "anthropic" :repo src}]}))
+        (spit (str (fs/path dir "project")) "p-att\n")
+        ;; and in a lane, because a task with no board card renders as a stray
+        ;; line rather than a card, and the card is the count under test.
+        (write! (fs/path dir "state" "board" "tasks.tsv")
+                (str id "\timplement\t2026-09-07T00:00:00Z\t2026-09-07T00:00:00Z\n"))
+        (spit (str (fs/path dir "escalation.md"))
+              (str "- **the first thing** — needs Allen\n"
+                   "- **the second thing** — also needs Allen\n"))
+        (write! (fs/path dir "state" "denials.jsonl") "{\"tool\":\"Edit\"}\n")
+
+        (testing "every line starts open, and the board card agrees with the page"
+          (let [b (page)]
+            (is (= 3 (count (keys-on-page b))) "two escalations and the denials line")
+            (is (str/includes? b "<span class=\"status unmet\">3</span>")))
+          (is (str/includes? (index) "class=\"tcard\"") "the task is a card in its project's swimlane")
+          (is (str/includes? (index) "3 needs you")))
+
+        (let [k (second (first (keys-on-page (page))))]
+          (testing "crossing one off drops it from both counts without deleting it"
+            (let [r (request env :post (str "/tasks/" id "/attention")
+                             {:body (str "key=" k "&do=handle")})]
+              (is (= 303 (:status r)))
+              (is (= (str "/tasks/" id) (get (:headers r) "Location"))))
+            (let [b (page)]
+              (is (str/includes? b "<span class=\"status unmet\">2</span>"))
+              (is (str/includes? b "1 crossed off"))
+              (is (str/includes? b "class=\"att off\"") "and it renders struck through, still there")
+              (is (= 3 (count (keys-on-page b))) "nothing was removed from the list"))
+            (is (str/includes? (index) "2 needs you") "the swimlane card cannot disagree with the page"))
+
+          (testing "the escalation file is untouched — the roles own it, the portal does not"
+            (is (str/includes? (slurp (str (fs/path dir "escalation.md"))) "the first thing"))
+            (is (= 2 (count (str/split-lines (slurp (str (fs/path dir "escalation.md"))))))))
+
+          (testing "putting it back removes the row rather than recording both states"
+            (request env :post (str "/tasks/" id "/attention") {:body (str "key=" k "&do=open")})
+            (let [f (fs/path dir "state" "attention-handled.tsv")]
+              (is (str/blank? (slurp (str f)))))
+            (is (str/includes? (page) "<span class=\"status unmet\">3</span>"))))
+
+        (testing "each line has its own key, so crossing one off does not cross its neighbour"
+          (let [ks (map second (keys-on-page (page)))]
+            (is (= 3 (count (distinct ks))) "three lines, three keys")
+            (request env :post (str "/tasks/" id "/attention") {:body (str "key=" (first ks) "&do=handle")})
+            (let [b (page)]
+              (is (str/includes? b "<span class=\"status unmet\">2</span>") "exactly one went")
+              (is (str/includes? b "1 crossed off")))
+            (request env :post (str "/tasks/" id "/attention") {:body (str "key=" (first ks) "&do=open")})))
+
+        (testing "the kind is part of the key, so two kinds reading the same cannot collide"
+          ;; A failed-mail item's text is the path; an escalation line can say
+          ;; exactly that path. Contrived, but legal input — and without the
+          ;; kind in the hash, crossing off one would cross off the other.
+          (let [path "mail/run/failed/50_x_from_run_to_nobody.handoff"]
+            (write! (fs/path dir "mail" "run" "failed" "50_x_from_run_to_nobody.handoff") "id: x\n")
+            (spit (str (fs/path dir "escalation.md")) (str "- " path "\n") :append true)
+            (let [b (page)
+                  ks (map second (keys-on-page b))]
+              (is (= (count ks) (count (distinct ks)))
+                  "the escalation and the failed mail read identically and still key apart"))
+            ;; put the fixture back for the assertions that follow
+            (fs/delete (fs/path dir "mail" "run" "failed" "50_x_from_run_to_nobody.handoff"))
+            (spit (str (fs/path dir "escalation.md"))
+                  (str "- **the first thing** — needs Allen\n"
+                       "- **the second thing** — also needs Allen\n"))))
+
+        (testing "a key this task never produced is ignored, so the store cannot be grown from a form"
+          (request env :post (str "/tasks/" id "/attention") {:body "key=deadbeefdeadbeef&do=handle"})
+          (let [f (fs/path dir "state" "attention-handled.tsv")]
+            (is (or (not (fs/exists? f)) (str/blank? (slurp (str f))))))
+          (is (str/includes? (page) "<span class=\"status unmet\">3</span>"))))
+      (finally
+        (fs/delete-tree sandbox)))))
+
 (deftest the-model-sorts-the-paste-but-the-parser-still-decides
   (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
   (load-file (str (fs/path repo-root "scripts" "project_lib.bb")))
