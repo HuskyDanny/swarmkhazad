@@ -39,15 +39,8 @@
   "Type the wake-up into the recipient's pane. Best-effort: a role whose session
    is gone still gets its inbox file; only the nudge is lost."
   [ctx role]
-  (when-let [socket (handoff-lib/tmux-socket ctx)]
-    (let [target (task-lib/session-name role)
-          ok? (zero? (:exit (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "-l" wake-message)))]
-      (if ok?
-        (do (Thread/sleep 150)
-            (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-m")
-            (Thread/sleep 50)
-            (process/sh {:continue true} "tmux" "-S" socket "send-keys" "-t" target "C-j"))
-        (log! ctx "wake-failed" role)))))
+  (when-not (handoff-lib/type-into-pane! ctx role wake-message)
+    (log! ctx "wake-failed" role)))
 
 (defn fail! [ctx path reason]
   (let [failed-dir (fs/path (fs/parent (fs/parent path)) "failed")

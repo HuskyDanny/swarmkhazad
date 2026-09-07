@@ -9,6 +9,7 @@
 ;;                              files, the board card, Attention, role cards
 ;;   /tasks/<id>/roles/<role>   the role's pane, streamed by polling
 ;;   /tasks/<id>/roles/<role>/pane   text/plain: live tmux capture, else the archive
+;;   POST /tasks/<id>/roles/<role>/keys  type into that pane, or Escape to interrupt it
 ;;   /projects                  POST: create a project (checkouts + role lineup)
 ;;   /projects/<name>/new       the only task form: goal, not-goal, bars
 ;;   /projects/<name>/tasks     POST: scaffold from the project, then open
@@ -17,7 +18,8 @@
 ;;
 ;; Nothing here writes into a task folder except kickstart, which only calls the
 ;; CLI. The portal never ticks a goal box: the checkboxes show what the judge
-;; said, and goal.md itself stays 444.
+;; said, and goal.md itself stays 444. The keys route writes nothing either —
+;; it types into a terminal the page already prints the attach command for.
 
 (ns portal
   (:require [babashka.fs :as fs]
@@ -387,6 +389,11 @@
    .railhead{display:flex;align-items:baseline;gap:.75rem;margin-bottom:.35rem}
    .railhead .status{flex:1;min-width:0}
    .rail pre{margin:0;max-height:72vh;min-height:320px}
+   .nudge{display:flex;gap:.4rem;margin-top:.5rem}
+   .nudge input[type=text]{padding:.45rem .7rem;font-size:.85rem}
+   .nudge button{padding:.45rem .95rem;font-size:.85rem}
+   button.ghost{color:var(--muted);background:none;border:1px solid var(--line)}
+   button.ghost:hover{color:var(--red);border-color:var(--red)}
    pre.term{background:#16150f;border-color:#2a2822;color:#d6d2c4;font-size:12px;
      line-height:1.45;padding:.9rem 1rem}
    pre.term .b{font-weight:700}
@@ -657,6 +664,19 @@
          [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
         [:pre#pane.term {:data-task id :data-role watching}
          (ansi->hiccup (pane-text ctx watching {:ansi true}))]
+        ;; The pane is the only way to reach an agent mid-turn: it owns the
+        ;; terminal, and the inbox it reads between turns is no use to a role
+        ;; that is already running. Until now that meant a tmux attach in
+        ;; another window, which is why the attach line below has always been
+        ;; here. It stays — this is the same thing without leaving the page.
+        (when (= state :live)
+          [:form.nudge {:method "post" :action (str "/tasks/" id "/roles/" watching "/keys")}
+           [:input {:type "text" :name "text" :autocomplete "off"
+                    :placeholder (str "say something to " watching "…")}]
+           [:button {:name "do" :value "send"} "Send"]
+           [:button.ghost {:name "do" :value "stop"
+                           :title "Escape — interrupt the turn it is in the middle of"}
+            "Stop"]])
         [:p.muted "attach: " [:code (str "tmux -S " (:tmux-socket ctx) " attach -t " (task-lib/session-name watching))]]))]))
 
 (defn task-page [ctx watching]
@@ -794,6 +814,20 @@
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/pane" uri))]
        (let [ctx (ctx-for id)]
          (if (and ctx (some #{role} (map :role (roles ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
+     ;; Typing into a pane is what an attached operator already does, and the
+     ;; attach command is printed beside the box — this route is that reach,
+     ;; not a new one. The text is passed as one argv element to `tmux
+     ;; send-keys -l`, never through a shell, so it is typed and never run; the
+     ;; role must be one this task declared, like every other role route here.
+     (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
+       (let [ctx (ctx-for id)]
+         (if (and ctx (some #{role} (map :role (roles ctx))))
+           (let [params (parse-form (if (string? body) body (some-> body slurp)))]
+             (if (= "stop" (get params "do"))
+               (handoff-lib/press-key! ctx role "Escape")
+               (handoff-lib/type-into-pane! ctx role (get params "text")))
+             {:status 303 :headers {"Location" (str "/tasks/" id "?pane=" role)} :body ""})
+           (not-found))))
      (not-found))))
 
 (defn -main [& args]

@@ -221,6 +221,64 @@
         (is (= (list [:span {:class "f1"} long-line])
                (f (str E "[31m" long-line))))))))
 
+(deftest the-pane-takes-typing-and-an-interrupt-from-the-page
+  ;; A running agent owns its terminal: the inbox it reads between turns is no
+  ;; use to one already mid-turn, so the only way to reach it is to type. That
+  ;; was a tmux attach in another window until now. The pane here is `cat -v`,
+  ;; which renders control characters visibly — so an Escape is observable as
+  ;; ^[ rather than having to be taken on trust.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-keys."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home}
+        id "t-keys"
+        socket (str (fs/path sandbox "k.sock"))
+        tmux (fn [& args] (apply run {:ok? false} "tmux" "-S" socket args))
+        pane (fn [] (:out (tmux "capture-pane" "-p" "-t" "sk-implement")))
+        post (fn [role body] (request env :post (str "/tasks/" id "/roles/" role "/keys") {:body body}))]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles")) (str "implement claude " src " task\n"))
+        (run {:env env} cli "prepare" id)
+        ;; the socket file is what the portal reads to find the server; a real
+        ;; `open` writes it, and this test stands in for that one line.
+        (write! (fs/path dir "state" "tmux-socket") socket)
+        (tmux "new-session" "-d" "-s" "sk-implement" "cat -v")
+        (Thread/sleep 500)
+        (try
+          (testing "typing lands in the pane"
+            (let [r (post "implement" "do=send&text=hello+there")]
+              (is (= 303 (:status r)) "and the browser goes back to the pane it typed into")
+              (is (= (str "/tasks/" id "?pane=implement") (get (:headers r) "Location"))))
+            (Thread/sleep 700)
+            (is (str/includes? (pane) "hello there")))
+
+          (testing "the text is typed, never interpreted — a tmux key name arrives as characters"
+            (post "implement" "do=send&text=C-c")
+            (Thread/sleep 700)
+            (is (str/includes? (pane) "C-c") "sent with -l, so it is three characters")
+            (is (str/includes? (:out (tmux "list-sessions")) "sk-implement")
+                "and cat is still running: C-c was not a signal"))
+
+          (testing "stop sends Escape, which cat -v shows as ^["
+            (post "implement" "do=stop")
+            (Thread/sleep 700)
+            (is (str/includes? (pane) "^[")))
+
+          (testing "an empty box types nothing rather than submitting a bare newline"
+            (let [before (pane)]
+              (is (= 303 (:status (post "implement" "do=send&text="))))
+              (Thread/sleep 400)
+              (is (= before (pane)))))
+
+          (testing "a role this task never declared is not a pane to type into"
+            (is (= 404 (:status (post "nobody" "do=send&text=x")))))
+          (finally (tmux "kill-server"))))
+      (finally
+        (fs/delete-tree sandbox)))))
+
 (deftest a-project-supplies-the-repos-and-the-roles-so-a-task-only-brings-a-goal
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-k."})
         home (str (fs/path sandbox "home"))
