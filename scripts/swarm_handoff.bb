@@ -27,10 +27,14 @@
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 
 (def usage-text
-  (str "Usage: swarm_handoff.bb <draft-file>\n\n"
+  (str "Usage: swarm_handoff.bb <draft-file>\n"
+       "       swarm_handoff.bb <draft-file> --no-change '<why nothing needed changing>'\n\n"
        "Write the draft under the task folder's tmp/ directory.\n\n"
        "type: git_handoff\nto: <role>[,<role>...]\npriority: NN\n\n"
-       "type: note\nto: <role>[,<role>...]\npriority: NN\nmessage: <one line, max 200 chars>\n"))
+       "type: note\nto: <role>[,<role>...]\npriority: NN\nmessage: <one line, max 200 chars>\n\n"
+       "--no-change is a git_handoff with an empty diff: you finished, and the right\n"
+       "answer was to change nothing. It is graded, it moves the board and it wakes the\n"
+       "next role exactly like any other handoff — a note does none of those things.\n"))
 
 (def allowed-fields #{"type" "to" "priority" "message"})
 (def allowed-types #{"git_handoff" "note"})
@@ -146,11 +150,16 @@
 
 ;; ---------------------------------------------------------------- write
 
-(defn body-text [type sender commit message]
+(defn body-text [type sender commit message no-change]
   (case type
-    "git_handoff" (str "Re-read your instructions.\n\n" sender " committed " commit
-                       " in its repo. Nothing to merge: if that is your repo too, it is already"
-                       " on your branch; if it is not, read the diff there rather than pulling it.\n")
+    "git_handoff" (if no-change
+                    (str "Re-read your instructions.\n\n" sender " changed nothing, on purpose: "
+                         no-change "\n\nIts tree is unchanged at " commit
+                         ". Read its draft for the evidence behind that call, and review the"
+                         " reasoning rather than a diff.\n")
+                    (str "Re-read your instructions.\n\n" sender " committed " commit
+                         " in its repo. Nothing to merge: if that is your repo too, it is already"
+                         " on your branch; if it is not, read the diff there rather than pulling it.\n"))
     "note" (str "Re-read your instructions.\n\n" message "\n")))
 
 (defn origin-repo
@@ -161,7 +170,7 @@
   (let [repos (distinct (keep :repo (task-lib/read-sessions-tsv ctx)))]
     (when (> (count repos) 1) (:repo row))))
 
-(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet repo]}]
+(defn write-handoff! [ctx {:keys [sender recipients headers commit artifacts non-forwarding? base unmet repo no-change]}]
   (let [out (handoff-lib/outbox-dir ctx sender)
         stamp (handoff-lib/fresh-stamp out sender)
         type (get headers "type")
@@ -178,13 +187,17 @@
                    "task" (:task-id ctx)
                    "created_at" (handoff-lib/timestamp)}
             (= type "git_handoff") (assoc "role" sender "commit" commit "artifacts" (str/join "," artifacts))
+            ;; Not a flag the recipient has to infer from an empty artifact
+            ;; list: the next role, the judge and the summarizer all need to
+            ;; tell "changed nothing, on purpose" from "changed nothing, stalled".
+            no-change (assoc "no_change" no-change)
             (and (= type "git_handoff") repo) (assoc "origin_repo" repo)
             (and (= type "git_handoff") base) (assoc "task_base_commit" base)
             non-forwarding? (assoc "non-forwarding" "true")
             (seq unmet) (assoc "unmet" (str/join "; " unmet))
             (= type "note") (assoc "message" (get headers "message")))]
     (fs/create-dirs (fs/path out "tmp"))
-    (spit (str tmp) (handoff-lib/render-message h (body-text type sender commit (get headers "message"))))
+    (spit (str tmp) (handoff-lib/render-message h (body-text type sender commit (get headers "message") no-change)))
     (fs/move tmp final)
     final))
 
@@ -270,9 +283,19 @@
 
 (defn -main [& args]
   (when (some #{"--help" "-h"} args) (print usage-text) (System/exit 0))
-  (when (not= 1 (count args)) (exit! 1 usage-text))
-  (let [ctx (task-lib/ctx-from-env)
-        draft (fs/absolutize (fs/path (first args)))
+  ;; `--no-change '<why>'` is the one outcome this helper had no channel for: the
+  ;; role finished, and the right answer was to change nothing. Its reason is
+  ;; required — an empty diff with no explanation is indistinguishable from a
+  ;; role that gave up, and that is exactly the distinction the next role, the
+  ;; judge and the board all need to make.
+  (let [no-change? (boolean (some #{"--no-change"} args))
+        why (when no-change? (second (drop-while #(not= "--no-change" %) args)))
+        positional (remove #{"--no-change" why} args)
+        _ (when (and no-change? (str/blank? why))
+            (exit! 1 "--no-change needs a reason: swarm_handoff.bb <draft> --no-change '<why nothing needed changing>'"))
+        _ (when (not= 1 (count positional)) (exit! 1 usage-text))
+        ctx (task-lib/ctx-from-env)
+        draft (fs/absolutize (fs/path (first positional)))
         sender (handoff-lib/session ctx)
         row (handoff-lib/session-row ctx sender)]
     (when-not (fs/regular-file? draft) (exit! 1 (str "Draft file not found: " draft)))
@@ -299,9 +322,15 @@
             base (when git? (task-base ctx sender))
             files (when git? (changed-files worktree base commit))
             draft-doc (str "draft-" sender ".md")
-            artifacts (when git? (cond-> files (fs/regular-file? (fs/path (:task-dir ctx) draft-doc)) (conj draft-doc)))]
-        (when (and git? (empty? files))
-          (exit! 1 (str "Result commit " commit " changes no files" (when base (str " since task base " base)) "; commit your work first.")))
+            artifacts (when git? (cond-> (vec files)
+                                   (fs/regular-file? (fs/path (:task-dir ctx) draft-doc)) (conj draft-doc)))]
+        (when (and git? (empty? files) (not no-change?))
+          (exit! 1 (str "Result commit " commit " changes no files" (when base (str " since task base " base))
+                        "; commit your work first, or pass --no-change '<why nothing needed changing>'"
+                        " if the right answer was to change nothing.")))
+        (when (and no-change? (seq files))
+          (exit! 1 (str "--no-change, but commit " commit " changes " (count files)
+                        " file(s); send it as an ordinary handoff.")))
         (when-let [dup (and git? (duplicate-active ctx sender recipients commit))]
           (exit! 1 (str "Duplicate active handoff for the same from/to/commit: " dup)))
         (let [verdict (when git? (judge-verdict ctx sender))
@@ -312,6 +341,7 @@
               unmet (when (and verdict (not (:met verdict))) (:unmet verdict))
               final (write-handoff! ctx {:sender sender :recipients recipients :headers headers
                                          :commit commit :artifacts artifacts :base base :unmet unmet
+                                         :no-change (when no-change? why)
                                          :repo (when git? (origin-repo ctx row))
                                          :non-forwarding? (and git? (handoff-lib/last-role? ctx sender))})]
           (fs/delete draft)

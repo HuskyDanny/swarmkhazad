@@ -630,3 +630,44 @@
          :roles roles
          :repos worktrees
          :sessions rows}))))
+
+;; ---------------------------------------------------------------------------
+;; Attention cross-offs.
+;;
+;; Task state, so it lives here rather than in the portal: a role that fixes the
+;; thing it escalated has to be able to cross the item off itself, and the
+;; portal is not the only writer any more. One key function, shared — a second
+;; copy of this hash in the other writer would drift and quietly stop matching.
+
+(defn attention-key
+  "A stable id for one attention item. Escalations are append-only bullets and
+   the other kinds are derived from files, so the text is the only thing that
+   survives a re-render — there is no row id to use. Hashed because the raw text
+   is a paragraph and this goes in a form field."
+  [{:keys [kind text]}]
+  (let [d (java.security.MessageDigest/getInstance "SHA-1")
+        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
+    (apply str (map #(format "%02x" %) (take 8 b)))))
+
+(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
+
+(defn handled
+  "key → when it was crossed off. A separate file, never escalation.md: the
+   roles own that one and append to it, and a writer that edited it would be
+   rewriting what a role said rather than recording what was done about it."
+  [ctx]
+  (into {} (for [l (str/split-lines (or (try (slurp (str (handled-file ctx))) (catch Exception _ nil)) ""))
+                 :let [[k at] (str/split l #"\t" 2)]
+                 :when (seq (str/trim (or k "")))]
+             [k (or at "")])))
+
+(defn set-handled!
+  "Cross one off, or put it back. Rewrites the file rather than appending, so
+   unticking actually removes the row instead of leaving both states in it."
+  [ctx key on?]
+  (let [now (if on?
+              (assoc (handled ctx) key (str (java.time.Instant/now)))
+              (dissoc (handled ctx) key))]
+    (fs/create-dirs (:state-dir ctx))
+    (spit (str (handled-file ctx))
+          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))

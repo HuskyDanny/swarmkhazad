@@ -156,39 +156,12 @@
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
 
-(defn- assoc-or-dissoc [m k on?]
-  (if on? (assoc m k (str (java.time.Instant/now))) (dissoc m k)))
-
-(defn attention-key
-  "A stable id for one attention item. Escalations are append-only bullets and
-   the other kinds are derived from files, so the text is the only thing that
-   survives a re-render — there is no row id to use. Hashed because the raw text
-   is a paragraph and this goes in a form field."
-  [{:keys [kind text]}]
-  (let [d (java.security.MessageDigest/getInstance "SHA-1")
-        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
-    (apply str (map #(format "%02x" %) (take 8 b)))))
-
-(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
-
-(defn handled
-  "key → when it was crossed off. A separate file, never escalation.md: the
-   roles own that one and append to it, and a portal that edited it would be
-   rewriting what a role said rather than recording what a person did about it."
-  [ctx]
-  (into {} (for [l (nonblank-lines (text (handled-file ctx)))
-                 :let [[k at] (str/split l #"\t" 2)]
-                 :when (seq k)]
-             [k (or at "")])))
-
-(defn set-handled!
-  "Cross one off, or put it back. Rewrites the file rather than appending, so
-   unticking actually removes the row instead of leaving both states in it."
-  [ctx key on?]
-  (let [now (assoc-or-dissoc (handled ctx) key on?)]
-    (fs/create-dirs (:state-dir ctx))
-    (spit (str (handled-file ctx))
-          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))
+;; The cross-off store lives in task_lib: a role that fixes what it escalated
+;; crosses the item off with note.bb, so the portal is no longer its only
+;; writer. Aliased here because the call sites below read better unqualified.
+(def attention-key task-lib/attention-key)
+(def handled task-lib/handled)
+(def set-handled! task-lib/set-handled!)
 
 (defn open-attention
   "What still needs a human: the list minus what someone has crossed off. Both
@@ -288,6 +261,18 @@
        :sent (count-files (fs/path mail "sent"))
        :inbox (+ (count-files (fs/path mail "inbox" "new")) (count-files (fs/path mail "inbox" "in_process")))
        :last-line (last (nonblank-lines (pane-text ctx name)))})))
+
+(defn session-summary
+  "`implement: superset, gobel · review: superset, gobel`.
+
+   The four session ids on their own made a reader group them by prefix to see
+   there were two roles and two repos. Roles come out in the roles file's order,
+   which is the order the work moves through."
+  [rows]
+  (str/join " · "
+            (for [role (distinct (map :role rows))]
+              (let [repos (for [r rows :when (= role (:role r))] (or (:repo r) (:session r)))]
+                (str role ": " (str/join ", " repos))))))
 
 (defn lane [ctx]
   (or (try (board-lib/card-lane ctx (:task-id ctx)) (catch Exception _ nil))
@@ -586,7 +571,13 @@
    .row.head{align-items:flex-start}
    a.doc{color:var(--blue);text-decoration:none;font-size:.9rem;white-space:nowrap}
    .card-top{display:flex;align-items:center;justify-content:space-between}
-   .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}")
+   .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}
+   .rolegroups{display:flex;flex-direction:column;gap:.7rem}
+   .rolegroup{background:var(--row);border-radius:14px;padding:.5rem}
+   .rolegroup .rolename{font-size:.8rem;font-weight:600;color:var(--muted);
+     letter-spacing:.06em;text-transform:uppercase;padding:.25rem .55rem .45rem}
+   .rolegroup .card{background:var(--surface);margin-bottom:.5rem}
+   .rolegroup .card:last-child{margin-bottom:0}")
 
 (def poll-script
   "Two loops. The pane is appended to every two seconds and keeps its scroll
@@ -762,7 +753,7 @@
              (for [id loose :let [ctx (task-lib/task-ctx id) att (open-attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
                 [:div.grow [:div.name.trunc id]
-                 [:div.muted.trunc (str/join ", " (map :session (sessions ctx)))]]
+                 [:div.muted.trunc (session-summary (sessions ctx))]]
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
                   [:span.status.met "clear"])
@@ -921,6 +912,22 @@
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
             [:span.lane {:class (when (= "done" l) "done")} (lane-label ctx)]]]
+          ;; First on the page, above Attention: the one question a reader opens
+          ;; this page to answer. Everything below it — attention, goals, bars,
+          ;; roles — is the evidence for the answer, so it reads as the summary
+          ;; and then its working, not as a footnote after four scrolls.
+          (let [cached (summary/read-summary ctx)]
+            [:section
+             [:h2 "Ready to merge?"
+              (when-let [h (:headers cached)]
+                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
+             [:form {:method "post" :action (str "/tasks/" id "/summary")}
+              [:button {:type "submit"} (if cached "Summarize again" "Summarize")]
+              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
+               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
+             (if cached
+               [:pre (:body cached)]
+               [:p.empty "not asked yet"])])
           (let [done (handled ctx)
                 keyed (for [a att] (assoc a :key (attention-key a) :done (get done (attention-key a))))
                 ;; crossed-off items sink to the bottom and stop counting, the
@@ -982,18 +989,6 @@
                        " " [:span.muted (:at e)]
                        (when (seq (:tail e)) [:pre (:tail e)])]
                       [:span.status.pending "no evidence yet"])]])]]]
-          (let [cached (summary/read-summary ctx)]
-            [:section
-             [:h2 "Ready to merge?"
-              (when-let [h (:headers cached)]
-                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
-             [:form {:method "post" :action (str "/tasks/" id "/summary")}
-              [:button {:type "submit"} (if cached "Ask again" "Ask")]
-              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
-               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
-             (if cached
-               [:pre (:body cached)]
-               [:p.empty "not asked yet"])])
           (when-let [prs (seq (pr-watch/shipped ctx))]
             [:section
              [:h2 "In review"]
@@ -1024,18 +1019,33 @@
               ;; link has to sum the window the same way telemetry.bb does.
               [:a {:href (str (telemetry/base-url) "/vmui/#/?g0.expr="
                               (java.net.URLEncoder/encode (str "sum by (role) (sum_over_time(claude_code.cost.usage{task_id=\"" id "\"}[7d]))") "UTF-8"))} "vmui"]
-              " · repo dashboard: dashboards/swarmkhazad.json"]])
+              " · "
+              ;; The trend boards VictoriaMetrics itself serves. Naming the JSON
+              ;; file was not a link and told a reader nothing they could click.
+              [:a {:href (str (telemetry/base-url) "/vmui/#/dashboards")} "trend dashboards"]
+              [:span.muted " (dashboards/swarmkhazad.json)"]]])
+          ;; Grouped by role, in the roles file's own order, because that order IS
+          ;; the sequence the work moves through — every implement repo, then every
+          ;; review repo. Flowing the sessions into one auto-fill grid put
+          ;; `review_gobel` beside `implement_gobel` and wrapped `review_superset`
+          ;; onto a second row, which reads as four unrelated agents rather than
+          ;; two stages of one task. The card names its repo; the band names the
+          ;; role, so the session name is not repeated on every card.
           [:section [:h2 "Roles"]
-           [:div.cards
-            (for [c (session-cards ctx)]
-              [:div.card
-               [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:session c)] [:span.chev "›"]]
-               [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
-               [:div "judge: " (if-let [v (:verdict c)]
-                                 [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
-                                 [:span.status.pending "no verdict"])]
-               [:div.muted "sent " (:sent c) " · inbox " (:inbox c)]
-               [:div.muted.pane-line (:last-line c)]])]]
+           (let [cs (session-cards ctx)]
+             [:div.rolegroups
+              (for [role (distinct (map :role cs))]
+                [:div.rolegroup
+                 [:div.rolename role]
+                 (for [c cs :when (= role (:role c))]
+                   [:div.card
+                    [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:repo c)] [:span.chev "›"]]
+                    [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
+                    [:div "judge: " (if-let [v (:verdict c)]
+                                      [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
+                                      [:span.status.pending "no verdict"])]
+                    [:div.muted "sent " (:sent c) " · inbox " (:inbox c)]
+                    [:div.muted.pane-line (:last-line c)]])])])]
           (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file]
                            ["finding.md — what the swarm worked out, not an ask" :finding-file]
                            ["escalation.md" :escalation-file]]]

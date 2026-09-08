@@ -358,3 +358,56 @@
         (is (allowed? (tool-call task "mcp__fs__write" {"path" (str task "/draft-implement.md")}))
             "a role's own write-up is its own to write, by any tool")))))
 
+
+(deftest the-guard-does-not-deny-the-swarms-own-mail-loop
+  ;; Found in the first live run, not by any test here: twelve denials in two
+  ;; minutes, all of them the same command.
+  ;;
+  ;;   cd <task> && ls -la && ready_for_next.bb 2>&1
+  ;;   -> "goal.md and metrics.md are the task's truth (chmod 444)…"
+  ;;
+  ;; That is the mail loop — the single most common command in the system, and
+  ;; the first thing every role runs. Two independent causes, both of which
+  ;; produce a denial that reads as the truth-lock working:
+  ;;
+  ;;   1. The reader allowlist named `note.bb` and none of the other helpers,
+  ;;      so a role could write a bullet but not collect its own mail.
+  ;;   2. The pipeline split is on `|;&`, so `ready_for_next.bb 2>&1` arrives as
+  ;;      TWO segments and the second one's first word is the file descriptor
+  ;;      `1`. Read as a command name, `1` is on no allowlist.
+  ;;
+  ;; An over-denial is not a safe failure here: it stops the swarm dead while
+  ;; looking exactly like the guard doing its job.
+  (with-task
+    (fn [task _]
+      (session-start task)
+      (testing "the exact command the live run denied"
+        (is (allowed? (bash task task (str "cd " task " && ls -la && ready_for_next.bb 2>&1")))))
+      (testing "every helper a role is told to run"
+        (doseq [c ["ready_for_next.bb"
+                   "done_with_current.bb"
+                   "swarm_handoff.bb tmp/draft.txt"
+                   "run_evidence.bb"
+                   "goal_judge.bb"
+                   "note.bb finding 'a claim' 'a why'"]]
+          (is (allowed? (bash task task (str "cd " task " && " c)))
+              (str "helper denied: " c))))
+      (testing "a redirect is not a command name"
+        ;; Each of these splits on `&` or leaves a `>`-leading token where the
+        ;; head-word scan looks for a command.
+        (is (allowed? (bash task task "ready_for_next.bb 2>&1")))
+        (is (allowed? (bash task task "ready_for_next.bb > /tmp/out.txt 2>&1")))
+        (is (allowed? (bash task task "cat goal.md 2>&1 | head -3")))
+        (is (allowed? (bash task task "ls -la 1>&2"))))
+      (testing "and the lock still holds against every way round it"
+        ;; The reason this test exists is that widening an allowlist is exactly
+        ;; how a guard is quietly turned off. Each of these was a kill in the
+        ;; mutation run and must stay one.
+        (is (denied? (bash task task (str "cd " task " && chmod 644 goal.md"))))
+        (is (denied? (bash task task (str "cd " task " && sed -i '' s/a/b/ goal.md"))))
+        (is (denied? (bash task task (str "cd " task " && echo x >> escalation.md"))))
+        (is (denied? (bash task task (str "cd " task " && patch goal.md < /tmp/p.diff"))))
+        (is (denied? (bash task task (str "ready_for_next.bb 2>&1 && chmod 644 " task "/goal.md")))
+            "a redirect earlier in the line does not buy the rest of it a pass")
+        (is (denied? (bash task task (str "cd " task " && ready_for_next.bb > goal.md")))
+            "an allowed reader is still not allowed to redirect over the truth"))))) 

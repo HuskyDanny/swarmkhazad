@@ -348,6 +348,13 @@ pre_tool_use() {
           case "$hw" in
             *=*) continue ;;                          # VAR=x prefixes
             sudo|command|nohup|time|env|builtin) continue ;;
+            # Not commands: the split is on `|;&`, so `foo 2>&1` arrives as two
+            # segments and the second one's first word is the file descriptor
+            # `1`. Read as a command name it is on no allowlist, so every
+            # ordinary `… 2>&1` denied — including `ready_for_next.bb 2>&1`,
+            # the mail loop every role runs constantly. Found in a live run.
+            [0-9]|[0-9][0-9]) continue ;;
+            "<"*|">"*|"&"*) continue ;;
             *) head_word=$(basename "$hw"); break ;;
           esac
         done
@@ -355,7 +362,9 @@ pre_tool_use() {
         case "$head_word" in
           cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|\
           awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
-          readlink|md5|shasum|true|false|nl|column|note.bb|cd|pushd|popd) ;;
+          readlink|md5|shasum|true|false|nl|column|cd|pushd|popd|\
+          note.bb|ready_for_next.bb|done_with_current.bb|swarm_handoff.bb|\
+          run_evidence.bb|goal_judge.bb) ;;
           *) mutating=1; break ;;
         esac
       done < <(printf '%s' "$bare" | tr '|;&\n' '\n\n\n\n')

@@ -553,3 +553,165 @@
         (doseq [session ["implement_gobel" "implement_cirdan"]]
           (is (empty? (handoffs (fs/path dir "mail" session "outbox"))) session))))))
 
+
+(defn base!
+  "Give a session the inbound item a live one always has: an in-process handoff
+   stamped with its worktree's HEAD. Without a base, `changed-files` falls back
+   to the root commit and every worktree looks like it changed every file — so a
+   role that changed nothing has no way to be seen as having changed nothing."
+  [dir session repo]
+  (let [head (str/trim (:out (process/sh {:dir (str (fs/path dir "worktrees" repo))}
+                                         "git" "rev-parse" "--short=10" "HEAD")))]
+    (write! (fs/path dir "mail" session "inbox" "in_process" "50_kickoff.handoff")
+            (str "id: kickoff\nfrom: (New-Task)\nto: " session "\npriority: 50\n"
+                 "type: note\ntask_id: t-two\ntask: t-two\n"
+                 "task_base_commit: " head "\nmessage: start\n\nstart\n"))
+    head))
+
+(deftest a-role-that-changes-nothing-still-hands-off-and-is-still-graded
+  ;; The outcome the helper had no channel for, found in the first live run.
+  ;;
+  ;; gobel's goal line asked which domain a host answered on before changing
+  ;; anything. It checked, the `.co` URL in the code was already right, and the
+  ;; correct diff was empty — at which point `swarm_handoff.bb` refused it
+  ;; ("Result commit … changes no files; commit your work first"), leaving
+  ;; `type: note` as the only way to say it had finished. A note is not graded,
+  ;; does not move the board and does not complete its role's join, so ONE
+  ;; missing outcome produced four symptoms: no verdict for gobel, review woken
+  ;; early off the note, the sibling's real handoff held for a join that could
+  ;; never complete, and a card stuck in `implement` with the work all done.
+  (with-two-repo-task
+    (fn [{:keys [dir env helper commit! card]}]
+      (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                     "(board-lib/create-card! (task-lib/task-ctx \"t-two\") \"t-two\" \"implement\")"))
+      (base! dir "implement_gobel" "gobel")
+      (testing "an empty diff with no explanation is still refused"
+        (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                        (draft! dir "n1.txt" "type: git_handoff\nto: review\npriority: 50\n"))]
+          (is (= 1 (:exit r)) (str (:out r) (:err r)))
+          (is (str/includes? (:err r) "changes no files"))
+          (is (str/includes? (:err r) "--no-change")
+              "and the refusal names the flag, or a role reaches for the note instead")))
+      (testing "--no-change without a reason is refused"
+        (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                        (draft! dir "n2.txt" "type: git_handoff\nto: review\npriority: 50\n")
+                        "--no-change")]
+          (is (= 1 (:exit r)) (str (:out r) (:err r)))
+          (is (str/includes? (:err r) "needs a reason")
+              "an unexplained empty diff is indistinguishable from a role that gave up")))
+      (testing "--no-change with a reason queues a real git_handoff"
+        (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                        (draft! dir "n3.txt" "type: git_handoff\nto: review\npriority: 50\n")
+                        "--no-change" "the .co host answers 401; .com is NXDOMAIN")]
+          (is (zero? (:exit r)) (str (:out r) (:err r))))
+        (let [f (first (handoffs (fs/path dir "mail" "implement_gobel" "outbox")))
+              h (headers f)]
+          (is (= "git_handoff" (get h "type")) "not a note — it has to be graded and to move the board")
+          (is (= "the .co host answers 401; .com is NXDOMAIN" (get h "no_change"))
+              "the reason travels on the handoff, so the next role reads it without opening a file")
+          (is (str/includes? (slurp (str f)) "changed nothing, on purpose")
+              "and the body tells the recipient to review the reasoning, not to hunt for a diff")))
+      (testing "it holds the role's join exactly like any other handoff"
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (str/starts-with? (card) "t-two\timplement\t") (card))
+        (is (str/ends-with? (card) "\timplement_gobel"))
+        (is (empty? (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))
+            "review is not woken by one sibling finishing; it is woken by the ROLE finishing"))
+      (testing "and the sibling with a real commit completes the turn"
+        (commit! "cirdan" "b.txt")
+        (is (zero? (:exit (helper "implement_cirdan" "cirdan" "swarm_handoff.bb"
+                                  (draft! dir "n4.txt" "type: git_handoff\nto: review\npriority: 50\n")))))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (str/starts-with? (card) "t-two\treview\t") (card))
+        (is (= 2 (count (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new"))))
+            "both handoffs arrive together — the no-change one and the commit one")))))
+
+(deftest no-change-is-refused-once-there-is-a-diff
+  ;; The flag says "the right answer was to change nothing". A role that has
+  ;; committed work and passes it anyway would send real changes labelled as a
+  ;; no-op, and the next role would review the reasoning instead of the diff.
+  (with-two-repo-task
+    (fn [{:keys [dir helper commit!]}]
+      (base! dir "implement_gobel" "gobel")
+      (commit! "gobel" "late.txt")
+      (let [r (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                      (draft! dir "n5.txt" "type: git_handoff\nto: review\npriority: 50\n")
+                      "--no-change" "still nothing")]
+        (is (= 1 (:exit r)) (str (:out r) (:err r)))
+        (is (str/includes? (:err r) "changes 1 file"))))))
+
+(deftest the-turn-gate-holds-on-the-role-boundary-not-on-the-message-type
+  ;; The gate asked "is this a git_handoff?" when the question is "does this
+  ;; cross a role boundary?". A note addressed to the next role sailed past it
+  ;; in the first live run and started review on trees still being written,
+  ;; while its sibling's real handoff was held for a join that could never
+  ;; complete — early start on one side and a deadlock on the other.
+  (with-two-repo-task
+    (fn [{:keys [dir env helper card]}]
+      (run {:env env} "bb" "-e" (str "(load-file \"" scripts "/board_lib.bb\") "
+                                     "(board-lib/create-card! (task-lib/task-ctx \"t-two\") \"t-two\" \"implement\")"))
+      (testing "a note to the NEXT role is held for the role's join, like a handoff"
+        (is (zero? (:exit (helper "implement_gobel" "gobel" "swarm_handoff.bb"
+                                  (draft! dir "m1.txt"
+                                          "type: note\nto: review\npriority: 50\nmessage: gobel is done\n")))))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (empty? (handoffs (fs/path dir "mail" "review_gobel" "inbox" "new")))
+            "the type field is not what makes a message a turn change")
+        (is (str/ends-with? (card) "\timplement_gobel")
+            "and it counts toward its role's join instead of being invisible to it"))
+      (testing "a note to its own role's sibling is chatter and goes straight out"
+        (is (zero? (:exit (helper "implement_cirdan" "cirdan" "swarm_handoff.bb"
+                                  (draft! dir "m2.txt"
+                                          "type: note\nto: implement_gobel\npriority: 50\nmessage: fyi\n")))))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (= 1 (count (handoffs (fs/path dir "mail" "implement_gobel" "inbox" "new"))))
+            "holding sibling chatter would deadlock a role that has to talk to finish"))
+      (testing "a note from a role that does not hold the lane is not held either"
+        (is (zero? (:exit (helper "review_gobel" "gobel" "swarm_handoff.bb"
+                                  (draft! dir "m3.txt"
+                                          "type: note\nto: implement_cirdan\npriority: 50\nmessage: question\n")))))
+        (run {:env env :ok? false} "bb" (str (fs/path scripts "handoffd.bb")) "--once" "t-two")
+        (is (= 1 (count (handoffs (fs/path dir "mail" "implement_cirdan" "inbox" "new"))))
+            "a reviewer asking the active implementer a question waits on nobody")))))
+
+(deftest a-role-crosses-off-the-escalation-it-has-since-cleared
+  ;; An escalation is append-only and the portal's tick was the only writer of
+  ;; the cross-off store, so an ask the swarm resolved by itself sat on the
+  ;; Attention list looking like an open blocker. The role that raised it is the
+  ;; one who knows it is gone.
+  (with-task
+    (fn [{:keys [dir helper]}]
+      (let [note (fn [& args] (apply helper "a" "note.bb" args))
+            handled (fn [] (let [f (fs/path dir "state" "attention-handled.tsv")]
+                             (if (fs/exists? f)
+                               (->> (str/split-lines (slurp (str f))) (remove str/blank?) vec)
+                               [])))
+            ;; the portal's own key, computed the portal's own way — if these two
+            ;; ever drift, a cross-off written here stops matching the item there
+            portal-key (fn [text]
+                         (str/trim (:out (run {:dir dir}
+                                              "bb" "-e"
+                                              (str "(load-file \"" scripts "/task_lib.bb\") "
+                                                   "(print (task-lib/attention-key {:kind \"escalation\" :text "
+                                                   (pr-str text) "}))")))))]
+        (is (zero? (:exit (note "escalation" "the staging cluster is unreachable" "cannot run the e2e bar"))))
+        (is (zero? (:exit (note "escalation" "a second, unrelated ask" "still open"))))
+        (testing "a match that hits nothing is refused, not silently ignored"
+          (let [r (note "resolved" "no such bullet" "did a thing")]
+            (is (= 1 (:exit r)))
+            (is (str/includes? (:err r) "nothing crossed off")
+                "silence here would leave the role believing the item was cleared")
+            (is (empty? (handled)))))
+        (testing "matching text crosses exactly that item off"
+          (is (zero? (:exit (note "resolved" "staging cluster" "the VPN was down; reconnected and the bar passes now"))))
+          (is (= 1 (count (handled))) "the unrelated ask is untouched")
+          (is (str/starts-with? (first (handled))
+                                (portal-key "**the staging cluster is unreachable** — cannot run the e2e bar"))
+              "and the key is the one the portal computes, or the cross-off matches nothing on the page"))
+        (testing "what was said stays said; what was done about it is recorded separately"
+          (is (= 2 (count (->> (str/split-lines (slurp (str (fs/path dir "escalation.md"))))
+                               (remove str/blank?))))
+              "escalation.md is never edited — the role owns it and the record is a different file")
+          (is (str/includes? (slurp (str (fs/path dir "finding.md")))
+                             "resolved: staging cluster")
+              "the how is a finding, so the next reader sees why it stopped being an ask"))))))

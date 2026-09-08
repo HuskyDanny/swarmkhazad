@@ -36,13 +36,40 @@
    "escalation" :escalation-file
    "finding" :finding-file})
 
+(defn resolve-escalations!
+  "Cross off every escalation bullet containing `match`, and say how many.
+
+   A role that escalates and then clears the blocker itself had no way to say
+   so: the bullet is append-only, and the portal's tick was the only writer of
+   the cross-off store — so the item sat on Attention as an open ask after the
+   swarm had already dealt with it. Matching on the bullet's own text rather
+   than a key because the role wrote that text; it does not know the hash.
+
+   escalation.md is never edited. What a role said stays said; what was done
+   about it is recorded separately, which is the same split the portal's tick
+   has always used."
+  [ctx match]
+  (let [needle (str/lower-case match)
+        lines (->> (str/split-lines (or (try (slurp (str (:escalation-file ctx))) (catch Exception _ nil)) ""))
+                   (map str/trim)
+                   (remove str/blank?)
+                   (map #(str/replace % #"^- " "")))
+        hits (filter #(str/includes? (str/lower-case %) needle) lines)]
+    (doseq [l hits]
+      (task-lib/set-handled! ctx (task-lib/attention-key {:kind "escalation" :text l}) true))
+    (count hits)))
+
 (def usage-text
   (str "Usage: note.bb <decision|gotcha|escalation|finding> <claim> <why>\n"
+       "       note.bb resolved <match> <how>\n"
        "\n"
        "  decision    a fork you resolved — name the alternative you rejected\n"
        "  gotcha      something that cost you time and would cost the next one\n"
        "  escalation  something only a human can clear (an ask)\n"
        "  finding     something you established that nobody asked for (not an ask)\n"
+       "  resolved    an escalation you have since cleared yourself — <match> is\n"
+       "              any text from the bullet, <how> is what you did about it.\n"
+       "              Crosses it off Attention and records the how as a finding.\n"
        "\n"
        "Both claim and why are one line each. The bullet is written for you:\n"
        "  - [<repo>] **<claim>** — <why>\n"))
@@ -76,7 +103,7 @@
     (System/exit 0))
   (let [[kind claim why] args
         file-key (kinds kind)]
-    (when-not file-key
+    (when-not (or file-key (= "resolved" kind))
       (fail! 1 (str "note.bb: unknown kind " (pr-str kind) "\n\n" usage-text)))
     (let [claim (one-line claim)
           why (one-line why)]
@@ -84,10 +111,21 @@
       (when (str/blank? why) (fail! 1 (str "note.bb: the why is empty — a claim with no reason is a line nobody can act on\n\n" usage-text)))
       (when (seq (drop 3 args)) (fail! 1 (str "note.bb: too many arguments; quote the claim and the why\n\n" usage-text)))
       (let [ctx (task-lib/ctx-from-env)
-            session (handoff-lib/session ctx)
-            file (get ctx file-key)]
-        (spit (str file) (bullet (tag ctx session) claim why) :append true)
-        (println (str "NOTED " kind ": " file))))))
+            session (handoff-lib/session ctx)]
+        (if (= "resolved" kind)
+          (let [n (resolve-escalations! ctx claim)]
+            ;; A match that hits nothing is a typo, and silently doing nothing
+            ;; would leave the role believing it had cleared the item.
+            (when (zero? n)
+              (fail! 1 (str "note.bb: no escalation bullet contains " (pr-str claim)
+                            " — nothing crossed off")))
+            (spit (str (:finding-file ctx))
+                  (bullet (tag ctx session) (str "resolved: " claim) why) :append true)
+            (println (str "RESOLVED " n " escalation line(s); how recorded in "
+                          (:finding-file ctx))))
+          (let [file (get ctx file-key)]
+            (spit (str file) (bullet (tag ctx session) claim why) :append true)
+            (println (str "NOTED " kind ": " file))))))))
 
 (when (= (str *file*) (System/getProperty "babashka.file"))
   (try

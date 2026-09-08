@@ -84,7 +84,10 @@
             (is (= 200 (:status r)))
             (is (str/includes? (:body r) "href=\"/tasks/t-portal\""))
             (is (str/includes? (:body r) "not opened"))
-            (is (str/includes? (:body r) "implement, run, review"))
+            ;; Role-major, matching the task page: `<role>: <repo>, <repo>`
+            ;; joined by `·`. Four bare session ids made the reader group them
+            ;; by prefix to see there were three roles over one repo.
+            (is (str/includes? (:body r) "implement: fixture · run: fixture · review: fixture"))
             (is (re-find #"unmet\">4 needs you<" (:body r)) "escalation + failed mail + denials + judge down = 4 attention items")
             (is (str/includes? (:body r) "action=\"/projects\"") "the new-project composer is on the index")
             (is (str/includes? (:body r) "Tasks outside a project") "a task with no project is still reachable")
