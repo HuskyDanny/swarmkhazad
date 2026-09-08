@@ -49,6 +49,35 @@
   (when (lane-agents harness)
     (fs/path (cc-home) "scripts" (str (str/replace harness "_" "-") ".sh"))))
 
+(defn lane-system-prompt
+  "The system-prompt file a lane appends to every session it launches, or nil
+   for a lane that appends none.
+
+   `--append-system-prompt-file` takes the LAST occurrence, not the union (RAN:
+   two flags, one file per codeword, the SECOND file's codeword came back). So
+   the swarm's own file did not layer over the lane's — it REPLACED it, and a
+   role on cc_auto silently lost every line of AUTONOMOUS.md, the six-reviewer
+   panel included. Reading the lane's file here lets the session prompt CARRY
+   that text ahead of the swarm's own, which is what inheriting a lane was
+   supposed to mean.
+
+   Parsed out of the script rather than listed here: each lane names its own
+   file, and a second copy of that path is a second thing to keep in step.
+   Comment lines are dropped first — cc-full.sh mentions the flag in prose to
+   say it deliberately passes none."
+  [harness]
+  (when-let [script (lane-script harness)]
+    (when (fs/regular-file? script)
+      (let [home (str (fs/parent (fs/parent script)))
+            code (->> (str/split-lines (slurp (str script)))
+                      (remove #(str/starts-with? (str/triml %) "#"))
+                      (str/join "\n"))
+            raw (second (re-find #"--append-system-prompt-file\s+\"?([^\"\s\\]+)" code))
+            path (some-> raw
+                         (str/replace "${CC_HOME}" home)
+                         (str/replace "$CC_HOME" home))]
+        (when (and path (fs/regular-file? path)) (str path))))))
+
 (def receive-modes #{"task" "batch"})
 
 ;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the

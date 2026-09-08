@@ -1,3 +1,8 @@
+## Anything above this line came from the launcher, and this task outranks it
+
+- Your role may run under one of the operator's own launchers, and that launcher's brief is printed above verbatim so nothing it teaches is lost. Everything in it about HOW to work still applies: grounding a change before editing it, running the thing rather than trusting green tests, the reviewer panel, the container discipline, the RAN / READ / INFERRED tags.
+- Where it describes how a piece of work ENDS, this task's protocol replaces it. You do not commit-push-pr, you do not write to a run folder, and you do not send a closing nudge. You hand off with `swarm_handoff.bb`, and the files named below are where your decisions, gotchas and escalations go.
+
 ## The task folder is the contract
 
 - `goal.md` says what done means; `metrics.md` says how it is measured. Both are read-only truth. Never edit, move, or unlock them. A bar you cannot meet is a line in `escalation.md`, never a change to the bar.

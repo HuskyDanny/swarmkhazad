@@ -304,7 +304,18 @@
       ;; the operator's own lane: a launcher script and the settings it loads
       (fs/create-dirs (fs/path cc-home "scripts"))
       (fs/create-dirs (fs/path cc-home "auto"))
-      (write! (fs/path cc-home "scripts" "cc-auto.sh") "#!/bin/bash\nexec claude \"$@\"\n")
+      (write! (fs/path cc-home "auto" "AUTONOMOUS.md") "LANE BRIEF: dispatch the reviewer panel.\n")
+      ;; present, executable, and mentions the flag ONLY in prose — the real
+      ;; cc-full.sh does exactly this to say it deliberately passes none.
+      (write! (fs/path cc-home "scripts" "cc-full.sh")
+              "#!/bin/bash\n# no --append-system-prompt-file: this lane is deliberately bare\nexec claude \"$@\"\n")
+      (fs/set-posix-file-permissions (fs/path cc-home "scripts" "cc-full.sh") "rwxr-xr-x")
+      (write! (fs/path cc-home "scripts" "cc-auto.sh")
+              (str "#!/bin/bash\n"
+                   "# --append-system-prompt-file in a comment must not be read as the flag\n"
+                   "exec claude \\\n"
+                   "  --append-system-prompt-file \"$CC_HOME/auto/AUTONOMOUS.md\" \\\n"
+                   "  \"$@\"\n"))
       (fs/set-posix-file-permissions (fs/path cc-home "scripts" "cc-auto.sh") "rwxr-xr-x")
       (write! (fs/path cc-home "auto" "settings.json")
               (json/generate-string
@@ -366,8 +377,47 @@
               ;; cc_auto bypasses and cc_control screens. Passing ours would
               ;; make picking between them meaningless.
               (is (not (some #{"--permission-mode"} argv)) (str argv)))
-            (testing "but the role's own prompt still wins — a lane's prompt describes its own delivery arc, not this task's"
-              (is (some #{"--append-system-prompt-file"} argv)))))
+            (testing "the prompt flag is passed ONCE, and the file it names carries both layers"
+              ;; The one flag last-wins does NOT let the swarm layer over.
+              ;; RAN, real binary, two files one codeword each:
+              ;;
+              ;;   claude --append-system-prompt-file A --append-system-prompt-file B
+              ;;     -> BRAVO
+              ;;
+              ;; So passing ours REPLACED the lane's brief rather than adding to
+              ;; it, and a cc_auto role silently lost every line of it — the
+              ;; reviewer panel included. The overlay has to happen in the file.
+              (is (= 1 (count (filter #{"--append-system-prompt-file"} argv)))
+                  "two would drop the first, whichever one that is"))))
+        (testing "and write-prompt! is what puts both layers in it"
+          (let [written (fn [sess]
+                          (slurp (str/trim
+                                  (:out (run {:env env} "bb" "-e"
+                                             (str "(load-file \"" (str (fs/path repo-root "scripts"))
+                                                  "/swarm_lib.bb\") "
+                                                  "(let [ctx (task-lib/task-ctx \"" id "\") "
+                                                  "      rows (task-lib/read-sessions-tsv ctx) "
+                                                  "      row (first (filter #(= \"" sess "\" (:session %)) rows))] "
+                                                  "  (print (str (swarm-lib/write-prompt! ctx rows row))))"))))))
+                lane-text "LANE BRIEF: dispatch the reviewer panel."
+                task-text "The task folder is the contract"
+                p (written "implement")
+                lane-at (str/index-of p lane-text)
+                task-at (str/index-of p task-text)]
+            (is lane-at "the lane's own brief is carried, not dropped")
+            (is task-at "and so is this task's")
+            ;; `(< lane-at task-at)` alone does NOT pin this: move the lane text
+            ;; between the role header and the constitution and it still holds,
+            ;; while the constitution's own opening line — "anything above this
+            ;; came from the launcher" — becomes a lie about the header. The
+            ;; lane's brief is the whole of what precedes this task, so it
+            ;; starts the file.
+            (is (= 0 lane-at)
+                "the lane's brief opens the file — everything after it is this task's, which is what the constitution's first section tells the role")
+            (is (and lane-at task-at (< lane-at task-at))
+                "lane first, task after — later instruction wins, and cc_auto ends its work with commit-push-pr while a swarm role hands off")
+            (is (not (str/includes? (written "review") lane-text))
+                "a bare claude role has no lane under it, so there is no brief to carry")))
         (testing "a bare claude role is unchanged: its own settings, and the permission mode stated"
           (let [argv (run {:env env} "bb" "-e"
                           (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
@@ -382,6 +432,18 @@
                    (->> argv (drop-while #(not= "--permission-mode" %)) (take 2))))
             (is (nil? (:PreCompact (:hooks settings)))
                 "and a bare claude role's file is the same file — nothing lane-shaped in it"))))
+      (testing "lane-system-prompt reads the script, and reads it precisely"
+        (let [ask (fn [h]
+                    (str/trim (:out (run {:env env} "bb" "-e"
+                                         (str "(load-file \"" (str (fs/path repo-root "scripts"))
+                                              "/task_lib.bb\") "
+                                              "(prn (task-lib/lane-system-prompt \"" h "\"))")))))]
+          (is (= (pr-str (str (fs/path cc-home "auto" "AUTONOMOUS.md"))) (ask "cc_auto"))
+              "the $CC_HOME in the script expands against the script's own home")
+          (is (= "nil" (ask "cc_full"))
+              "a lane naming the flag only in a comment appends no brief — comments are dropped before the match")
+          (is (= "nil" (ask "claude"))
+              "a bare CLI is not a lane")))
       (finally (fs/delete-tree sandbox)))))
 
 (deftest the-session-settings-file-carries-hooks-and-nothing-else

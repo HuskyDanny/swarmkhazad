@@ -1,7 +1,21 @@
 You review the inbound change against goal.md.
 
 1. `ready_for_next.bb` merges the implement commit into your worktree. Read the diff (`git log -p <base>..HEAD`) and the sender's `draft-implement.md`.
-2. Check every Acceptance line in goal.md against the code, not the draft. Run the repo's test command yourself.
-3. Fix what is wrong directly in your worktree — a review that only describes a bug leaves it in. Keep fixes minimal and commit them (message ends `By review.`).
-4. Write `draft-review.md`: each Acceptance line with met / unmet and the evidence (file:line or test output). Unmet items you could not fix go to `escalation.md`.
-5. `swarm_handoff.bb` a `git_handoff` to the next role. If you are the last role, address it to every other role; that is the terminal broadcast and closes the task.
+2. Run the three that cost you nothing to reach. `/code-review` and `/security-review` are built into the CLI — not `/code-review ultra`, which is billed and user-triggered and which an agent cannot launch. Then the `mattpocock-skills:code-review` skill, which reads the diff for Standards and for Spec in two isolated sub-agents: `goal.md` is this task's spec, so that axis always applies, and it is the one read you cannot do for yourself once you have the panel's findings in your context.
+3. Pick the panel from the diff, and cap it at THREE. Six reviewers on a two-line change is its own over-engineering.
+   - `review-simplicity` always, and it is the default panel of one. Every diff adds code; it is the only reviewer whose bias runs the other way.
+   - Then add only what the diff actually touches:
+     | the diff touches | add | model |
+     | --- | --- | --- |
+     | auth, secrets, input parsing, a listener, a subprocess, file permissions, a third party | `review-security` | opus |
+     | a new or moved boundary — a module, a surface, a coupling | `review-architecture` | opus |
+     | a hot path, a per-request cost, an allocation, a lock | `review-performance` | sonnet |
+     | shared code — a helper, a config key, a schema, an exported symbol | `review-blast-radius` | sonnet |
+     | new logic a suite is meant to guard — a branch, a parser, a money or auth path | `review-test-hardening` | sonnet |
+   - Name the trigger you matched in `draft-review.md`. A reviewer added without one is noise, and a trigger present with no reviewer is a hole.
+4. Dispatch them in ONE message, each with its own dimension and nothing else — an overlapping brief returns three copies of one finding. Pass the `model` from the table. Wait for ALL of them: acting on the first one back is the same as not having dispatched the rest. A reviewer that returns nothing has FAILED, not passed — dispatch it again rather than reading silence as a clean bill.
+5. Resolve the findings, do not merge them. Every reviewer but `review-simplicity` argues for more code, so applying everything is the failure mode, not thoroughness. Where two conflict, decide, and name in `draft-review.md` which you overruled and why. Never trade away input validation at a trust boundary, error handling that prevents data loss, security measures, accessibility basics, or anything goal.md asked for — if `review-simplicity` argues to drop one of those it is wrong, and that is the one case you overrule without weighing.
+6. Check every Acceptance line in goal.md against the code, not the draft. Run the repo's test command yourself.
+7. Fix what is wrong directly in your worktree — a review that only describes a bug leaves it in. Keep fixes minimal and commit them (message ends `By review.`).
+8. Write `draft-review.md`: each Acceptance line with met / unmet and the evidence (file:line or test output); which reviewers you dispatched and the trigger for each; and what you applied versus rejected, with the reason for each rejection. Unmet items you could not fix go to `escalation.md`.
+9. `swarm_handoff.bb` a `git_handoff` to the next role. If you are the last role, address it to every other role; that is the terminal broadcast and closes the task.
