@@ -11,7 +11,8 @@
 ;;
 ;; ~/.swarmkhazad/projects/<name>.edn, one map:
 ;;   {:repos ["/abs/path" ...]
-;;    :roles [{:role "implement" :harness "claude" :model "anthropic"} ...]}
+;;    :roles [{:role "implement" :harness "claude" :model "anthropic"} ...]
+;;    :cloud-env "ccpool_..."}
 ;;
 ;; EDN rather than another line grammar: bb reads it with no parser of ours, and
 ;; the role list is a list of maps rather than a positional line.
@@ -64,10 +65,35 @@
            vec)
       [])))
 
-(defn write-project! [{:keys [name repos roles]}]
+(def cloud-env-var "SWARMKHAZAD_CLOUD_ENV")
+
+(defn valid-cloud-env?
+  "A self-hosted environment id, or blank. Blank is a real answer — a project
+   with no cloud bars needs no environment — so it is not an error, it just
+   means an @cloud bar in that project reports `blocked` and says why."
+  [s]
+  (or (str/blank? s) (boolean (re-matches #"ccpool_[A-Za-z0-9]{1,64}" (str s)))))
+
+(defn known-cloud-envs
+  "Every environment id already in use, for the picker to offer. There is no
+   API that lists them — `claude` has no `environments` subcommand — so the
+   only honest source is the ones already chosen here, plus whatever the
+   variable names."
+  []
+  ;; list-projects already returns project MAPS, not names — mapping
+  ;; read-project over them gives nil for every one, and an empty datalist is
+  ;; indistinguishable from "no environments have been used yet".
+  (->> (cons (System/getenv cloud-env-var) (map :cloud-env (list-projects)))
+       (keep not-empty)
+       distinct
+       sort
+       vec))
+
+(defn write-project! [{:keys [name repos roles cloud-env]}]
   (let [f (project-file name)]
     (fs/create-dirs (projects-dir))
-    (spit (str f) (with-out-str (pprint/pprint {:repos (vec repos) :roles (vec roles)})))
+    (spit (str f) (with-out-str (pprint/pprint (cond-> {:repos (vec repos) :roles (vec roles)}
+                                                 (not-empty cloud-env) (assoc :cloud-env cloud-env)))))
     (read-project name)))
 
 (defn delete-project!
@@ -241,6 +267,20 @@
   (let [f (task-project-file ctx)]
     (when (fs/regular-file? f)
       (not-empty (str/trim (slurp (str f)))))))
+
+(defn cloud-env-for
+  "Which self-hosted environment this task's @cloud bars dispatch to, most
+   specific first: the environment variable, then the project the task belongs
+   to. Nil when neither says.
+
+   The project is the answer that survives. The variable was the first home for
+   this and it is a poor one — an id nobody can remember, in a shell rc nobody
+   reads, invisible on the page that claims to declare how a project runs. It
+   stays as an override because a one-off dispatch at a different environment
+   should not require editing the project."
+  [ctx]
+  (or (not-empty (or (System/getenv cloud-env-var) ""))
+      (some-> (task-project ctx) read-project :cloud-env not-empty)))
 
 (defn tasks-for [project-name]
   (->> (task-lib/list-task-ids)

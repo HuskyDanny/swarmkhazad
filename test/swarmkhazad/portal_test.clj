@@ -798,6 +798,44 @@
       (finally
         (fs/delete-tree sandbox)))))
 
+(deftest the-project-declares-its-self-hosted-environment-so-it-is-not-a-remembered-id
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-env."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src"))}]
+    (try
+      (make-source-repo! src)
+      (testing "the field is on the form, with a datalist rather than a free guess"
+        (let [body (:body (request env :get "/"))]
+          (is (str/includes? body "name=\"cloud-env\""))
+          (is (str/includes? body "list=\"cloud-envs\"")
+              "there is no API that lists environments, so the picker offers the ones in use")))
+      (testing "a bad id is refused with what a good one looks like"
+        (let [r (request env :post "/projects"
+                         {:body (str "name=p1&repo%3A" src "=on&role%3Aimplement=on&cloud-env=nope")})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "not an environment id"))
+          (is (str/includes? (:body r) "ccpool_"))))
+      (testing "a good one round-trips into the project and back onto the form"
+        (is (= 303 (:status (request env :post "/projects"
+                                     {:body (str "name=p1&repo%3A" src
+                                                 "=on&role%3Aimplement=on&cloud-env=ccpool_ABC123")}))))
+        (is (= "ccpool_ABC123" (:cloud-env (read-string (slurp (str (fs/path home "projects" "p1.edn")))))))
+        ;; The bare string is NOT enough: the datalist below the field also
+        ;; carries `value="ccpool_ABC123"`, so a substring check passes on a
+        ;; form whose input is empty. Mutation caught this — dropping the
+        ;; round-trip killed no case at all. Anchor it to the input's own tag.
+        (is (re-find #"name=\"cloud-env\"[^>]*value=\"ccpool_ABC123\""
+                     (:body (request env :get "/projects/p1/edit")))
+            "without the round-trip, pressing Save would blank it"))
+      (testing "and it is then offered to the next project, so it is typed once"
+        (is (str/includes? (:body (request env :get "/")) "<option value=\"ccpool_ABC123\"")))
+      (testing "blank stays blank — a project with no @cloud bars needs no environment"
+        (is (= 303 (:status (request env :post "/projects"
+                                     {:body (str "name=p2&repo%3A" src "=on&role%3Aimplement=on&cloud-env=")}))))
+        (is (nil? (:cloud-env (read-string (slurp (str (fs/path home "projects" "p2.edn"))))))))
+      (finally (fs/delete-tree sandbox)))))
+
 (deftest the-role-picker-declares-the-harness-and-not-only-the-vendor
   ;; Two axes: the harness is which CLI runs the role, the vendor is which model
   ;; that CLI talks to. Every layer already carried both — the form reader
