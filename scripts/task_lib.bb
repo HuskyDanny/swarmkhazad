@@ -49,16 +49,6 @@
   (when (lane-agents harness)
     (fs/path (cc-home) "scripts" (str (str/replace harness "_" "-") ".sh"))))
 
-(defn lane-settings-file
-  "The settings.json a lane loads, when it loads one.
-
-   `cc_auto` and `cc_control` each pass `--settings <cc-home>/<lane>/settings.json`;
-   `cc_full` and `cc_alt` use the operator's global settings and pass none, so
-   there is nothing to merge and nothing is lost by not merging it."
-  [harness]
-  (when (lane-agents harness)
-    (let [f (fs/path (cc-home) (str/replace harness #"^cc_" "") "settings.json")]
-      (when (fs/regular-file? f) f))))
 (def receive-modes #{"task" "batch"})
 
 ;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the

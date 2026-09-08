@@ -268,33 +268,22 @@
                          :hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :Stop [{:hooks [{:type "command" :command goal-judge :timeout 180}]}]}})
 
-(defn layer-settings
-  "The lane's settings with the task's layered over.
-
-   Hook arrays are concatenated per event, lane first, so both run — a lane's
-   SessionStart hook and the truth lock are not competing for one slot. Anything
-   else stays the lane's, because the task layer has no opinion about it."
-  [lane task]
-  (if lane
-    (assoc (merge lane task) :hooks (merge-with into (:hooks lane) (:hooks task)))
-    task))
-
 (defn write-hook-settings!
-  "One settings file per session. A lane harness contributes its own first: the
-   parser takes the LAST --settings, so passing both would drop the lane's
-   entirely and with it every hook it installs."
+  "This session's own settings, and only its own.
+
+   Settings files MERGE — measured against the real CLI, not assumed:
+
+     claude --settings A --settings B   both files' SessionStart hooks fire,
+                                        in either order
+
+   So a lane's file and this one both apply, and copying the lane's hooks in
+   here would only make this file lie about whose hooks they are. Two flags do
+   NOT merge and are last-wins, which is why the argv still appends them:
+   `--append-system-prompt-file` and `--model`."
   [ctx row]
   (fs/create-dirs (:hooks-dir ctx))
-  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))
-        lane (when-let [f (task-lib/lane-settings-file (:harness row))]
-               ;; A lane whose settings are unreadable is a bad lane, not a
-               ;; reason to launch without the truth lock.
-               (try (json/parse-string (slurp (str f)) true)
-                    (catch Exception e
-                      (println (str "swarmkhazad: could not read " f " (" (ex-message e)
-                                    "); launching " (:session row) " with the task's settings only"))
-                      nil)))]
-    (spit (str file) (json/generate-string (layer-settings lane hook-settings) {:pretty true}))
+  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))]
+    (spit (str file) (json/generate-string hook-settings {:pretty true}))
     file))
 
 (defn start-text [ctx row]

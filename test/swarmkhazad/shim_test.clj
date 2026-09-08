@@ -327,7 +327,7 @@
             (is (= "cc_auto" (nth (cols "implement") 4)) (str rows))
             (is (= "anthropic:claude-opus-5[1m]" (nth (cols "implement") 6)))
             (is (= "claude" (nth (cols "review") 4)) "and a bare CLI still resolves as itself")))
-        (testing "the lane's settings are merged in, not replaced by the task's"
+        (testing "the task contributes only its own settings — the CLI merges the lane's"
           (let [argv (run {:env env} "bb" "-e"
                           (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
                                "(let [ctx (task-lib/task-ctx \"" id "\") "
@@ -338,19 +338,30 @@
                 argv (read-string (str/trim (:out argv)))
                 settings-path (second (drop-while #(not= "--settings" %) argv))
                 merged (json/parse-string (slurp settings-path) true)]
-            (testing "both hooks run on the event they share, the lane's first"
-              (is (= ["/lane/persona.sh"]
-                     (mapv :command (mapcat :hooks (take 1 (:SessionStart (:hooks merged))))))
-                  "the lane's SessionStart hook is still there")
-              (is (= 2 (count (:SessionStart (:hooks merged))))
-                  "and the truth lock was appended to it rather than replacing it")
+            ;; RAN against the real CLI, which is why this file holds only our
+            ;; hooks rather than a copy of the lane's:
+            ;;
+            ;;   claude --settings A --settings B   BOTH files' SessionStart
+            ;;                                      hooks fire, either order
+            ;;
+            ;; and the base layer is not replaced either — with `--settings`
+            ;; passed, ~/.claude/settings.json's own PreToolUse guard still
+            ;; refused `sudo`. Settings LAYER. Copying the lane's hooks in here
+            ;; would add nothing and would make this file claim hooks that are
+            ;; not its own.
+            (testing "our own hooks are here"
               (is (str/includes? (str (mapv :command (mapcat :hooks (:SessionStart (:hooks merged)))))
-                                 "run-contract.sh")))
-            (testing "an event only the lane has is kept, and an event only the task has is added"
-              (is (= ["/lane/compact.sh"] (mapv :command (mapcat :hooks (:PreCompact (:hooks merged))))))
-              (is (seq (:Stop (:hooks merged))) "the goal judge"))
-            (testing "and everything else of the lane's survives"
-              (is (= "1" (get-in merged [:env :LANE_ONLY]))))
+                                 "run-contract.sh")
+                  "the truth lock")
+              (is (seq (:Stop (:hooks merged))) "and the goal judge"))
+            (testing "and the lane's are NOT copied in — the CLI merges its file, this one does not restate it"
+              (is (= 1 (count (:SessionStart (:hooks merged))))
+                  "one entry, ours")
+              (is (not (str/includes? (str merged) "/lane/persona.sh")))
+              (is (nil? (:PreCompact (:hooks merged)))
+                  "an event only the lane has stays only the lane's")
+              (is (nil? (:env merged))
+                  "and nothing else of the lane's is duplicated here either"))
             (testing "the permission mode is the lane's, not restated"
               ;; cc_auto bypasses and cc_control screens. Passing ours would
               ;; make picking between them meaningless.
@@ -370,5 +381,5 @@
             (is (= ["--permission-mode" "bypassPermissions"]
                    (->> argv (drop-while #(not= "--permission-mode" %)) (take 2))))
             (is (nil? (:PreCompact (:hooks settings)))
-                "no lane, nothing merged — a claude role does not inherit cc_auto's hooks"))))
+                "and a bare claude role's file is the same file — nothing lane-shaped in it"))))
       (finally (fs/delete-tree sandbox)))))
