@@ -264,10 +264,16 @@
 (def contract-hook (str (fs/path script-dir "hooks" "run-contract.sh")))
 
 (defn lock-truth!
-  "goal.md and metrics.md are read-only from the moment a swarm opens. The
-   SessionStart hook repeats this per role; the PreToolUse hook stops the chmod."
+  "goal.md, metrics.md and repos are read-only from the moment a swarm opens.
+   The SessionStart hook repeats this per role; the PreToolUse hook stops the
+   chmod.
+
+   `repos` is here because it is not only read at open. `ship` reads it hours
+   later to decide which branches to push and open PRs from (ship.bb:314), and
+   `sessions.tsv` was written from it once — so an edit mid-run cannot add a
+   session, only make the file disagree with the panes that are running."
   [ctx]
-  (doseq [f [(:goal-file ctx) (:metrics-file ctx)]]
+  (doseq [f [(:goal-file ctx) (:metrics-file ctx) (:repos-file ctx)]]
     (when (fs/exists? f)
       (fs/set-posix-file-permissions f "r--r--r--"))))
 
