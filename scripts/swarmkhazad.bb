@@ -52,8 +52,17 @@
 
 (defn metrics-template [task-id]
   (str "# " task-id " — bars\n\n"
-       "## Quantitative\n- <metric> — bar: <threshold> — measure: `<command>`\n\n"
-       "## Qualitative\n- <property> — bar: <what passing looks like> — judged by: Allen\n"))
+       ;; The grammar goes in an HTML comment, not in a live bullet — the same
+       ;; reason goal-template hides its own. A placeholder `measure:` command
+       ;; is a real commanded bar to every parser that reads this file, so
+       ;; `open` refused the task it had just scaffolded, and `run_evidence.bb`
+       ;; would have tried to execute `<command>`.
+       "## Quantitative\n"
+       "<!-- one line per bar: `- <metric> — bar: <threshold> — measure: `<command>``.\n"
+       "     A bar with a `measure:` command needs a role that runs it (the `run`\n"
+       "     role); a bar judged by a human belongs under Qualitative. -->\n\n"
+       "## Qualitative\n"
+       "<!-- `- <property> — bar: <what passing looks like> — judged by: <who>` -->\n"))
 
 (defn flag-values [args flag]
   (->> (partition 2 1 (cons nil args))

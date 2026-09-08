@@ -359,10 +359,20 @@ pre_tool_use() {
           esac
         done
         [ -n "$head_word" ] || continue
+        # Read-only inspectors only. `find`, `du`, `tree`, `dig`, `host`,
+        # `nslookup` and `date` were added after a live run: a role reading the
+        # task folder with `find` was refused, and the refusal talked about
+        # editing goal.md, so it probed the hook instead of moving on.
+        #
+        # Deliberately NOT here: `git`, which writes the very file this block
+        # protects (`git checkout -- goal.md` restores it from the index);
+        # `curl`, which writes with -o; and `env`, already skipped as a command
+        # prefix above and which would otherwise launder whatever follows it.
         case "$head_word" in
           cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|\
           awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
           readlink|md5|shasum|true|false|nl|column|cd|pushd|popd|\
+          find|du|tree|dig|host|nslookup|date|\
           note.bb|ready_for_next.bb|done_with_current.bb|swarm_handoff.bb|\
           run_evidence.bb|goal_judge.bb) ;;
           *) mutating=1; break ;;
@@ -375,7 +385,14 @@ pre_tool_use() {
       if [ "$hit_kind" = "note" ]; then
         deny "decision.md, gotcha.md, finding.md and escalation.md are append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "Bash" "$cmd"
       fi
-      deny "goal.md and metrics.md are the task's truth (chmod 444). A role never edits, moves, or unlocks them — a bar you cannot meet is an escalation.md line, never an edit to the bar." "Bash" "$cmd"
+      # Name the rule that actually fired. This message used to describe an
+      # edit attempt whatever the command was, so a role that ran `ls -la` or
+      # `find .` on the task folder was told it must not edit goal.md — and
+      # spent turns probing a refusal whose text was about something else,
+      # then wrote the confusion into append-only escalation.md. The command
+      # is refused for not being a KNOWN READER of a locked file, which is a
+      # different sentence.
+      deny "goal.md and metrics.md are the task's truth (chmod 444), and '${head_word:-that command}' is not a reader this hook knows, so a command naming them is refused rather than assumed safe. To read one, use Read, or cat/head/grep/sed. A bar you cannot meet is an escalation.md line, never an edit to the bar." "Bash" "$cmd"
       ;;
     Read|Grep|Glob|LS|NotebookRead)
       # Reads pass, and these are the reads. Named explicitly so the catch-all

@@ -36,6 +36,13 @@
    "escalation" :escalation-file
    "finding" :finding-file})
 
+(def ^{:doc
+       "Where a retraction's reason is recorded. `retract` says a bullet was
+        WRONG, not that its ask was met, and that is a fork the role resolved —
+        so the why belongs with the other decisions rather than among the
+        findings, which are things established."}
+  retract-file-key :decision-file)
+
 (defn resolve-escalations!
   "Cross off every escalation bullet containing `match`, and say how many.
 
@@ -62,6 +69,7 @@
 (def usage-text
   (str "Usage: note.bb <decision|gotcha|escalation|finding> <claim> <why>\n"
        "       note.bb resolved <match> <how>\n"
+       "       note.bb retract  <match> <why>\n"
        "\n"
        "  decision    a fork you resolved — name the alternative you rejected\n"
        "  gotcha      something that cost you time and would cost the next one\n"
@@ -70,6 +78,11 @@
        "  resolved    an escalation you have since cleared yourself — <match> is\n"
        "              any text from the bullet, <how> is what you did about it.\n"
        "              Crosses it off Attention and records the how as a finding.\n"
+       "  retract     an escalation bullet that was WRONG — superseded, or a\n"
+       "              probe you never meant to keep. Same cross-off, but the why\n"
+       "              lands in decision.md, and readers skip the bullet instead\n"
+       "              of weighing it. Use `resolved` when the ask was real and\n"
+       "              you met it; `retract` when it should not have been asked.\n"
        "\n"
        "Both claim and why are one line each. The bullet is written for you:\n"
        "  - [<repo>] **<claim>** — <why>\n"))
@@ -102,8 +115,9 @@
     (print usage-text)
     (System/exit 0))
   (let [[kind claim why] args
-        file-key (kinds kind)]
-    (when-not (or file-key (= "resolved" kind))
+        file-key (kinds kind)
+        cross-off? (#{"resolved" "retract"} kind)]
+    (when-not (or file-key cross-off?)
       (fail! 1 (str "note.bb: unknown kind " (pr-str kind) "\n\n" usage-text)))
     (let [claim (one-line claim)
           why (one-line why)]
@@ -112,17 +126,22 @@
       (when (seq (drop 3 args)) (fail! 1 (str "note.bb: too many arguments; quote the claim and the why\n\n" usage-text)))
       (let [ctx (task-lib/ctx-from-env)
             session (handoff-lib/session ctx)]
-        (if (= "resolved" kind)
-          (let [n (resolve-escalations! ctx claim)]
+        (if cross-off?
+          (let [retract? (= "retract" kind)
+                n (resolve-escalations! ctx claim)
+                dest (get ctx (if retract? retract-file-key :finding-file))]
             ;; A match that hits nothing is a typo, and silently doing nothing
             ;; would leave the role believing it had cleared the item.
             (when (zero? n)
               (fail! 1 (str "note.bb: no escalation bullet contains " (pr-str claim)
                             " — nothing crossed off")))
-            (spit (str (:finding-file ctx))
-                  (bullet (tag ctx session) (str "resolved: " claim) why) :append true)
-            (println (str "RESOLVED " n " escalation line(s); how recorded in "
-                          (:finding-file ctx))))
+            (spit (str dest)
+                  (bullet (tag ctx session)
+                          (str (if retract? "retracted: " "resolved: ") claim)
+                          why)
+                  :append true)
+            (println (str (if retract? "RETRACTED " "RESOLVED ") n
+                          " escalation line(s); why recorded in " dest)))
           (let [file (get ctx file-key)]
             (spit (str file) (bullet (tag ctx session) claim why) :append true)
             (println (str "NOTED " kind ": " file))))))))
