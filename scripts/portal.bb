@@ -336,7 +336,25 @@
                          :when (get params (str "role:" stage))]
                      {:role stage
                       :harness (or (get params (str "harness:" stage)) "claude")
-                      :model (or (get params (str "model:" stage)) "anthropic")}))]
+                      ;; Two controls, one field: the roles grammar has always
+                      ;; been `model=<vendor>[:<model-id>]`, and splitting it
+                      ;; across two form names here rather than two columns in
+                      ;; the file keeps the swarm's own reader unchanged.
+                      :model (let [v (or (not-empty (get params (str "vendor:" stage)))
+                                         ;; a saved project's own params, and any
+                                         ;; caller still posting the single field
+                                         (not-empty (first (task-lib/split-model (get params (str "model:" stage) ""))))
+                                         (first (task-lib/split-model (project-lib/default-model stage))))
+                                   id (or (not-empty (str/trim (or (get params (str "modelid:" stage)) "")))
+                                          ;; a POST that names neither control —
+                                          ;; a scripted call, or the CLI — still
+                                          ;; gets the role's default model, not
+                                          ;; a bare vendor with the id dropped
+                                          (when-not (or (get params (str "vendor:" stage))
+                                                        (get params (str "modelid:" stage))
+                                                        (get params (str "model:" stage)))
+                                            (second (task-lib/split-model (project-lib/default-model stage)))))]
+                               (if id (str v ":" id) v))}))]
     (cond
       (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
       (empty? repos) {:error "pick at least one checkout"}
@@ -701,11 +719,24 @@
                [:select {:name (str "harness:" stage)}
                 (for [a (sort task-lib/known-agents)]
                   [:option {:value a :selected (= a h)} a])]
-               [:select (cond-> {:name (str "model:" stage)}
-                          (not= "claude" h) (assoc :disabled true
-                                                   :title (str h " does not take a vendor; it uses its own login")))
-                (for [v (sort task-lib/known-vendors)]
-                  [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]))
+               (let [declared (get params (str "model:" stage) (project-lib/default-model stage))
+                     [vendor model-id] (task-lib/split-model declared)
+                     off? (not= "claude" h)]
+                 (list
+                  [:select (cond-> {:name (str "vendor:" stage)}
+                             off? (assoc :disabled true
+                                         :title (str h " does not take a vendor; it uses its own login")))
+                   (for [v (sort task-lib/known-vendors)]
+                     [:option {:value v :selected (= v vendor)} v])]
+                  ;; Optional, and free text on purpose: the id after the colon
+                  ;; is the vendor's own namespace, not a set this repo can
+                  ;; enumerate without going stale every time a vendor ships.
+                  [:input (cond-> {:type "text" :name (str "modelid:" stage)
+                                   :value (or model-id "")
+                                   :autocomplete "off"
+                                   :placeholder "exact model (optional)"
+                                   :title "overrides the vendor's default, e.g. claude-opus-5[1m]"}
+                            off? (assoc :disabled true))]))))
             ;; No checkout picker: a role works in every repo the project holds,
             ;; and a task narrows that with `@repo` tags on its goal lines.
             ])]

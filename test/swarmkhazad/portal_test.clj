@@ -815,9 +815,29 @@
       (testing "both selects are on the card, one per axis"
         (let [body (:body (request env :get "/"))]
           (is (str/includes? body "name=\"harness:implement\"") "the harness axis has a control at all")
-          (is (str/includes? body "name=\"model:implement\""))
+          (is (str/includes? body "name=\"vendor:implement\"") "the endpoint")
+          (is (str/includes? body "name=\"modelid:implement\"") "and the exact model, optional")
           (is (str/includes? body "value=\"codex\"") "and every known harness is offered")
           (is (str/includes? body "value=\"grok\""))))
+      (testing "each role card opens on the model that role is meant to run"
+        ;; Not one default for everyone. A quiet quality drop in a building role
+        ;; ships wrong code, so those get Opus; specifier and review get a
+        ;; different VENDOR on purpose, so a diff is read by a model that did
+        ;; not write it and cannot agree with its own reasoning.
+        (let [body (:body (request env :get "/"))
+              picked (fn [stage]
+                       ;; the value sitting in that stage's own two controls
+                       (let [at (str/index-of body (str "name=\"vendor:" stage "\""))
+                             seg (subs body at (min (count body) (+ at 1400)))
+                             v (second (re-find #"<option selected=\"selected\" value=\"([^\"]+)\"" seg))
+                             id (second (re-find (re-pattern (str "name=\"modelid:" stage "\" [^>]*value=\"([^\"]*)\"")) seg))]
+                         (if (seq id) (str v ":" id) v)))]
+          (is (= "anthropic:claude-opus-5[1m]" (picked "implement")))
+          (is (= "anthropic:claude-opus-5[1m]" (picked "hardener")))
+          (is (= "anthropic:claude-opus-5[1m]" (picked "qa")))
+          (is (= "anthropic:claude-fable-5-1" (picked "architect")))
+          (is (= "glm" (picked "specifier")) "a vendor with no id override needs no colon")
+          (is (= "deepseek" (picked "review")))))
       (testing "a non-claude role's vendor select is disabled, not silently ignored"
         ;; Only the claude shim reads the vendor; the others pin the binary and
         ;; nothing else. Offering a choice that does nothing is worse than
@@ -833,15 +853,18 @@
         (let [r (request env :post "/projects"
                          {:body (str "name=" project "&repo%3A" src "=on"
                                      "&role%3Aimplement=on&harness%3Aimplement=codex"
-                                     "&role%3Areview=on&harness%3Areview=claude&model%3Areview=glm")})]
+                                     "&role%3Areview=on&harness%3Areview=claude"
+                                     "&vendor%3Areview=kimi&modelid%3Areview=moonshotai%2Fkimi-k2.5")})]
           (is (= 303 (:status r)) (:body r)))
         (let [body (:body (request env :get (str "/projects/" project "/edit")))]
           (is (str/includes? body "selected=\"selected\" value=\"codex\"")
               "and comes back selected on edit — without the round-trip, pressing Save reset every role to claude")
-          (is (str/includes? body "selected=\"selected\" value=\"glm\"")))
+          (is (str/includes? body "selected=\"selected\" value=\"kimi\""))
+          (is (str/includes? body "value=\"moonshotai/kimi-k2.5\"")
+              "and the exact model comes back in its own box, not lost into the vendor"))
         ;; and into the saved project, which is what `new` turns into a roles
         ;; file — the swarm never learns a project exists, it only reads that.
         (let [saved (slurp (str (fs/path home "projects" (str project ".edn"))))]
           (is (str/includes? saved "codex") saved)
-          (is (str/includes? saved "glm") saved)))
+          (is (str/includes? saved "kimi:moonshotai/kimi-k2.5") saved)))
       (finally (fs/delete-tree sandbox)))))

@@ -22,11 +22,20 @@ if [ -z "$real" ] || [ ! -x "$real" ]; then
 fi
 # sessions.tsv columns are task-lib's sessions-tsv-columns; :model is the
 # seventh and the session id is the first (both pinned by shim_test).
-vendor="$(awk -F'\t' -v r="$session" '$1==r {print $7}' "$task_dir/state/sessions.tsv")"
-if [ -z "$vendor" ]; then
+declared="$(awk -F'\t' -v r="$session" '$1==r {print $7}' "$task_dir/state/sessions.tsv")"
+if [ -z "$declared" ]; then
   echo "swarmkhazad shim: session '$session' is not in $task_dir/state/sessions.tsv" >&2
   exit 2
 fi
+# `<vendor>[:<model-id>]`. The vendor half picks the endpoint and the keychain
+# service; the optional suffix names the exact model, because a vendors.tsv row
+# pins one pair for everyone who picks that vendor. Split on the FIRST colon —
+# a model id carries colons of its own (`moonshotai/kimi-k3:exacto`), and
+# splitting on the last would leave the vendor half unresolvable.
+case "$declared" in
+  *:*) vendor="${declared%%:*}"; model_override="${declared#*:}" ;;
+  *)   vendor="$declared";       model_override="" ;;
+esac
 
 extra=()
 if [ "$harness" = "claude" ]; then
@@ -37,6 +46,9 @@ if [ "$harness" = "claude" ]; then
     unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN \
           ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
           CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    # `anthropic:claude-opus-5[1m]` — same login, a named model rather than
+    # whatever settings.json defaults to.
+    [ -n "$model_override" ] && extra=(--model "$model_override")
   else
     # vendors.tsv: vendor base_url keychain_service model_main model_small ctx_tokens
     IFS=$'\t' read -r _ BASE_URL KEYCHAIN_SVC MODEL_MAIN MODEL_SMALL CTX_TOKENS \
@@ -55,6 +67,7 @@ if [ "$harness" = "claude" ]; then
     # Empty-but-set: unset, Claude Code falls back to its own Anthropic auth and bills api.anthropic.com.
     export ANTHROPIC_API_KEY=""
     export API_TIMEOUT_MS="3000000"
+    [ -n "$model_override" ] && MODEL_MAIN="$model_override"
     export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_MAIN"
     export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_MAIN"
     export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_SMALL"

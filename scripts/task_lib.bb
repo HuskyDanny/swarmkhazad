@@ -36,6 +36,18 @@
 ;; there, not at the first agent launch.
 (def known-vendors (conj (set (keys (read-vendors))) "anthropic"))
 
+(defn split-model
+  "`<vendor>[:<model-id>]` -> [vendor model-id-or-nil].
+
+   Split on the FIRST colon only: a model id carries colons of its own
+   (`moonshotai/kimi-k3:exacto`), and splitting on the last one would hand the
+   vendor half `kimi:moonshotai/kimi-k3` and lose the endpoint."
+  [s]
+  (let [i (str/index-of (or s "") ":")]
+    (if i
+      [(subs s 0 i) (not-empty (subs s (inc i)))]
+      [(or s "") nil])))
+
 (def sessions-tsv-columns
   "state/sessions.tsv: the (role, repo) pairs this task runs, and where each
    one's working directory is. Written once at prepare, read everywhere else —
@@ -144,13 +156,13 @@
 ;;
 ;; Grammar, one role per line, `#` comments and blank lines skipped:
 ;;
-;;   <role> <harness> <repo-path|none> [task|batch] [model=<vendor>] [cli args...]
+;;   <role> <harness> <repo-path|none> [task|batch] [model=<vendor>[:<model-id>]] [cli args...]
 ;;
 ;; The two optional tokens are recognised anywhere after the repo, in any order;
 ;; whatever is left is passed to the harness CLI verbatim.
 
 (def roles-grammar-comment
-  "# <role> <harness> [task|batch] [model=anthropic|glm|kimi|deepseek|qwen] [cli args...]\n")
+  "# <role> <harness> [task|batch] [model=anthropic|glm|kimi|deepseek|qwen[:<model-id>]] [cli args...]\n")
 
 (def repos-grammar-comment
   "# one checkout per line; the task branches sk/<task-id> off origin/<default>\n# <abs-path> [branch=<name>]\n")
@@ -207,8 +219,15 @@
       (throw (ex-info (format "roles line %d: role %s must match [A-Za-z0-9][A-Za-z0-9.-]* (a path component and a refname segment; no underscore, slash, or leading dot/dash)" line-no (pr-str role)) {})))
     (when-not (known-agents harness)
       (throw (ex-info (format "roles line %d: unknown harness %s (want %s)" line-no (pr-str harness) (str/join "|" (sort known-agents))) {})))
-    (when-not (known-vendors model)
-      (throw (ex-info (format "roles line %d: unknown model vendor %s (want %s)" line-no (pr-str model) (str/join "|" (sort known-vendors))) {})))
+    ;; Only the vendor half is a closed set — it selects a base URL and a
+    ;; keychain service, both of which have to exist. The model id after the
+    ;; colon is the vendor's own namespace and is not ours to enumerate.
+    (let [[vendor model-id] (split-model model)]
+      (when-not (known-vendors vendor)
+        (throw (ex-info (format "roles line %d: unknown model vendor %s (want %s, optionally %s:<model-id>)"
+                                line-no (pr-str vendor) (str/join "|" (sort known-vendors)) "<vendor>") {})))
+      (when (and model-id (str/blank? (str/trim model-id)))
+        (throw (ex-info (format "roles line %d: model=%s: names a vendor and an empty model id" line-no vendor) {}))))
     (when (some #(str/starts-with? % "/") trailing)
       (throw (ex-info (format "roles line %d: a role no longer names a repo — put checkouts in the task's `repos` file. Got %s"
                               line-no (pr-str line)) {})))

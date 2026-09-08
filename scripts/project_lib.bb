@@ -139,10 +139,37 @@
         known (filterv on-disk pipeline-order)]
     (into known (sort (remove (set pipeline-order) on-disk)))))
 
+(def opus "anthropic:claude-opus-5[1m]")
+
+(def role-models
+  "What each role runs on unless a project says otherwise.
+
+   Not one default for everyone: the roles do different work and the cost of
+   getting them wrong differs. The building roles get Opus because a quiet
+   quality drop there ships wrong code; architect gets Fable for design work;
+   specifier and review get a different VENDOR on purpose, so the diff is read
+   by a model that did not write it and cannot agree with its own reasoning.
+
+   `<vendor>:<model-id>` — the vendor picks the endpoint and the credential,
+   the suffix names the exact model."
+  {"implement"  opus
+   "refactorer" opus
+   "cleaner"    opus
+   "hardener"   opus
+   "run"        opus
+   "qa"         opus
+   "architect"  "anthropic:claude-fable-5-1"
+   "specifier"  "glm"
+   "review"     "deepseek"})
+
+(defn default-model
+  "A stage with no opinion recorded here runs on the operator's own login."
+  [role]
+  (get role-models role "anthropic"))
+
 (def default-roles
-  [{:role "implement" :harness "claude" :model "anthropic"}
-   {:role "review" :harness "claude" :model "anthropic"}
-   {:role "run" :harness "claude" :model "anthropic"}])
+  (mapv (fn [r] {:role r :harness "claude" :model (default-model r)})
+        ["implement" "review" "run"]))
 
 (defn valid-role-spec?
   "The role itself. Its checkout is not re-checked here — a role may only name
@@ -150,7 +177,7 @@
   [{:keys [role harness model]}]
   (and (task-lib/valid-role? role)
        (contains? task-lib/known-agents harness)
-       (contains? task-lib/known-vendors model)))
+       (contains? task-lib/known-vendors (first (task-lib/split-model model)))))
 
 ;; ---------------------------------------------------------------- roles file
 

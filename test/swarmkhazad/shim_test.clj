@@ -144,12 +144,19 @@
         (spit (str (fs/path dir "roles"))
               (str "plain claude task\n"
                    "fast claude task model=kimi\n"
-                   "deep claude task model=deepseek --model sonnet\n"))
+                   "deep claude task model=deepseek --model sonnet\n"
+                   ;; `<vendor>:<model-id>`: the vendor half picks the endpoint
+                   ;; and the credential, the suffix names the exact model. A
+                   ;; vendors.tsv row pins one pair for everyone who picks that
+                   ;; vendor, so without this a role can ask for kimi and not
+                   ;; for a particular kimi.
+                   "exact claude task model=anthropic:claude-opus-5[1m]\n"
+                   "pinned claude task model=kimi:moonshotai/kimi-k2.5:exacto\n"))
         (spit (str (fs/path dir "repos")) (str src "\n"))
         (let [result (run {:env env} cli "smoke" id)
               out (:out result)]
           (testing "every role reports OK and sent its note to itself"
-            (doseq [role ["plain" "fast" "deep"]]
+            (doseq [role ["plain" "fast" "deep" "exact" "pinned"]]
               (is (re-find (re-pattern (str "(?m)^OK +" role " ")) out) (str role ": " out))
               (is (str/includes? (slurp (str (fs/path dir "tmp" (str "smoke-" role ".out")))) "HANDOFF QUEUED") "the stub ran swarm_handoff.bb"))
             (is (empty? (fs/glob (fs/path dir "mail") "**/outbox/*.handoff")) "smoke notes are removed so a later open does not deliver them"))
@@ -169,6 +176,31 @@
               (is (= "http://127.0.0.1:8428/opentelemetry" (get e "OTEL_EXPORTER_OTLP_ENDPOINT")))
               (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
               (is (not (some #{"--model"} (str/split-lines (slurp (str (fs/path dir "tmp" "launch-plain.argv")))))) "no --model pin for anthropic")))
+          (testing "an exact model on the operator's own login: pinned, and still no vendor routing"
+            (let [e (env-map (fs/path dir "tmp" "launch-exact.env"))
+                  argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-exact.argv"))))]
+              (is (nil? (get e "ANTHROPIC_BASE_URL"))
+                  "`anthropic:` is still anthropic — naming a model does not route it anywhere")
+              (is (nil? (get e "ANTHROPIC_AUTH_TOKEN")))
+              (is (= ["--model" "claude-opus-5[1m]"]
+                     (->> argv (drop-while #(not= "--model" %)) (take 2)))
+                  "and the model reaches the CLI, which is the whole point of the suffix")))
+          (testing "an exact model on a vendor's endpoint: that vendor's URL and token, this role's model"
+            (let [e (env-map (fs/path dir "tmp" "launch-pinned.env"))
+                  argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-pinned.argv"))))]
+              (is (= "https://openrouter.ai/api" (get e "ANTHROPIC_BASE_URL"))
+                  "the vendor half still selects the endpoint")
+              (is (= "tok-from-test:openrouter-token" (get e "ANTHROPIC_AUTH_TOKEN"))
+                  "and the credential")
+              (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL"))
+                  "but the model is this role's, not the row's `moonshotai/kimi-k3:exacto` — and the id carries a colon of its own, which is why the split is on the FIRST one")
+              (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_SONNET_MODEL")))
+              (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL"))
+                  "the row's small model is not overridden; nothing else in the row moves either")
+              (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+                  "the context window still comes from the vendor row")
+              (is (= ["--model" "moonshotai/kimi-k2.5:exacto"]
+                     (->> argv (drop-while #(not= "--model" %)) (take 2))))))
           (testing "a kimi role gets the cc_alt env and a --model pin, and the run reports that model"
             (let [e (env-map (fs/path dir "tmp" "launch-fast.env"))
                   argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-fast.argv"))))]
