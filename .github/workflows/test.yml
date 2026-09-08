@@ -63,10 +63,18 @@ jobs:
         env:
           BB_VERSION: 1.13.220
         run: |
-          curl -sSLO https://raw.githubusercontent.com/babashka/babashka/master/install
-          chmod +x install
-          sudo ./install --version "$BB_VERSION"
+          # Into a temp dir, NOT the workspace. `curl -O` in the checkout left
+          # an untracked `install` behind, which made the repo dirty — and the
+          # first run then printed swarmkhazad's own "opening from a checkout
+          # with uncommitted changes" warning, about a file CI had just
+          # created. Harmless, but a workflow that dirties the tree it is
+          # testing is a workflow that lies about the tree.
+          d=$(mktemp -d)
+          curl -sSL -o "$d/install" https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x "$d/install"
+          sudo "$d/install" --version "$BB_VERSION"
           bb --version
+          git status --porcelain   # expected: empty
 
       - name: Identify git to itself
         # Fixtures that build scratch repos set user.email/name per repo, but

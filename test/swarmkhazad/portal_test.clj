@@ -550,7 +550,21 @@
         home (str (fs/path sandbox "home"))
         src (str (fs/path sandbox "src" "fixture"))
         stubdir (str (fs/path sandbox "stubbin"))
+        ;; The project this test creates declares the `cc_auto` harness, and a
+        ;; lane harness does not resolve on PATH at all — `task-lib/lane-script`
+        ;; looks for `<cc-home>/scripts/cc-auto.sh`, because a lane is one of the
+        ;; operator's own launcher scripts reached through a shell alias, and an
+        ;; alias is not a file a child can exec.
+        ;;
+        ;; So this test used to require Allen's dotfiles to be present. It went
+        ;; green on his machine and, on CI, `open` refused with `'cc_auto' is
+        ;; required but not on PATH` — leaving no tmux socket, no lane, and an
+        ;; empty pane, which showed up as four unrelated-looking failures.
+        ;; `cc-home` honours CLAUDE_CONFIG_DIR, so the lane lives in the sandbox
+        ;; and the real resolution path is still what runs.
+        cc-home (fs/path sandbox "cc-home")
         env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src"))
+             "CLAUDE_CONFIG_DIR" (str cc-home)
              "PATH" (str stubdir ":" (System/getenv "PATH"))}
         ;; a checkout one level deeper than the root, the shape ~/repos has:
         ;; the checkouts are not all direct children (~/repos/mithra_ai/istari).
@@ -563,6 +577,14 @@
       (fs/create-dirs stubdir)
       (fs/copy stub (fs/path stubdir "claude"))
       (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
+      ;; The lane the created project names, as a real executable script in the
+      ;; sandbox's cc-home. It execs the stub `claude` on PATH, so a role
+      ;; launched through the lane behaves the same as one launched directly.
+      (fs/create-dirs (fs/path cc-home "scripts"))
+      (doseq [lane ["cc-auto" "cc-alt"]]
+        (let [f (fs/path cc-home "scripts" (str lane ".sh"))]
+          (spit (str f) "#!/usr/bin/env bash\nexec claude \"$@\"\n")
+          (fs/set-posix-file-permissions f "rwxr-xr-x")))
       (testing "the index scans the repo roots, so the checkouts are a list to tick, not a path to type"
         (let [body (:body (request env :get "/"))]
           (is (str/includes? body (str "name=\"repo:" src "\"")) "the checkout under the root is offered")
