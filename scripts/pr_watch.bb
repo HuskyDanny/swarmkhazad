@@ -226,9 +226,7 @@
 ;; ------------------------------------------------------------- who it wakes
 
 (defn last-committer
-  "The session that most recently handed off work in this repo — the one whose
-   archive, verdict and evidence are all about the diff under review. Falls
-   back to the repo's first session, so feedback always reaches somebody."
+  "The session that most recently handed off work in this repo."
   [ctx repo]
   (let [rows (filter #(= repo (:repo %)) (task-lib/read-sessions-tsv ctx))
         stamp (fn [row]
@@ -237,12 +235,36 @@
                      (map (comp str fs/file-name))
                      sort
                      last))]
-    (or (->> rows
-             (keep (fn [row] (when-let [s (stamp row)] [s (:session row)])))
-             (sort-by first)
-             last
-             second)
-        (:session (first rows)))))
+    (->> rows
+         (keep (fn [row] (when-let [s (stamp row)] [s (:session row)])))
+         (sort-by first)
+         last
+         second)))
+
+(defn fixer
+  "Who a PR comment wakes: the FRONT of the pipeline for that repo.
+
+   It used to be `last-committer`, on the reasoning that the last session to
+   hand off is the one whose diff is under review. True, and the wrong
+   conclusion — by the time a PR exists the last session to hand off is REVIEW,
+   so every finding landed on the one role that does not fix anything. A
+   reviewer could bounce it back by hand, but nothing required it, and the
+   process stopped at `reviewed` with no fix step.
+
+   A comment is inbound work, and work enters at the front: the first role in
+   the roles file holding a session in this repo. Named by position rather than
+   by the string `implement`, so a lineup that starts with `specifier` or
+   `architect` still reaches whoever actually starts work. It fixes, hands off
+   to review as usual, and the lane runs again — no separate fix path exists,
+   because the pipeline already is one.
+
+   Falls back to the last committer, then to any session in the repo, so
+   feedback always reaches somebody rather than being dropped for tidiness."
+  [ctx repo]
+  (let [rows (filter #(= repo (:repo %)) (task-lib/read-sessions-tsv ctx))
+        order (map :role (task-lib/parse-roles ctx))
+        front (some (fn [role] (some #(when (= role (:role %)) (:session %)) rows)) order)]
+    (or front (last-committer ctx repo) (:session (first rows)))))
 
 ;; ------------------------------------------------------------- the handoffs
 
@@ -327,7 +349,7 @@
       (let [repo (:repo pr-row)
             state (seen ctx repo)
             handled (set (:handled state))
-            recipient (last-committer ctx repo)
+            recipient (fixer ctx repo)
             items (concat (threads pr) (issue-comments pr) (failing-checks pr))
             ;; Our own comments are our own replies coming back round.
             ours? (fn [i] (= (str/lower-case (str (:author i)))

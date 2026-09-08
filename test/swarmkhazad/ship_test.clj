@@ -386,7 +386,7 @@
           (is (= 3 (count files))
               "three queued in the same millisecond, three arrived — the stamp is the filename's uniqueness")
           (is (empty? (inbox "implement_cirdan")))
-          (is (empty? (inbox "review_gobel")) "review never handed off, so the diff under review is not its")
+          (is (empty? (inbox "review_gobel")) "a comment goes to the front of the pipeline, not to the reviewer who cannot fix it")
           (let [hs (map headers-of files)]
             (is (= #{"pr_comment" "pr_check"} (set (map #(get % "type") hs))))
             (is (every? #(= "gobel" (get % "origin_repo")) hs)
@@ -492,11 +492,15 @@
       (ship! h)
       (graphql! nil live-pr)
       (graphql! "cirdan" quiet-pr)
-      ;; BOTH sessions handed off, implement first and review after. One stamp
-      ;; would leave the sort untested — the candidate list has a single element
-      ;; and `last` and `first` agree — so the earlier one is the whole point of
-      ;; this fixture. review is the session whose archive, verdict and evidence
-      ;; are about the diff now under review, so the comment is its to answer.
+      ;; BOTH sessions handed off, implement first and review after — the shape
+      ;; a PR is always in, because a PR exists only once review is through.
+      ;;
+      ;; That is exactly why `last-committer` was the wrong recipient: the last
+      ;; session to hand off is REVIEW, so every finding landed on the one role
+      ;; that does not fix anything, and the process stopped at "reviewed" with
+      ;; no fix step. A comment is inbound work, and work enters the pipeline at
+      ;; the FRONT — implement fixes it and hands off to review as usual, so the
+      ;; lane runs again with no separate fix path to build.
       (write! (fs/path dir "mail" "implement_gobel" "sent"
                        "50_20260101T000000001Z_from_implement_gobel_to_review.handoff")
               "id: earlier\nfrom: implement_gobel\nto: review_gobel\ntype: git_handoff\n\nearlier\n")
@@ -506,10 +510,10 @@
       ;; handoffd's own loop does the polling; nothing here calls pr_watch.
       (deliver!)
       (deliver!)
-      (is (= 3 (count (inbox "review_gobel")))
+      (is (= 3 (count (inbox "implement_gobel")))
           "handoffd polls the PRs itself — the portal's button only skips the wait")
-      (is (empty? (inbox "implement_gobel"))
-          "implement handed off too, earlier — latest wins, and only a second stamp can show that"))))
+      (is (empty? (inbox "review_gobel"))
+          "and review, which handed off LAST, is not woken — it cannot fix what the comment asks for"))))
 
 (deftest the-daemon-polls-the-prs-on-its-own-loop
   ;; Every other test here drives `handoffd --once`. This one runs the real
