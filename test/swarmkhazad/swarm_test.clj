@@ -188,9 +188,22 @@
       (run {:env env} cli "new" "t-noharness" "--repo" src)
       (spit (str (fs/path home "tasks" "t-noharness" "roles")) "a copilot\n")
       (spit (str (fs/path home "tasks" "t-noharness" "repos")) (str src "\n"))
-      (let [result (run {:env (assoc env "PATH" "/usr/bin:/bin:/opt/homebrew/bin") :ok? false} cli "open" "t-noharness")]
+      ;; A PATH that holds what `open` needs and nothing that answers to
+      ;; `copilot`. Derived, not named: this used to be the literal
+      ;; "/usr/bin:/bin:/opt/homebrew/bin", which is Apple-Silicon Homebrew —
+      ;; so it passed on that one machine and failed anywhere else. On CI, bb
+      ;; installs to /usr/local/bin, the run died `env: bb: No such file or
+      ;; directory`, and this assertion failed on a message that had nothing to
+      ;; do with copilot. A wrong-reason failure reads exactly like a real one.
+      (let [needed (str/join ":" (distinct (concat (keep #(some-> (fs/which %) fs/parent str)
+                                                         ["bb" "git" "tmux"])
+                                                   ["/usr/bin" "/bin"])))
+            result (run {:env (assoc env "PATH" needed) :ok? false} cli "open" "t-noharness")]
+        (is (nil? (fs/which "copilot" {:paths (str/split needed #":")}))
+            "the point of this PATH is that copilot is NOT on it")
         (is (not= 0 (:exit result)))
-        (is (str/includes? (:err result) "'copilot' is required")))
+        (is (str/includes? (:err result) "'copilot' is required")
+            (str "PATH was " needed "\n" (:err result))))
       (finally
         (fs/delete-tree sandbox)))))
 

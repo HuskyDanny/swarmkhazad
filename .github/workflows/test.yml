@@ -1,0 +1,98 @@
+name: test
+
+# The suite was the only gate this repo had, and nothing ran it but a human.
+# `bb test` exits non-zero on failure (test/run_tests.clj), so it gates here
+# with no wrapper.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A second push to the same ref cancels the first: the suite takes minutes
+  # and only the newest commit's answer is worth having.
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macOS, not ubuntu, because that is the platform this tool targets and
+    # the suite says so in two places: `stat -f '%Lp'` is BSD (GNU coreutils
+    # reads -f as "filesystem status" and would report something else
+    # entirely), and the tmux socket lives under /tmp because macOS caps a
+    # unix socket path. Making the TESTS portable while the TOOL is not would
+    # buy a green run that does not describe the platform anyone uses — the
+    # same passes-for-the-wrong-reason this suite exists to catch. The repo is
+    # public, so macOS minutes are free.
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history. Not required today — the suite builds its own scratch
+          # repos rather than reading this checkout's refs — but a depth-1
+          # clone has no HEAD~1 and no origin/main, which is precisely the
+          # shape that hid the base-resolution bug. Cheap insurance against a
+          # future test borrowing the ambient repo.
+          fetch-depth: 0
+
+      - name: tmux
+        # `open` requires it (swarm_lib/check-dependencies!) and six tests
+        # start real tmux servers. Installed only if the image lacks it, so
+        # this neither assumes it is there nor pays for brew when it is.
+        run: |
+          command -v tmux >/dev/null 2>&1 || brew install tmux
+          tmux -V
+
+      - name: babashka
+        # The official installer, pinned. The docs recommend setup-clojure for
+        # GitHub Actions and caching is its reason, but bb is one ~20 MB binary
+        # that installs in seconds — the action would buy a dependency and a
+        # version to track for very little. Pinned rather than `latest` so a bb
+        # release cannot turn a green branch red on its own.
+        #
+        # RAN before committing: `install --dir <dir> --version 1.13.220`
+        # fetched babashka-1.13.220-macos-aarch64.tar.gz and reported the
+        # version back. --version needs no --checksum; the installer only
+        # rejects a --checksum given WITHOUT a --version.
+        env:
+          BB_VERSION: 1.13.220
+        run: |
+          # Into a temp dir, NOT the workspace. `curl -O` in the checkout left
+          # an untracked `install` behind, which made the repo dirty — and the
+          # first run then printed swarmkhazad's own "opening from a checkout
+          # with uncommitted changes" warning, about a file CI had just
+          # created. Harmless, but a workflow that dirties the tree it is
+          # testing is a workflow that lies about the tree.
+          d=$(mktemp -d)
+          curl -sSL -o "$d/install" https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x "$d/install"
+          sudo "$d/install" --version "$BB_VERSION"
+          bb --version
+          git status --porcelain   # expected: empty
+
+      - name: Identify git to itself
+        # Fixtures that build scratch repos set user.email/name per repo, but
+        # one that forgets would die with "Author identity unknown" instead of
+        # on its own assertion — a failure for the wrong reason, which reads
+        # like a real one.
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "swarmkhazad CI"
+          git config --global init.defaultBranch main
+
+      - name: Full suite
+        # No filter argument: every test/**/*_test.clj namespace.
+        run: bb test
+
+      - name: How to reproduce a failure
+        if: failure()
+        run: |
+          echo "bb test prints each failure with its file and line; the log above"
+          echo "is the whole record. Locally, one namespace at a time:"
+          echo "  bb test <substring>      # e.g. bb test base"

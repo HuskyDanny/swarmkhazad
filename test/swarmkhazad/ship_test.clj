@@ -574,9 +574,19 @@
       (graphql! "cirdan" quiet-pr)
       (let [proc (process/process {:dir repo-root :extra-env env :out :string :err :string}
                                   "bb" (str (fs/path scripts "handoffd.bb")) "t-ship")
-            deadline (+ (System/currentTimeMillis) 60000)]
+            deadline (+ (System/currentTimeMillis) 60000)
+            ;; Wait for what the assertion actually checks. This waited for the
+            ;; inbox to be NON-EMPTY and then asserted three: the daemon
+            ;; delivers one message per PR event, they land one at a time, and
+            ;; on a machine slower than the author's the loop exited after the
+            ;; first. CI failed `(= 3 1)` — a real race, not a slow machine's
+            ;; fault, and the kind that reports a delivery bug that is not
+            ;; there. The deadline still bounds it, so a daemon that genuinely
+            ;; never delivers fails rather than hanging.
+            wanted 3]
         (try
-          (while (and (empty? (inbox "implement_gobel")) (< (System/currentTimeMillis) deadline))
+          (while (and (< (count (inbox "implement_gobel")) wanted)
+                      (< (System/currentTimeMillis) deadline))
             (Thread/sleep 200))
           (finally
             (spit (str (fs/path dir "state" "daemon" "stop")) "")

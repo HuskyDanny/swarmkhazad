@@ -4,6 +4,8 @@ A local, goal-driven swarm: SwarmForge's runtime, the `.claude` goal contract, a
 
 One runtime dependency: [Babashka](https://babashka.org) (`bb`). `git` and `tmux` are assumed present.
 
+`bb test` runs the suite, and `.github/workflows/test.yml` runs it on every push to `main` and every pull request. On **macOS**, not Linux, because that is the platform this targets and the suite says so: `stat -f '%Lp'` is BSD, and the tmux socket lives under `/tmp` because macOS caps the length of a unix socket path. Making the tests portable while the tool is not would buy a green run that describes a platform nobody uses.
+
 ## Quick start
 
 ```bash

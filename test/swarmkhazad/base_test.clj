@@ -89,18 +89,48 @@
       (is (str/includes? src "is NOT `no ")
           "the summariser must distinguish an uncomputed diff from an empty one"))))
 
+(defn- repo-with-two-commits!
+  "A scratch repo that HAS origin/main and a second commit — the shape this
+   test needs, built rather than borrowed.
+
+   It used to run against `(fs/cwd)`, the live checkout, which made it depend
+   on refs the ambient repo happens to hold: `HEAD~1` needs history deeper than
+   `actions/checkout`'s default `fetch-depth: 1`, and the fallback needs one of
+   origin/HEAD, origin/main, main or master to resolve, which a detached PR
+   checkout may not have. It also failed once for a third reason — origin/main
+   moved under it mid-session. A test that owns its fixture has none of those
+   failure modes."
+  [dir]
+  (let [g (fn [& args] (apply process/sh {:continue true :dir (str dir)} "git" args))]
+    (fs/create-dirs dir)
+    (g "init" "-q" "-b" "main")
+    (g "config" "user.email" "t@example.com")
+    (g "config" "user.name" "T")
+    (spit (str (fs/path dir "one")) "1\n")
+    (g "add" ".")
+    (g "commit" "-q" "-m" "one")
+    (let [first-sha (str/trim (str (:out (g "rev-parse" "HEAD"))))]
+      ;; origin/main exists as a remote-tracking ref, so the fallback chain has
+      ;; something to find — without an actual remote to talk to.
+      (g "update-ref" "refs/remotes/origin/main" first-sha)
+      (spit (str (fs/path dir "two")) "2\n")
+      (g "add" ".")
+      (g "commit" "-q" "-m" "two")
+      {:prev first-sha :head (str/trim (str (:out (g "rev-parse" "HEAD"))))})))
+
 (deftest pin-wins-over-a-resolvable-ref
-  ;; The discriminating case: this worktree HAS origin/HEAD, so the chain alone
-  ;; would answer. A pin must still take precedence, because refs are shared
-  ;; with the source checkout and move when anyone fetches in it.
+  ;; The discriminating case: this repo HAS origin/main, so the chain alone
+  ;; would answer. A pin must still take precedence, because those refs are
+  ;; shared with the source checkout and move when anyone fetches in it.
   (let [ctx (tmp-ctx)
-        wt (str (fs/cwd))
-        head (str/trim (:out (process/sh {:dir wt} "git" "rev-parse" "HEAD")))
-        prev (str/trim (:out (process/sh {:dir wt} "git" "rev-parse" "HEAD~1")))
-        repo (fs/file-name (fs/cwd))]
+        wt (str (fs/path (fs/create-temp-dir {:prefix "sk-pinrepo-"}) "repo"))
+        {:keys [prev head]} (repo-with-two-commits! wt)
+        repo "fixture"]
     (task-lib/write-base-tsv! ctx [{:name repo :start prev}])
-    (testing "the pin is used even though origin/HEAD resolves"
-      (is (= prev (summary/base-ref ctx repo wt))))
+    (testing "the pin is used even though a ref in the chain resolves"
+      (is (= prev (summary/base-ref ctx repo wt)))
+      (is (not= head (summary/base-ref ctx repo wt))
+          "and it is the pin, not simply whatever HEAD is"))
     (testing "a pin the worktree does not hold falls through instead of breaking the range"
       ;; A pinned sha that is not present makes `<pin>..HEAD` fail silently and
       ;; the section goes empty again — the original bug by another route.
