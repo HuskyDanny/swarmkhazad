@@ -39,7 +39,25 @@
 (defn stop-file [ctx] (fs/path (:daemon-dir ctx) "stop"))
 (defn pid-file [ctx] (fs/path (:daemon-dir ctx) "handoffd.pid"))
 
-(defn should-stop? [ctx] (or @stopping (fs/exists? (stop-file ctx))))
+(defn orphaned?
+  "The task this daemon serves no longer exists on disk.
+
+   A daemon is a bare `bb` process whose life was tied to nothing: deleting a
+   task folder by hand left it polling a directory that was not there, and no
+   other part of the system looks for that — `close` needs a task folder to
+   work from, and `reap` only ever inspects git. Three such daemons were found
+   running in one day (`t-e2e`, `t-kick`, `t-ship`), one of them from a
+   swarmkhazad generation that had since been replaced.
+
+   Checked on the tick rather than cleaned up afterwards, because a process
+   that ends itself cannot become a class of litter. The task DIR, not the
+   state dir: `close` empties state but keeps the folder for its notes, and a
+   daemon that quit on that would stop serving a task still being worked."
+  [ctx]
+  (not (fs/directory? (:task-dir ctx))))
+
+(defn should-stop? [ctx]
+  (or @stopping (fs/exists? (stop-file ctx)) (orphaned? ctx)))
 
 (defn notify!
   "Type the wake-up into the recipient's pane. Best-effort: a role whose session

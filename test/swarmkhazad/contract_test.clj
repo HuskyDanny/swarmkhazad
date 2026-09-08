@@ -410,4 +410,36 @@
         (is (denied? (bash task task (str "ready_for_next.bb 2>&1 && chmod 644 " task "/goal.md")))
             "a redirect earlier in the line does not buy the rest of it a pass")
         (is (denied? (bash task task (str "cd " task " && ready_for_next.bb > goal.md")))
-            "an allowed reader is still not allowed to redirect over the truth"))))) 
+            "an allowed reader is still not allowed to redirect over the truth")))))
+
+(deftest read-only-inspectors-are-readers-and-writers-still-are-not
+  ;; From a live run: a role inspecting the task folder with `find` was
+  ;; refused, and the refusal text talked about editing goal.md — so it spent
+  ;; turns probing the hook, then wrote the confusion into append-only
+  ;; escalation.md, where the merge verdict later spent a `nit` on it.
+  (with-task
+    (fn [task _sandbox]
+      (session-start task)
+
+      (testing "read-only inspectors that name the truth are allowed"
+        (is (allowed? (bash task task (str "cd " task " && find . -maxdepth 2 -type f"))))
+        (is (allowed? (bash task task (str "du -sh " task "/goal.md"))))
+        (is (allowed? (bash task task (str "cat " task "/goal.md"))))
+        (is (allowed? (bash task task (str "cd " task " && ls -la")))))
+
+      (testing "tools that can WRITE the truth are still refused, allowlist or not"
+        ;; `git` is the one deliberately left off: `git checkout -- goal.md`
+        ;; restores the file from the index, which is a write by another name.
+        (is (denied? (bash task task (str "cd " task " && git checkout -- goal.md"))))
+        (is (denied? (bash task task (str "curl -s -o " task "/metrics.md https://example.invalid"))))
+        ;; `env` is skipped as a command PREFIX, so listing it would have
+        ;; laundered whatever followed.
+        (is (denied? (bash task task (str "env FOO=1 perl -pi -e 's/a/b/' " task "/goal.md")))))
+
+      (testing "the refusal names the rule that fired, not an edit nobody attempted"
+        (let [r (bash task task (str "cd " task " && perl -pi -e 's/a/b/' goal.md"))
+              why (get-in (:json r) ["hookSpecificOutput" "permissionDecisionReason"])]
+          (is (denied? r))
+          (is (str/includes? why "perl")
+              "the reason must name the command that was not recognised")
+          (is (str/includes? why "not a reader this hook knows"))))))) 

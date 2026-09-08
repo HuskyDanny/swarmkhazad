@@ -875,3 +875,52 @@
           (is (str/includes? saved "codex") saved)
           (is (str/includes? saved "kimi:moonshotai/kimi-k2.5") saved)))
       (finally (fs/delete-tree sandbox)))))
+
+(deftest a-task-with-nothing-running-offers-to-resume
+  ;; A reboot takes every tmux server and daemon with it — the sockets are
+  ;; under /tmp — while the task folder survives whole. The way back is `open`
+  ;; again, and until now that meant remembering the CLI, because the portal
+  ;; read the task as still open: it checked for the socket FILE, which `open`
+  ;; writes once into the task folder and which outlives the socket itself.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-resume."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home}
+        id "t-resume"]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (let [dir (fs/path home "tasks" id)
+            sock-file (fs/path dir "state" "tmux-socket")]
+        (spit (str (fs/path dir "roles")) "implement claude task\nreview claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
+
+        (testing "a task that was never opened offers Resume"
+          (let [body (:body (request env :get (str "/tasks/" id)))]
+            (is (str/includes? body "Resume the swarm"))
+            (is (str/includes? body (str "/tasks/" id "/resume")))))
+
+        (testing "a task whose socket file survives a dead socket still offers Resume"
+          ;; The post-reboot state exactly: the file names a socket that is gone.
+          (fs/create-dirs (fs/path dir "state"))
+          (spit (str sock-file) (str (fs/path sandbox "gone" "t-resume.sock") "\n"))
+          (let [body (:body (request env :get (str "/tasks/" id)))]
+            (is (str/includes? body "Resume the swarm")
+                "the socket file existing must not read as a live server")))
+
+        (testing "a task whose socket is really there does not offer Resume"
+          (let [live (fs/path sandbox "live.sock")]
+            (spit (str live) "")
+            (spit (str sock-file) (str live "\n"))
+            (let [body (:body (request env :get (str "/tasks/" id)))]
+              (is (not (str/includes? body "Resume the swarm"))))))
+
+        (testing "posting resume redirects back to the task"
+          (let [r (request env :post (str "/tasks/" id "/resume"))]
+            (is (= 303 (:status r)))
+            (is (= (str "/tasks/" id) (get (:headers r) "Location")))))
+
+        (testing "resume on a task that does not exist is a 404"
+          (let [r (request env :post "/tasks/t-nope/resume")]
+            (is (= 404 (:status r))))))
+      (finally (fs/delete-tree sandbox)))))

@@ -99,16 +99,30 @@
 
 ;; ---------------------------------------------------------------- state
 
-(defn git-state [worktree]
+(declare base-ref)
+
+(defn git-state
+  "The worktree's state, counted against one base — `base-ref`, the same one
+   summary.bb uses, so the judge and the merge verdict cannot disagree about
+   what a role changed.
+
+   Two resolutions were removed here, both able to report a wrong diff rather
+   than no diff. `@{upstream}` led: once a role pushes its task branch, that
+   resolves to `origin/sk/<task-id>`, whose range against HEAD is EMPTY — the
+   judge would see a pushed role as having committed nothing. And the last
+   resort was `HEAD~10..HEAD`, which counts ten commits of unrelated history as
+   this task's work in any repo where the refs failed."
+  [ctx repo worktree]
   (when (and worktree (fs/directory? (fs/path worktree)))
-    (let [upstream (sh worktree "git" "rev-parse" "--abbrev-ref" "--symbolic-full-name" "@{upstream}")
-          base (if (str/blank? upstream)
-                 (sh worktree "git" "rev-parse" "--abbrev-ref" "origin/HEAD")
-                 upstream)
-          range (if (str/blank? base) "HEAD~10..HEAD" (str base "..HEAD"))]
-      (str "### git status\n" (or (not-empty (sh worktree "git" "status" "--short")) "(clean)") "\n\n"
-           "### commits (" range ")\n" (or (not-empty (sh worktree "git" "log" "--oneline" range)) "(none)") "\n\n"
-           "### diff --stat\n" (or (not-empty (sh worktree "git" "diff" "--stat" range)) "(none)") "\n"))))
+    (if-let [base (base-ref ctx repo worktree)]
+      (let [range (str base "..HEAD")]
+        (str "### git status\n" (or (not-empty (sh worktree "git" "status" "--short")) "(clean)") "\n\n"
+             "### commits (" range ")\n" (or (not-empty (sh worktree "git" "log" "--oneline" range)) "(none)") "\n\n"
+             "### diff --stat\n" (or (not-empty (sh worktree "git" "diff" "--stat" range)) "(none)") "\n"))
+      (str "### repo\nBASE UNRESOLVED — no pin in state/base.tsv and no\n"
+           "origin/HEAD, origin/main, origin/master, main or master in this\n"
+           "worktree, so the commits and diff were NOT computed. This is a\n"
+           "missing measurement: do not grade it as 'nothing was committed'.\n"))))
 
 (defn files-section [title paths]
   (when (seq paths)
@@ -123,12 +137,12 @@
    The role's last assistant message used to be part of this. It is not any
    more: grading happens when the handoff is sent, and what is being handed
    over is the commit, never the sentence the role wrote about it."
-  [ctx session worktree]
+  [ctx session worktree repo]
   (let [draft (fs/path (:task-dir ctx) (str "draft-" session ".md"))
         evidence (when (fs/directory? (:evidence-dir ctx))
                    (->> (fs/list-dir (:evidence-dir ctx)) (filter fs/regular-file?) (sort-by str)))]
     (str "session: " session "\n\n"
-         (or (git-state worktree) "### repo\n(unavailable)\n") "\n"
+         (or (git-state ctx repo worktree) "### repo\n(unavailable)\n") "\n"
          (if (fs/regular-file? draft)
            (str "### draft-" session ".md\n" (clip (slurp (str draft))) "\n\n")
            (str "### draft-" session ".md\n(not written)\n\n"))
@@ -208,14 +222,26 @@
                          (handoff-lib/handoff-files (handoff-lib/completed-dir ctx role))))))
 
 (defn base-ref
-  "The ref a role's work is counted against. `origin/HEAD` is the usual answer,
-   but a source checkout with no upstream has its origin removed at clone time,
-   and then origin/HEAD does not exist at all — fall back to the clone's own
-   default branch, which every worktree branched from."
-  [worktree]
-  (let [ok? (fn [r] (zero? (:exit (process/sh {:continue true :dir (str worktree)}
-                                              "git" "rev-parse" "--verify" "--quiet" r))))]
-    (first (filter ok? ["origin/HEAD" "main" "master"]))))
+  "The commit a role's work is counted against.
+
+   state/base.tsv first: pinned when the worktree was made, and the only answer
+   that cannot move. `origin/HEAD` used to lead, but it is a symref `git clone`
+   creates and other setups never do — measured absent in a live task, which is
+   how a summary came to read an empty diff for a repo holding a commit. Local
+   `main`/`master` come last because they are the operator's branches and can
+   sit behind their remote (gobel's was 5 commits behind), and a base that is
+   too old fabricates a diff rather than losing one.
+
+   nil when nothing resolves; callers treat that as 'cannot tell', never as 'no
+   commits'."
+  ([ctx repo worktree]
+   (let [ok? (fn [r] (zero? (:exit (process/sh {:continue true :dir (str worktree)}
+                                               "git" "rev-parse" "--verify" "--quiet" r))))]
+     (or (when (and ctx repo)
+           (when-let [pin (get (task-lib/read-base-tsv ctx) repo)]
+             (when (ok? (str pin "^{commit}")) pin)))
+         (first (filter ok? ["origin/HEAD" "origin/main" "origin/master"
+                             "main" "master"]))))))
 
 (defn committed-past-base?
   "The worktree holds commits past the task branch's base.
@@ -223,10 +249,10 @@
    A git that cannot answer counts as committed. The two errors are not
    symmetric: a spurious nudge costs one line in a pane nobody is reading,
    a missed one leaves the board frozen."
-  [worktree]
+  [ctx repo worktree]
   (if (nil? worktree)
     false
-    (if-let [base (base-ref worktree)]
+    (if-let [base (base-ref ctx repo worktree)]
       (let [r (process/sh {:continue true :dir (str worktree)} "git" "rev-list" "--count" (str base "..HEAD"))]
         (or (not (zero? (:exit r))) (not= "0" (str/trim (:out r)))))
       true)))
@@ -281,10 +307,50 @@
     {:ctx ctx
      :row row
      :worktree (:worktree-path row)
+     ;; The roles named by the lines this session does NOT own. Kept so the
+     ;; verdict can be held to the partition instead of merely being shown it.
+     :other-roles (set (keep #(:role (task-lib/goal-line %)) (:others split)))
      :goals (str (:whole split)
                  (when (seq (:others split))
                    (str "\n\n## Not yours — other roles own these; do not grade them\n"
                         (str/join "\n" (:others split)) "\n")))}))
+
+(defn own-unmet-only
+  "Drop unmet items that name another role's goal line.
+
+   The ownership partition is computed correctly — `:mine` versus `:others` —
+   but until now it only SUGGESTED ownership to the judge: the other lines are
+   put in the prompt under a heading saying not to grade them, and a cheap
+   model grades them anyway. Measured: review_superset came back unmet on
+   `implement @gobel — ... URL repoint to .com ...`, a line describing a change
+   its own goal line calls a send-back, and which it could not act on from its
+   own repo. That blocked its handoff and was written verbatim into
+   append-only escalation.md, where it could not be removed.
+
+   Only the unambiguous case is dropped: an item that OPENS with another
+   role's name. A paraphrase of this session's own line never does, so this
+   cannot quietly turn a real unmet verdict into a pass. What was dropped is
+   recorded on the verdict, because a silent correction is the other way to
+   lose a measurement."
+  [verdict own-role other-roles]
+  (if (or (:down verdict) (empty? (:unmet verdict)) (empty? other-roles))
+    verdict
+    (let [foreign? (fn [item]
+                     (let [t (str/lower-case (str/trim (str item)))]
+                       (some (fn [r] (and (not= r own-role)
+                                          (str/starts-with? t (str/lower-case (str r)))))
+                             other-roles)))
+          dropped (vec (filter foreign? (:unmet verdict)))
+          kept (vec (remove foreign? (:unmet verdict)))]
+      (if (empty? dropped)
+        verdict
+        (assoc verdict
+               :unmet kept
+               ;; Every reason the model gave belonged to someone else, so on
+               ;; its own lines this session is met. Leaving met=false here
+               ;; would keep the block this exists to remove.
+               :met (if (empty? kept) true (:met verdict))
+               :dropped-unmet dropped)))))
 
 (defn grade!
   "Grade the session's committed state now, write the verdict, return it.
@@ -294,9 +360,10 @@
    handed over — gobel's judge produced a wrong \"not committed\" verdict once by
    grading something else."
   [session]
-  (let [{:keys [ctx worktree goals]} (session-ctx session)
+  (let [{:keys [ctx row worktree goals other-roles]} (session-ctx session)
         previous (read-json (verdict-file ctx session))
-        verdict (grade goals (working-state ctx session worktree))]
+        verdict (-> (grade goals (working-state ctx session worktree (:repo row)))
+                    (own-unmet-only (or (:role row) session) other-roles))]
     (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
     (spit (str (verdict-file ctx session))
           (json/generate-string (merge verdict {:role session :at (handoff-lib/timestamp)})
@@ -321,7 +388,7 @@
           turn (or (get input "session_id") "unknown")
           reason (nudge {:terminal? (terminal-inbound? ctx session)
                          :sent? (handoff-sent? ctx session worktree)
-                         :committed? (committed-past-base? worktree)
+                         :committed? (committed-past-base? ctx (:repo row) worktree)
                          :nudges (nudges-so-far ctx session turn)})]
       (when reason
         (fs/create-dirs (fs/path (:state-dir ctx) "judge"))

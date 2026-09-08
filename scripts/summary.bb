@@ -43,29 +43,96 @@
   (let [r (apply process/sh {:continue true :dir (str dir)} "git" args)]
     (when (zero? (:exit r)) (str/trim (:out r)))))
 
+(def base-unresolved
+  "What the diff section says when there is no base to count against.
+
+   It must NOT read as an empty diff. Measured: superset's worktree held commit
+   ef72964 — one Dockerfile line, the task's whole deliverable — and the summary
+   rendered `diff — superset` as `(none)`, identical to gobel's correctly
+   zero-diff repo beside it. The verdict came back `NOT READY — both diffs are
+   empty`, and the one thing a human reads before merging was wrong about the
+   only thing that had changed."
+  (str "BASE UNRESOLVED — the diff was NOT computed.\n"
+       "No pin in state/base.tsv, and none of origin/HEAD, origin/main,\n"
+       "origin/master, main or master resolves in this worktree.\n"
+       "This is a MISSING measurement, not an empty one. Do not read it as\n"
+       "'no change': a repo holding commits looks exactly like this.\n"
+       "Fix: `git -C <source-checkout> remote set-head origin -a`, then re-run."))
+
 (defn base-ref
-  "The ref this worktree's work is counted against. Same fallback chain the goal
-   judge uses: a source checkout cloned without an upstream has no origin/HEAD."
-  [worktree]
-  (first (filter #(git worktree "rev-parse" "--verify" "--quiet" %)
-                 ["origin/HEAD" "main" "master"])))
+  "The commit this repo's work is counted against.
+
+   The pin in state/base.tsv first — recorded when the worktree was made, and
+   the only answer here that cannot move. Every ref below it belongs to the
+   source checkout, which is SHARED with every other worktree of it and with
+   the operator's own branch: one `git fetch` in ~/repos/<repo> re-points
+   origin/main under a running task.
+
+   Then the derivable refs, for tasks opened before the pin existed. Order
+   matters and the old one was wrong twice over: `origin/HEAD` is a symref
+   `git clone` creates and other setups never do, so it is simply absent in
+   some checkouts; and a LOCAL `main` can sit arbitrarily far behind its
+   remote. Measured in gobel — local main was 5 commits behind origin/main, so
+   falling back to it would have reported 5 unrelated commits as this task's
+   diff. A wrong base fabricates a diff as easily as it loses one, so every
+   remote-tracking ref is tried before any local branch.
+
+   nil when nothing resolves, and the caller must say so out loud."
+  [ctx repo worktree]
+  (let [ok? (fn [r] (git worktree "rev-parse" "--verify" "--quiet" r))]
+    (or (when-let [pin (get (task-lib/read-base-tsv ctx) repo)]
+          ;; A pinned sha the worktree does not hold is worse than no pin: the
+          ;; range silently fails and the section goes empty again.
+          (when (ok? (str pin "^{commit}")) pin))
+        (first (filter ok? ["origin/HEAD" "origin/main" "origin/master"
+                            "main" "master"])))))
 
 (defn worktree-diff
-  "What one role's worktree actually changed: the stat, then the patch. Both are
+  "What one repo's worktree actually changed: the stat, then the patch. Both are
    clipped — a summary that costs more than reading the diff is not a summary."
-  [worktree budget]
+  [ctx repo worktree budget]
   (when (and worktree (fs/directory? worktree))
-    (when-let [base (base-ref worktree)]
+    (if-let [base (base-ref ctx repo worktree)]
       (let [range (str base "..HEAD")
             stat (git worktree "diff" "--stat" range)
             log (git worktree "log" "--oneline" range)
             patch (git worktree "diff" range)
             dirty (git worktree "status" "--porcelain")]
         (when (or (seq (or stat "")) (seq (or dirty "")))
-          (str "commits:\n" (or (not-empty log) "(none)") "\n\n"
+          (str "base: " base "\n\n"
+               "commits:\n" (or (not-empty log) "(none)") "\n\n"
                "stat:\n" (or (not-empty stat) "(none)") "\n\n"
                (when (seq (or dirty "")) (str "uncommitted:\n" dirty "\n\n"))
-               "patch:\n" (clip patch budget)))))))
+               "patch:\n" (clip patch budget))))
+      base-unresolved)))
+
+(defn live-escalations
+  "escalation.md with the crossed-off bullets marked, not hidden.
+
+   The file is append-only and the roles own it — a bullet that turned out to
+   be wrong cannot be removed, only followed by another bullet retracting it.
+   Measured: escalation.md opened with `- [superset] **probe** — probe`, then
+   an entire entry whose only content was `Ignore the bare probe line above`,
+   then two more retracting a third. The verdict spent a `nit` on the noise
+   and still had to work out which entries were live.
+
+   `note.bb resolved` and `note.bb retract` already record that, in the same
+   store the portal's tick writes. Reading it here is what makes the record
+   reach the one reader that decides a merge. Marked rather than dropped,
+   because a retraction is itself a fact about the run, and a bullet that
+   silently vanished would read as a file nobody wrote to."
+  [ctx]
+  (let [handled (task-lib/handled ctx)
+        raw (or (read-file (:escalation-file ctx) file-budget) "")
+        lines (remove str/blank? (map str/trim (str/split-lines raw)))
+        live (fn [l]
+               (let [text (str/replace l #"^- " "")]
+                 (if (contains? handled (task-lib/attention-key {:kind "escalation" :text text}))
+                   (str "- [CROSSED OFF — dealt with or retracted; do not treat as an open ask] "
+                        text)
+                   l)))]
+    (when (seq lines)
+      (str/join "\n" (map live lines)))))
 
 (defn evidence-section [ctx]
   (let [dir (:evidence-dir ctx)]
@@ -88,7 +155,7 @@
      (section "metrics.md" (read-file (:metrics-file ctx) file-budget))
      (section "decision.md — what the roles chose, and why" (read-file (:decision-file ctx) file-budget))
      (section "gotcha.md — what tripped them" (read-file (:gotcha-file ctx) file-budget))
-     (section "escalation.md — what they say needs a human" (read-file (:escalation-file ctx) file-budget))
+     (section "escalation.md — what they say needs a human" (live-escalations ctx))
      ;; Splitting findings out of escalation.md took them away from the only
      ;; reader that weighs them before a merge. Ten of gobel's 22 escalation
      ;; lines were findings; a verdict that cannot see them is reading half the
@@ -98,7 +165,8 @@
      ;; One diff per repo, not per session: roles sharing a repo share its
      ;; worktree, so a per-session loop would print the same diff twice.
      (str/join "" (for [[repo worktree] repos]
-                    (section (str "diff — " repo) (worktree-diff worktree per-repo)))))))
+                    (section (str "diff — " repo)
+                             (worktree-diff ctx repo worktree per-repo)))))))
 
 (def system-prompt
   (str
@@ -138,7 +206,10 @@
    "## Per repo\n"
    "One line per repo you were given a diff for, `<repo>: <verdict> — <why>`, "
    "using the same verdict words as above. A repo whose diff is empty says "
-   "`no change`. Skip this section entirely when there is only one repo.\n\n"
+   "`no change`. A repo whose diff section says BASE UNRESOLVED is NOT `no "
+   "change` — its diff was never computed, so it can only be NOT READY, and "
+   "say that the measurement is missing rather than that nothing changed. "
+   "Skip this section entirely when there is only one repo.\n\n"
    "## " merge-order-heading "\n"
    "The repos, one per line, in the order they must merge, each `<repo> — "
    "<why it goes here>`. Name every repo that has a diff, even when the order "

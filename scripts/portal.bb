@@ -127,7 +127,26 @@
     (when (fs/regular-file? pid-file)
       (zero? (:exit (process/sh {:continue true} "kill" "-0" (str/trim (slurp (str pid-file)))))))))
 
-(defn opened? [ctx] (fs/regular-file? (:tmux-socket-file ctx)))
+(defn opened?
+  "Whether this task's tmux server is actually there.
+
+   This used to be `the socket FILE exists`. That file is written once by
+   `open` and survives everything, including the one event that takes the
+   server with it — a reboot. Every task then rendered as open while nothing
+   was running, and the portal is exactly where you would look to find out
+   otherwise. The `dead` badge below inherited the same blind spot: it fires
+   on `opened? and daemon not alive`, so after a reboot it read every task as
+   open-with-a-dead-daemon rather than as needing a resume.
+
+   The socket itself is the honest answer, and macOS clears /tmp at boot, so
+   testing it costs one stat rather than a tmux call per task per render."
+  [ctx]
+  (boolean
+   (and (fs/regular-file? (:tmux-socket-file ctx))
+        (try
+          (let [p (str/trim (slurp (str (:tmux-socket-file ctx))))]
+            (and (seq p) (fs/exists? p)))
+          (catch Exception _ false)))))
 
 (defn attention
   "What needs a human: escalation lines, failed mail, denials, a down judge, a
@@ -971,6 +990,20 @@
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
             [:span.lane {:class (when (= "done" l) "done")} (lane-label ctx)]]]
+          ;; Resume, when nothing is running. A reboot takes every tmux server
+          ;; and daemon with it — the sockets live in /tmp — while the task
+          ;; folder survives whole, so the way back is `open` again, which is
+          ;; idempotent and rebuilds the panes from sessions.tsv. This is a
+          ;; button rather than a login item on purpose: `open` spawns agents,
+          ;; and nothing should start spending money at boot unwatched.
+          (when-not (opened? ctx)
+            [:section
+             [:form {:method "post" :action (str "/tasks/" id "/resume")}
+              [:button {:type "submit"} "Resume the swarm"]
+              [:span.muted " nothing is running for this task — no tmux server. "
+               "Re-runs `open`: same worktrees, same branch, each role restarted "
+               "and handed its inbox again. A role's half-finished turn does not "
+               "come back; its draft, notes and commits all do."]]])
           ;; First on the page, above Attention: the one question a reader opens
           ;; this page to answer. Everything below it — attention, goals, bars,
           ;; roles — is the evidence for the answer, so it reads as the summary
@@ -1230,6 +1263,23 @@
                               [:p.err (:error r)]
                               [:p [:a.doc {:href (str "/tasks/" id)} "← back to " id]]]))
              {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""}))
+         (not-found)))
+     ;; Resume. Deliberately a button and not a login item: `open` spawns
+     ;; agents, which spends money, and nothing should start doing that at boot
+     ;; with nobody watching. But a reboot kills every tmux server and daemon a
+     ;; task had, and until now the only way back was remembering the CLI —
+     ;; while the portal, the one place you would look, reported the task as
+     ;; still open because it checked for the socket FILE rather than the
+     ;; socket. Same spawn-and-log the create flow uses; `open` is idempotent
+     ;; and skips the board card and opening note when a lane already exists,
+     ;; so pressing this twice costs a re-boot of the panes and nothing else.
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/resume" uri))]
+       (if-let [ctx (ctx-for id)]
+         (do
+           (fs/create-dirs (:state-dir ctx))
+           (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
+             (process/process ["bb" cli "open" id] {:out log :err log}))
+           {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
          (not-found)))
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]

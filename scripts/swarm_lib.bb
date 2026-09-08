@@ -25,6 +25,10 @@
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
 (load-file (str (fs/path script-dir "board_lib.bb")))
+;; For the bar parser only — `open` refuses a task declaring measure: commands
+;; that no role will run. Same parser the portal and the runner use, so the
+;; three cannot disagree about what a bar is.
+(load-file (str (fs/path script-dir "run_evidence.bb")))
 
 (def prompts-src-dir (fs/path (fs/parent script-dir) "prompts"))
 (def pane-history-limit 10000)
@@ -436,6 +440,144 @@
 
 ;; ---------------------------------------------------------------- open / close
 
+;; ---------------------------------------------------------------- open gates
+
+(defn unmeasured-bars
+  "Bars carrying a `measure:` command that no role in this task will run.
+
+   metrics.md declares the bars, `run_evidence.bb` executes them into
+   evidence/<bar>.txt, and one role's prompt is what tells it to. A task whose
+   roles omit that role declares bars nobody measures — and afterwards an
+   unmeasured bar is not visibly different from one that ran and passed.
+
+   Measured: a two-role task (implement, review) named five `measure:`
+   commands. evidence/ held nothing but two files a role had written by hand,
+   and the merge verdict reported the bars as missing evidence rather than as
+   never configured, which sends a human looking for a broken runner instead
+   of a missing role.
+
+   Keyed on the PROMPT, not on a role being named `run`: the prompt is what
+   invokes the runner, so renaming the role cannot make this wrong in either
+   direction."
+  [ctx roles]
+  (let [metrics (if (fs/regular-file? (:metrics-file ctx))
+                  (slurp (str (:metrics-file ctx)))
+                  "")
+        ;; A still-angle-bracketed command is a template placeholder, not a bar
+        ;; anyone meant to run. Counting it refused a freshly scaffolded task,
+        ;; and the scaffold is the one file the operator has not written yet.
+        placeholder? #(re-find #"<[^>]+>" (str %))
+        commanded (remove #(placeholder? (:command %))
+                          (filter :command (run-evidence/bars ctx metrics)))]
+    (when (and (seq commanded)
+               (not (some #(str/includes? (stage-prompt (:role %)) "run_evidence.bb")
+                          roles)))
+      (vec commanded))))
+
+(defn require-measurable!
+  "Refuse to open a task whose quantitative bars have no one to measure them.
+
+   Refusing rather than warning, because the failure leaves no trace: a bar
+   that never ran writes no evidence file, and neither does one that ran and
+   produced nothing."
+  [ctx roles]
+  (when-let [orphans (unmeasured-bars ctx roles)]
+    (throw (ex-info
+            (str "metrics.md declares " (count orphans)
+                 " measure: command(s) that no role will run:\n"
+                 (str/join "\n" (for [b orphans]
+                                  (str "  - " (:name b) " — measure: `" (:command b) "`")))
+                 "\n\nAdd a role whose prompt runs run_evidence.bb — the `run` role —"
+                 "\nor move these under ## Qualitative, which names a human judge.")
+            {:exit 1}))))
+
+(defn- dir-kb [p]
+  (let [r (process/sh {:continue true} "du" "-sk" (str p))]
+    (when (zero? (:exit r))
+      (parse-long (or (first (str/split (str/trim (str (:out r))) #"\s+")) "0")))))
+
+(def disk-warn-kb
+  "Warn above 5 GB of task folders."
+  (* 5 1024 1024))
+
+(defn disk-warning
+  "One line when the task folders have grown past the threshold, naming the
+   worst task AND its biggest child directory, or nil.
+
+   The child is what makes it actionable, because the two causes have
+   different fixes: `worktrees/` is a stale task that `close --reclaim` gives
+   back, while `tmp/` is a role that cloned a repo into scratch, which nothing
+   in the system ever reclaims.
+
+   Measured over the WHOLE task folder, not over worktrees/ alone. The 2.2G
+   task was 2.2G of tmp/ and 8.5M of worktrees/, so a worktrees-only sum
+   reported the worst offender as the smallest."
+  []
+  (let [root (task-lib/tasks-dir)]
+    (when (fs/directory? root)
+      (let [gb (fn [kb] (format "%.1fG" (/ (double kb) 1024 1024)))
+            tasks (vec (for [d (fs/list-dir root)
+                             :when (fs/directory? d)
+                             :let [kb (dir-kb d)]
+                             :when kb]
+                         {:name (str (fs/file-name d)) :kb kb :path d}))
+            total (reduce + 0 (map :kb tasks))]
+        (when (> total disk-warn-kb)
+          (let [worst (last (sort-by :kb tasks))
+                child (when worst
+                        (last (sort-by :kb (for [c (fs/list-dir (:path worst))
+                                                 :when (fs/directory? c)
+                                                 :let [kb (dir-kb c)]
+                                                 :when kb]
+                                             {:name (str (fs/file-name c)) :kb kb}))))]
+            (str "swarmkhazad: task folders hold " (gb total)
+                 " across " (count tasks) " task(s)"
+                 (when worst (str "; largest is " (:name worst) " at " (gb (:kb worst))))
+                 (when child (str ", mostly " (:name child) "/ at " (gb (:kb child))))
+                 ".\n  worktrees/ → `swarmkhazad close <task> --reclaim`."
+                 "  tmp/ → role scratch, nothing reclaims it.")))))))
+
+(defn write-runtime-stamp!
+  "Record which copy of swarmkhazad opened this task, and at what commit.
+
+   A task's hooks and its daemon are launched with the absolute path of
+   whichever checkout ran `open`, and that path is very often a development
+   worktree. Two things follow, and both happened in one run. The daemon keeps
+   the code it loaded at boot while the hooks pick up new code on every
+   invocation, so a task can execute two versions at once — measured:
+   handoffd.bb was rewritten at 07:59, inside a daemon lifetime of 07:26 to
+   08:11. And reviewing that run afterwards meant reading four file mtimes to
+   work out which findings were real and which were already fixed.
+
+   So: stamp it. This does not pin the code — a snapshot per task would, at
+   the cost of a copy and a staleness question of its own — but it makes the
+   question answerable instead of archaeological, which is the half that
+   actually cost time."
+  [ctx]
+  (let [dir (str script-dir)
+        g (fn [& args] (let [r (apply process/sh {:continue true :dir dir} "git" args)]
+                         (when (zero? (:exit r)) (str/trim (str (:out r))))))
+        sha (or (g "rev-parse" "HEAD") "unknown")
+        branch (or (g "rev-parse" "--abbrev-ref" "HEAD") "unknown")
+        dirty? (not (str/blank? (or (g "status" "--porcelain") "")))
+        stamp (fs/path (:state-dir ctx) "runtime.tsv")]
+    (fs/create-dirs (:state-dir ctx))
+    (spit (str stamp)
+          (str/join "" (for [[k v] [["script_dir" dir]
+                                    ["branch" branch]
+                                    ["commit" sha]
+                                    ["dirty" (str dirty?)]
+                                    ["opened_at" (str (java.time.Instant/now))]]]
+                         (str k "\t" v "\n"))))
+    (when dirty?
+      (binding [*out* *err*]
+        (println (str "swarmkhazad: opening from a checkout with uncommitted changes ("
+                      dir " on " branch " @ " sha ")."
+                      "\n  The daemon keeps the code it boots with while hooks re-read it"
+                      " per call, so editing\n  these scripts mid-run makes one task execute"
+                      " two versions. Recorded in " stamp "."))))
+    stamp))
+
 (defn open!
   "Open the swarm for task-id. Returns the ctx plus :sessions and :commands.
 
@@ -446,6 +588,12 @@
   (let [ctx (task-lib/task-ctx task-id)
         {:keys [roles repos sessions]} (task-lib/prepare! ctx)]
     (check-dependencies!)
+    ;; Before anything is spawned: a contract nobody can measure is a contract
+    ;; that will read as met.
+    (require-measurable! ctx roles)
+    (write-runtime-stamp! ctx)
+    (when-let [w (disk-warning)]
+      (binding [*out* *err*] (println w)))
     (resolve-harnesses! ctx roles)
     (stop-handoffd! ctx)
     (kill-server! ctx)

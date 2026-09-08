@@ -157,6 +157,10 @@
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
      :sessions-tsv (fs/path state-dir "sessions.tsv")
+     ;; repo -> the commit its work is counted against, pinned at prepare.
+     ;; Every ref that could be derived instead is SHARED with the operator's
+     ;; own checkout and moves under a running task.
+     :base-tsv (fs/path state-dir "base.tsv")
      :tmux-socket (tmux-socket-path task-id)
      :tmux-socket-file (fs/path state-dir "tmux-socket")
      :board-dir (fs/path state-dir "board")
@@ -583,6 +587,46 @@
       (resolvable src (str "refs/heads/" branch))
       (git src "rev-parse" "HEAD")))
 
+(defn read-base-tsv
+  "repo -> pinned base commit, or {} when the task predates the pin."
+  [ctx]
+  (if-not (fs/regular-file? (:base-tsv ctx))
+    {}
+    (into {} (for [line (str/split-lines (slurp (str (:base-tsv ctx))))
+                   :when (not (str/blank? line))
+                   :let [[repo sha] (str/split line #"\t" -1)]
+                   :when (and (not (str/blank? repo)) (not (str/blank? sha)))]
+               [repo sha]))))
+
+(defn write-base-tsv!
+  "Persist the base each repo's work is counted against — append-only per repo.
+
+   `prepare-worktrees!` already computes this sha to start the branch from, and
+   until now threw it away, so every later reader re-derived it from refs
+   instead. Those refs are the source checkout's, shared with every other
+   worktree of it: a `git fetch` in ~/repos/<repo> moves origin/main under a
+   running task, and a checkout whose `refs/remotes/origin/HEAD` symref was
+   never created has no answer at all. Measured: a summary rendered an EMPTY
+   diff for a repo holding a one-line commit, because origin/HEAD did not exist
+   yet and there was no local `main` either — and an empty diff is indis-
+   tinguishable from a repo that correctly changed nothing.
+
+   Never overwrites an existing entry. `open` re-runs to resume a task after a
+   reboot, and re-pinning then would silently re-point the base at whatever
+   origin/main has since become — which is the exact drift this file prevents."
+  [ctx worktrees]
+  (let [existing (read-base-tsv ctx)
+        merged (reduce (fn [m {:keys [name start]}]
+                         (if (or (contains? m name) (str/blank? (str start)))
+                           m
+                           (assoc m name start)))
+                       existing worktrees)]
+    (when (seq merged)
+      (fs/create-dirs (fs/parent (:base-tsv ctx)))
+      (spit (str (:base-tsv ctx))
+            (str/join "" (for [[repo sha] (sort merged)] (str repo "\t" sha "\n")))))
+    merged))
+
 (defn task-branch
   "Every repo's worktree for this task sits on one branch name. The task id is
    in it, so two tasks on the same checkout never collide."
@@ -609,8 +653,9 @@
    a role had made — the one case where re-running prepare could lose work."
   [ctx repos]
   (fs/create-dirs (:worktrees-dir ctx))
-  (let [branch-name (task-branch ctx)]
-    (mapv (fn [{:keys [name path branch]}]
+  (let [branch-name (task-branch ctx)
+        worktrees
+        (mapv (fn [{:keys [name path branch]}]
             (let [dir (str (fs/path (:worktrees-dir ctx) name))
                   branch (or branch (source-default-branch path))
                   start (source-pin-sha path branch)]
@@ -622,8 +667,12 @@
                 (if (git-ok? path "rev-parse" "--verify" "--quiet" (str "refs/heads/" branch-name))
                   (git path "worktree" "add" "--quiet" dir branch-name)
                   (git path "worktree" "add" "--quiet" "-b" branch-name dir start)))
-              {:name name :source path :path dir :branch branch-name :start start}))
-          repos)))
+                {:name name :source path :path dir :branch branch-name :start start}))
+              repos)]
+    ;; The sha the branch started from IS the task's base. Keep it, so no later
+    ;; reader has to re-derive it from refs that move.
+    (write-base-tsv! ctx worktrees)
+    worktrees))
 
 ;; ---------------------------------------------------------------- prepare
 
