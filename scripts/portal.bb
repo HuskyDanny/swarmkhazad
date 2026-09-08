@@ -709,11 +709,15 @@
            [:label.card.rolecard
             [:div.card-top [:span.name stage]
              [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
-            ;; Two axes, and they are not the same one: the harness is which CLI
-            ;; runs the role, the vendor is which model that CLI talks to. Only
-            ;; claude reads the vendor — the shim says so, and the others ignore
-            ;; it — so the vendor select is disabled for the rest rather than
-            ;; offering a choice that silently does nothing.
+            ;; Three controls, three questions. The harness is what runs the
+            ;; role — a CLI, or one of the operator's own lane scripts, which is
+            ;; claude plus an SSO wrap, an effort level, an MCP set and a model
+            ;; router. The vendor is the endpoint, and only the bare `claude`
+            ;; harness reads it: a lane brings its own router, keyed on the
+            ;; model NAME, and codex and grok have their own logins. So for
+            ;; everything but `claude` the vendor select is disabled rather than
+            ;; offering a choice that silently does nothing, and the model id —
+            ;; which every one of them honours — stays live.
             (let [h (get params (str "harness:" stage) "claude")]
               (list
                [:select {:name (str "harness:" stage)}
@@ -725,7 +729,9 @@
                  (list
                   [:select (cond-> {:name (str "vendor:" stage)}
                              off? (assoc :disabled true
-                                         :title (str h " does not take a vendor; it uses its own login")))
+                                         :title (if (task-lib/lane-agents h)
+                                                  (str h " brings its own routing — its model router picks the endpoint from the model name")
+                                                  (str h " does not take a vendor; it uses its own login"))))
                    (for [v (sort task-lib/known-vendors)]
                      [:option {:value v :selected (= v vendor)} v])]
                   ;; Optional, and free text on purpose: the id after the colon
@@ -735,14 +741,19 @@
                                    :value (or model-id "")
                                    :autocomplete "off"
                                    :placeholder "exact model (optional)"
-                                   :title "overrides the vendor's default, e.g. claude-opus-5[1m]"}
-                            off? (assoc :disabled true))]))))
+                                   :title "overrides the harness's default, e.g. claude-opus-5[1m]"}
+                            ;; live for a lane: the model name is the only thing
+                            ;; its router reads, so this is the whole choice
+                            (and off? (not (task-lib/lane-agents h))) (assoc :disabled true))]))))
             ;; No checkout picker: a role works in every repo the project holds,
             ;; and a task narrows that with `@repo` tags on its goal lines.
             ])]
         [:div.go
          [:button {:type "submit"} (if project "Save project" "Create project")]
-         [:span.muted (count available) " checkouts found · harness runs the role, vendor is the model it talks to"]]]
+         [:span.muted (count available)
+          " checkouts found · a cc_ harness is that launcher, inherited whole —"
+          " its SSO wrap, effort, MCP set and model router — with this task's prompt,"
+          " settings and permission mode layered over it"]]]
        ;; Its own form, so Enter in the name field can never reach it.
        (when project
          [:form.danger {:method "post" :action (str "/projects/" (:name project) "/delete")}

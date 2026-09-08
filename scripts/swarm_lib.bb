@@ -268,10 +268,33 @@
                          :hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :Stop [{:hooks [{:type "command" :command goal-judge :timeout 180}]}]}})
 
-(defn write-hook-settings! [ctx row]
+(defn layer-settings
+  "The lane's settings with the task's layered over.
+
+   Hook arrays are concatenated per event, lane first, so both run — a lane's
+   SessionStart hook and the truth lock are not competing for one slot. Anything
+   else stays the lane's, because the task layer has no opinion about it."
+  [lane task]
+  (if lane
+    (assoc (merge lane task) :hooks (merge-with into (:hooks lane) (:hooks task)))
+    task))
+
+(defn write-hook-settings!
+  "One settings file per session. A lane harness contributes its own first: the
+   parser takes the LAST --settings, so passing both would drop the lane's
+   entirely and with it every hook it installs."
+  [ctx row]
   (fs/create-dirs (:hooks-dir ctx))
-  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))]
-    (spit (str file) (json/generate-string hook-settings {:pretty true}))
+  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))
+        lane (when-let [f (task-lib/lane-settings-file (:harness row))]
+               ;; A lane whose settings are unreadable is a bad lane, not a
+               ;; reason to launch without the truth lock.
+               (try (json/parse-string (slurp (str f)) true)
+                    (catch Exception e
+                      (println (str "swarmkhazad: could not read " f " (" (ex-message e)
+                                    "); launching " (:session row) " with the task's settings only"))
+                      nil)))]
+    (spit (str file) (json/generate-string (layer-settings lane hook-settings) {:pretty true}))
     file))
 
 (defn start-text [ctx row]
@@ -299,12 +322,20 @@
         led (str prompt-text "\n\n" message)
         name (str "sk " (:session row))]
     (vec
-     (case (:harness row)
+     (case (if (task-lib/lane-agents (:harness row)) "claude" (:harness row))
+       ;; A lane script execs claude with its own flags and appends ours, and
+       ;; the parser takes the last occurrence — so this same argv, handed to a
+       ;; lane, inherits the lane's model, effort, MCP set and SSO wrap while
+       ;; still overriding the three flags the swarm has to own.
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
                         ["--append-system-prompt-file" (str prompt)
-                         "--settings" (str (write-hook-settings! ctx row))
-                         "--permission-mode" "bypassPermissions"]
+                         "--settings" (str (write-hook-settings! ctx row))]
+                        ;; A lane already declares its own permission posture —
+                        ;; cc_auto bypasses, cc_control screens — and restating
+                        ;; ours would collapse the two into one choice.
+                        (when-not (task-lib/lane-agents (:harness row))
+                          ["--permission-mode" "bypassPermissions"])
                         (when (= mode :interactive) ["-n" name])
                         extra
                         ["--" message])

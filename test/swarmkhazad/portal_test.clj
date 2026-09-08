@@ -92,8 +92,8 @@
             (is (str/includes? (:body r) "action=\"/projects\"") "the new-project composer is on the index")
             (is (str/includes? (:body r) "Tasks outside a project") "a task with no project is still reachable")
             (is (str/includes? (:body r) "<details class=\"composer\">") "the composer starts collapsed when there is nothing to report")
-            (is (str/includes? (:body r) "harness runs the role, vendor is the model it talks to")
-                "the footer names the two axes the cards now offer, not one list of harnesses")))
+            (is (str/includes? (:body r) "inherited whole")
+                "the footer says what picking a cc_ harness actually does")))
         (testing "the task page: checkboxes follow the verdicts, never the file"
           (let [body (:body (request env :get (str "/tasks/" id)))]
             (is (not (str/includes? body "http-equiv=\"refresh\""))
@@ -818,7 +818,14 @@
           (is (str/includes? body "name=\"vendor:implement\"") "the endpoint")
           (is (str/includes? body "name=\"modelid:implement\"") "and the exact model, optional")
           (is (str/includes? body "value=\"codex\"") "and every known harness is offered")
-          (is (str/includes? body "value=\"grok\""))))
+          (is (str/includes? body "value=\"grok\""))
+          ;; A lane script is a harness too: picking it inherits that launcher
+          ;; whole — its SSO wrap, effort, MCP set and model router — with this
+          ;; task's prompt and settings layered over.
+          (is (str/includes? body "value=\"cc_auto\"") "the operator's own lanes are harnesses")
+          (is (str/includes? body "value=\"cc_control\""))
+          (is (str/includes? body "value=\"cc_full\""))
+          (is (str/includes? body "value=\"cc_alt\""))))
       (testing "each role card opens on the model that role is meant to run"
         ;; Not one default for everyone. A quiet quality drop in a building role
         ;; ships wrong code, so those get Opus; specifier and review get a

@@ -277,3 +277,98 @@
           (finally
             (run {:env env :ok? false} cli "close" id)
             (process/sh {:continue true} "tmux" "-S" socket "kill-server")))))))
+
+(deftest a-lane-script-is-a-harness-and-the-task-layers-over-it-without-restating-it
+  ;; Base home -> lane -> task. Each layer adds; none restates the one below.
+  ;;
+  ;; This works because of one measured fact about the CLI (RAN, real binary):
+  ;;
+  ;;   claude --model claude-haiku-4-5-20251001 --model bogus-model-xyz  -> error
+  ;;   claude --model bogus-model-xyz --model claude-haiku-4-5-20251001  -> ok
+  ;;
+  ;; The LAST occurrence wins. `lane_exec` is
+  ;; `exec aws-vault exec dev --duration=8h --server -- claude "$@"`, so a lane
+  ;; puts its flags first and appends ours — which is why the task layer can
+  ;; override the one flag it must own and inherit everything else.
+  ;;
+  ;; The same fact is why `--settings` had to stop being passed twice: ours
+  ;; REPLACED the lane's file, and every hook the lane installs stopped running.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-lane."})
+        cc-home (str (fs/path sandbox "cc"))
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home "CLAUDE_CONFIG_DIR" cc-home}
+        id "t-lane"]
+    (try
+      (make-source-repo! src)
+      ;; the operator's own lane: a launcher script and the settings it loads
+      (fs/create-dirs (fs/path cc-home "scripts"))
+      (fs/create-dirs (fs/path cc-home "auto"))
+      (write! (fs/path cc-home "scripts" "cc-auto.sh") "#!/bin/bash\nexec claude \"$@\"\n")
+      (fs/set-posix-file-permissions (fs/path cc-home "scripts" "cc-auto.sh") "rwxr-xr-x")
+      (write! (fs/path cc-home "auto" "settings.json")
+              (json/generate-string
+               {:hooks {:SessionStart [{:hooks [{:type "command" :command "/lane/persona.sh"}]}]
+                        :PreCompact [{:hooks [{:type "command" :command "/lane/compact.sh"}]}]}
+                :env {:LANE_ONLY "1"}}))
+      (run {:env env} cli "new" id "--repo" src)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles"))
+              (str "implement cc_auto task model=anthropic:claude-opus-5[1m]\n"
+                   "review claude task model=deepseek\n"))
+        (spit (str (fs/path dir "repos")) (str src "\n"))
+        (run {:env env} cli "prepare" id)
+        ;; `open` writes these; this test only needs argv, so it stands them in.
+        (doseq [sess ["implement" "review"]]
+          (write! (fs/path dir "prompts" (str sess ".md")) "role prompt\n"))
+        (testing "a lane name validates as a harness and survives into sessions.tsv"
+          (let [rows (str/split-lines (slurp (str (fs/path dir "state" "sessions.tsv"))))
+                cols (fn [n] (str/split (some #(when (str/starts-with? % n) %) rows) #"\t" -1))]
+            (is (= "cc_auto" (nth (cols "implement") 4)) (str rows))
+            (is (= "anthropic:claude-opus-5[1m]" (nth (cols "implement") 6)))
+            (is (= "claude" (nth (cols "review") 4)) "and a bare CLI still resolves as itself")))
+        (testing "the lane's settings are merged in, not replaced by the task's"
+          (let [argv (run {:env env} "bb" "-e"
+                          (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                               "(let [ctx (task-lib/task-ctx \"" id "\") "
+                               "      rows (task-lib/read-sessions-tsv ctx) "
+                               "      row (first (filter #(= \"implement\" (:session %)) rows))] "
+                               "  (prn (swarm-lib/harness-argv ctx row \"/bin/cc-auto.sh\" "
+                               "        (str (:prompts-dir ctx) \"/implement.md\") :interactive nil)))"))
+                argv (read-string (str/trim (:out argv)))
+                settings-path (second (drop-while #(not= "--settings" %) argv))
+                merged (json/parse-string (slurp settings-path) true)]
+            (testing "both hooks run on the event they share, the lane's first"
+              (is (= ["/lane/persona.sh"]
+                     (mapv :command (mapcat :hooks (take 1 (:SessionStart (:hooks merged))))))
+                  "the lane's SessionStart hook is still there")
+              (is (= 2 (count (:SessionStart (:hooks merged))))
+                  "and the truth lock was appended to it rather than replacing it")
+              (is (str/includes? (str (mapv :command (mapcat :hooks (:SessionStart (:hooks merged)))))
+                                 "run-contract.sh")))
+            (testing "an event only the lane has is kept, and an event only the task has is added"
+              (is (= ["/lane/compact.sh"] (mapv :command (mapcat :hooks (:PreCompact (:hooks merged))))))
+              (is (seq (:Stop (:hooks merged))) "the goal judge"))
+            (testing "and everything else of the lane's survives"
+              (is (= "1" (get-in merged [:env :LANE_ONLY]))))
+            (testing "the permission mode is the lane's, not restated"
+              ;; cc_auto bypasses and cc_control screens. Passing ours would
+              ;; make picking between them meaningless.
+              (is (not (some #{"--permission-mode"} argv)) (str argv)))
+            (testing "but the role's own prompt still wins — a lane's prompt describes its own delivery arc, not this task's"
+              (is (some #{"--append-system-prompt-file"} argv)))))
+        (testing "a bare claude role is unchanged: its own settings, and the permission mode stated"
+          (let [argv (run {:env env} "bb" "-e"
+                          (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                               "(let [ctx (task-lib/task-ctx \"" id "\") "
+                               "      rows (task-lib/read-sessions-tsv ctx) "
+                               "      row (first (filter #(= \"review\" (:session %)) rows))] "
+                               "  (prn (swarm-lib/harness-argv ctx row \"/bin/claude\" "
+                               "        (str (:prompts-dir ctx) \"/review.md\") :interactive nil)))"))
+                argv (read-string (str/trim (:out argv)))
+                settings (json/parse-string (slurp (second (drop-while #(not= "--settings" %) argv))) true)]
+            (is (= ["--permission-mode" "bypassPermissions"]
+                   (->> argv (drop-while #(not= "--permission-mode" %)) (take 2))))
+            (is (nil? (:PreCompact (:hooks settings)))
+                "no lane, nothing merged — a claude role does not inherit cc_auto's hooks"))))
+      (finally (fs/delete-tree sandbox)))))

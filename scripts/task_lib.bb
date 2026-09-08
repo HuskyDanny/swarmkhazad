@@ -17,7 +17,48 @@
             [babashka.process :as process]
             [clojure.string :as str]))
 
-(def known-agents #{"claude" "codex" "copilot" "grok"})
+(def cli-agents
+  "Harnesses that are a CLI on PATH."
+  #{"claude" "codex" "copilot" "grok"})
+
+(def lane-agents
+  "Harnesses that are one of the operator's own launcher scripts.
+
+   A lane is claude plus a fixed set of flags and an environment — the SSO wrap,
+   an effort level, its own MCP set, and a model router keyed on the model name.
+   Naming one here means a role inherits all of that; the swarm appends its own
+   three flags afterwards and, because the parser takes the last occurrence,
+   keeps the role's prompt, its truth-lock settings and its permission mode.
+
+   `cc_auto` resolves to `<claude-config-dir>/scripts/cc-auto.sh`. By convention
+   rather than a table: the path is derivable, and a table of one operator's
+   absolute paths in a shared repo is stale on any other machine."
+  #{"cc_full" "cc_auto" "cc_control" "cc_alt"})
+
+(def known-agents (into cli-agents lane-agents))
+
+(defn cc-home
+  "The operator's Claude Code config directory — where the lanes live."
+  []
+  (or (not-empty (or (System/getenv "CLAUDE_CONFIG_DIR") ""))
+      (str (fs/path (System/getProperty "user.home") ".claude"))))
+
+(defn lane-script
+  "The launcher a lane harness names, or nil if it is not a lane."
+  [harness]
+  (when (lane-agents harness)
+    (fs/path (cc-home) "scripts" (str (str/replace harness "_" "-") ".sh"))))
+
+(defn lane-settings-file
+  "The settings.json a lane loads, when it loads one.
+
+   `cc_auto` and `cc_control` each pass `--settings <cc-home>/<lane>/settings.json`;
+   `cc_full` and `cc_alt` use the operator's global settings and pass none, so
+   there is nothing to merge and nothing is lost by not merging it."
+  [harness]
+  (when (lane-agents harness)
+    (let [f (fs/path (cc-home) (str/replace harness #"^cc_" "") "settings.json")]
+      (when (fs/regular-file? f) f))))
 (def receive-modes #{"task" "batch"})
 
 ;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the
@@ -498,9 +539,14 @@
   [harness]
   (if-let [pinned (not-empty (or (System/getenv (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness))) ""))]
     {:path pinned :skipped [] :pinned true}
-    (let [all (harness-candidates harness)
-          [skipped [chosen]] (split-with wrapper-shim? all)]
-      (when chosen {:path chosen :skipped (vec skipped)}))))
+    ;; A lane is a script at a known path, not a name on PATH — the operator
+    ;; reaches it through a shell alias, and an alias is not a file a child
+    ;; process can exec.
+    (if-let [script (lane-script harness)]
+      (when (fs/executable? script) {:path (str script) :skipped []})
+      (let [all (harness-candidates harness)
+            [skipped [chosen]] (split-with wrapper-shim? all)]
+        (when chosen {:path chosen :skipped (vec skipped)})))))
 
 (defn session-name [session]
   (str "sk-" session))

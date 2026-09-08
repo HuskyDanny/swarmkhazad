@@ -37,8 +37,22 @@ case "$declared" in
   *)   vendor="$declared";       model_override="" ;;
 esac
 
+# A lane harness (cc_full/cc_auto/cc_control/cc_alt) is one of the operator's
+# launcher scripts. It calls `lane_router_env`, which exports its own
+# ANTHROPIC_BASE_URL pointing at the local model router — and it runs AFTER this
+# shim execs it, so anything we export here would be overwritten anyway. The
+# router keys on the model NAME (claude-* to Anthropic, vendor slugs to
+# OpenRouter), so `model=<vendor>:<id>` needs only its id half here; the vendor
+# half is inert for a lane, the way it already is for codex and grok.
+case "$harness" in
+  cc_*) lane=1 ;;
+  *)    lane="" ;;
+esac
+
 extra=()
-if [ "$harness" = "claude" ]; then
+if [ -n "$lane" ]; then
+  [ -n "$model_override" ] && extra=(--model "$model_override")
+elif [ "$harness" = "claude" ]; then
   if [ "$vendor" = "anthropic" ]; then
     # Anthropic direct means exactly that: a vendor routing inherited from the
     # operator's shell (a cc_alt session, a local model router) must not leak
@@ -76,6 +90,9 @@ if [ "$harness" = "claude" ]; then
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
     extra=(--model "$MODEL_MAIN")
   fi
+fi
+
+if [ -n "$lane" ] || [ "$harness" = "claude" ]; then
   # Telemetry: every claude role reports tokens, cost and turns tagged with the
   # task and the role. The endpoint is a local VictoriaMetrics single-node
   # (OTLP at /opentelemetry/v1/metrics); an absent collector costs nothing.
