@@ -383,3 +383,28 @@
             (is (nil? (:PreCompact (:hooks settings)))
                 "and a bare claude role's file is the same file — nothing lane-shaped in it"))))
       (finally (fs/delete-tree sandbox)))))
+
+(deftest the-session-settings-file-carries-hooks-and-nothing-else
+  ;; Not a style rule — a measured constraint. `--settings` has two precedence
+  ;; rules, and they point in opposite directions (RAN, real CLI):
+  ;;
+  ;;   hook arrays   union: every file's hooks run, whatever the order
+  ;;   scalar keys   the FIRST --settings wins
+  ;;
+  ;;     --settings A --settings B --settings C  ->  SK_PROBE=AAA
+  ;;     --settings B --settings A --settings C  ->  SK_PROBE=BBB
+  ;;
+  ;; A lane passes its own --settings and appends ours (`lane_exec … "$@"`), so
+  ;; ours is always LAST — and last loses for anything that is not a hook. A
+  ;; scalar added here would be honoured on a bare `claude` role and silently
+  ;; overridden by the lane on a `cc_*` one: the same config, two behaviours,
+  ;; with nothing in the output to say which applied.
+  (let [ks (read-string
+            (str/trim (:out (run {} "bb" "-e"
+                                 (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                                      "(prn (vec (keys swarm-lib/hook-settings)))")))))]
+    (is (= [:hooks] ks)
+        (str "session settings must contain only :hooks; found "
+             (pr-str (remove #{:hooks} ks))
+             " — a non-hook setting belongs on the argv, where last-wins puts the "
+             "task's value on top instead of underneath the lane's"))))

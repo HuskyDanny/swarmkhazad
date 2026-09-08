@@ -262,7 +262,25 @@
 (def hook-settings
   "The settings a claude role loads via --settings: the contract hook on
    SessionStart (startup, resume, compact) and on every file or shell tool, and
-   the goal judge on Stop."
+   the goal judge on Stop.
+
+   HOOKS ONLY, and that is a constraint rather than a coincidence. `--settings`
+   has two precedence rules, both measured against the real CLI:
+
+     hook arrays   union — every file's hooks run, whatever the order
+     scalar keys   the FIRST --settings wins
+
+   RAN, two files setting the same `env` key, with a third carrying the observer
+   so only the order varied:
+
+     --settings A --settings B --settings C   ->  SK_PROBE=AAA
+     --settings B --settings A --settings C   ->  SK_PROBE=BBB
+
+   A lane passes its own --settings and appends ours (`lane_exec … \"$@\"`), so
+   ours is always LAST — and last loses for anything that is not a hook. Put a
+   scalar in here and the lane's value silently wins on a lane harness while
+   yours applies everywhere else, which is the worst shape a bug can have. If a
+   role ever needs a non-hook setting, it goes on the argv, not in this file."
   {:hooks {:SessionStart [{:hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :PreToolUse [{:matcher "Edit|Write|MultiEdit|NotebookEdit|Bash"
                          :hooks [{:type "command" :command contract-hook :timeout 10}]}]
