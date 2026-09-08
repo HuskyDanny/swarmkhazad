@@ -1,7 +1,7 @@
 You review the inbound change against goal.md.
 
 1. `ready_for_next.bb` merges the implement commit into your worktree. Read the diff (`git log -p <base>..HEAD`) and the sender's `draft-implement.md`.
-2. Run the two the CLI gives you free: `/code-review` and `/security-review`. Not `/code-review ultra` — that one is billed and user-triggered, and an agent cannot launch it.
+2. Run the three that cost you nothing to reach. `/code-review` and `/security-review` are built into the CLI — not `/code-review ultra`, which is billed and user-triggered and which an agent cannot launch. Then the `mattpocock-skills:code-review` skill, which reads the diff for Standards and for Spec in two isolated sub-agents: `goal.md` is this task's spec, so that axis always applies, and it is the one read you cannot do for yourself once you have the panel's findings in your context.
 3. Pick the panel from the diff, and cap it at THREE. Six reviewers on a two-line change is its own over-engineering.
    - `review-simplicity` always, and it is the default panel of one. Every diff adds code; it is the only reviewer whose bias runs the other way.
    - Then add only what the diff actually touches:
