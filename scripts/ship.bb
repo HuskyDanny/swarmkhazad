@@ -77,10 +77,43 @@
              (#(str/split % #"/"))
              (#(when (= 2 (count %)) {:owner (first %) :name (second %)})))))
 
-(defn account-for [owner]
-  (or (not-empty (or (System/getenv "SWARMKHAZAD_GH_ACCOUNT") ""))
-      (get owner->account owner)
-      default-account))
+(defn repo-account
+  "The account this checkout says it pushes as: `swarmkhazad.ghAccount` in its
+   own git config, or nil.
+
+   The answer belongs with the checkout, because that is the thing that knows.
+   `gh` cannot supply it: its credential helper serves only the ACTIVE account
+   — RAN, asked for a non-active user it returns nothing at all — and
+   `gh auth switch` is per HOST and global, so there is no per-repo account in
+   gh to read. Git has no such notion either: `user.name` is commit authorship
+   and credentials are selected by host, not by repository. What git does have
+   is per-repo config, so that is where this lives.
+
+   Set it once per checkout, and a new repo needs no code change:
+     git -C <checkout> config swarmkhazad.ghAccount <account>"
+  [source]
+  (let [r (process/sh {:continue true :dir (str source)}
+                      "git" "config" "--get" "swarmkhazad.ghAccount")]
+    (when (zero? (:exit r)) (not-empty (str/trim (str (:out r)))))))
+
+(defn account-for
+  "Which of the authenticated accounts pushes to this owner, most specific
+   answer first: the environment override, then what the checkout itself says,
+   then the owner map, then the default.
+
+   The checkout beats the map on purpose. The map is a central list that has to
+   be edited for every new owner, and the cost of it being wrong is not an
+   error — `HuskyDanny` was absent, fell through to the `allen-mithra` default,
+   and the push failed `Invalid username or token`, which reads as a broken
+   credential rather than the wrong identity. Both accounts' tokens are already
+   on disk and `gh auth token -u <account>` serves either, so nothing about the
+   token side needs to change; only the choosing did."
+  ([owner] (account-for owner nil))
+  ([owner source]
+   (or (not-empty (or (System/getenv "SWARMKHAZAD_GH_ACCOUNT") ""))
+       (when source (repo-account source))
+       (get owner->account owner)
+       default-account)))
 
 (def gh-token
   "The account's token, supplied per command. Never `gh auth switch` — that
@@ -143,7 +176,8 @@
        :commits commits
        :head (git-out path "rev-parse" branch)
        :slug slug
-       :account (account-for (:owner slug))
+       ;; `path` so the checkout gets a say — see account-for.
+       :account (account-for (:owner slug) path)
        ;; Already at the remote with the same tip: a re-run after a failure
        ;; further down the order must not push it a second time.
        :pushed? (= (git-out path "rev-parse" branch)

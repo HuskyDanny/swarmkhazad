@@ -324,6 +324,54 @@
           "pushing as the wrong person is the failure this map exists to prevent")
       (is (= "allen-mithra" (:unknown m))))))
 
+(deftest the-checkout-gets-a-say-in-which-account-pushes
+  ;; The owner map is a central list that has to be edited for every new owner,
+  ;; and being wrong is not an error: `HuskyDanny` was absent, fell through to
+  ;; the `allen-mithra` default, and the push failed `Invalid username or
+  ;; token` — which reads as a broken credential rather than a wrong identity.
+  ;;
+  ;; It cannot come from gh or from git. RAN: gh's credential helper answers
+  ;; only for the ACTIVE account (asked for a non-active user it returns
+  ;; nothing), `gh auth switch` is per host and global, and git selects
+  ;; credentials by host while `user.name` is only commit authorship. Per-repo
+  ;; git config is the one place left, and it is the right one — the checkout
+  ;; is the thing that knows.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-account."})
+        repo (str (fs/path sandbox "checkout"))]
+    (try
+      (fs/create-dirs repo)
+      (git repo "init" "-q" "-b" "main")
+      (let [ask (fn [owner & [account env]]
+                  (let [form (str "(load-file \"" scripts "/ship.bb\") "
+                                  "(prn (with-redefs [ship/owner->account {\"acme\" \"acme-bot\"}] "
+                                  "       (ship/account-for " (pr-str owner) " " (pr-str repo) ")))")]
+                    (when account (git repo "config" "swarmkhazad.ghAccount" account))
+                    (read-string
+                     (str/trim (:out (run {:env (or env {})} "bb" "-e" form))))))]
+
+        (testing "with nothing set, the owner map still decides"
+          (is (= "acme-bot" (ask "acme")))
+          (is (= "allen-mithra" (ask "nobody"))))
+
+        (testing "the checkout's own config beats the map"
+          (is (= "husky-bot" (ask "acme" "husky-bot"))
+              "a new owner needs one git config, not a code change"))
+
+        (testing "and beats the default for an owner the map never heard of"
+          (is (= "husky-bot" (ask "nobody"))))
+
+        (testing "the environment override still beats the checkout"
+          ;; Most specific wins, and the env var is the operator saying it
+          ;; explicitly for this one run.
+          (is (= "someone-else"
+                 (ask "acme" nil {"SWARMKHAZAD_GH_ACCOUNT" "someone-else"}))))
+
+        (testing "a blank config value is not an answer"
+          (git repo "config" "swarmkhazad.ghAccount" "")
+          (is (= "acme-bot" (ask "acme"))
+              "an empty setting must fall through, not push as nobody")))
+      (finally (fs/delete-tree sandbox)))))
+
 ;; ------------------------------------------------------------- the PR loop
 
 (def live-pr
