@@ -606,8 +606,8 @@
           (is (= "/" (get (:headers r) "Location"))))
         (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
           (is (= [src nested] (:repos stored)) "a project holds more than one checkout")
-          (is (= [{:role "implement" :harness "claude" :model "anthropic"}
-                  {:role "run" :harness "claude" :model "kimi"}] (:roles stored))
+          (is (= [{:role "implement" :harness "cc_auto" :model "anthropic"}
+                  {:role "run" :harness "cc_auto" :model "kimi"}] (:roles stored))
               "a role names no checkout: it can work in any of the project's repos"))
         (let [body (:body (request env :get "/"))]
           (is (str/includes? body (str "class=\"pname\">" project)))
@@ -624,8 +624,8 @@
           (is (= 400 (:status r)))
           (is (str/includes? (:body r) (str "project already exists: " project))))
         (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
-          (is (= [{:role "implement" :harness "claude" :model "anthropic"}
-                  {:role "run" :harness "claude" :model "kimi"}] (:roles stored))
+          (is (= [{:role "implement" :harness "cc_auto" :model "anthropic"}
+                  {:role "run" :harness "cc_auto" :model "kimi"}] (:roles stored))
               "create is not a silent edit — that is what /projects/<name> is for")))
       (testing "the task form shows the swarm and the checkouts but never asks for them"
         (let [body (:body (request env :get (str "/projects/" project "/new")))]
@@ -681,8 +681,8 @@
           (is (= project (str/trim (slurp (str (fs/path dir "project"))))) "the task names its project, so the swimlane can find it")
           (let [roles (slurp (str (fs/path dir "roles")))
                 repos (slurp (str (fs/path dir "repos")))]
-            (is (str/includes? roles "implement claude task model=anthropic"))
-            (is (str/includes? roles "run claude task model=kimi") "each role's vendor reaches the roles file")
+            (is (str/includes? roles "implement cc_auto task model=anthropic"))
+            (is (str/includes? roles "run cc_auto task model=kimi") "each role's vendor reaches the roles file")
             (is (not (str/includes? roles "review")) "only the picked roles")
             (is (str/includes? repos src) "and the project's checkouts reach the repos file")
             (is (str/includes? repos nested)))
@@ -780,7 +780,7 @@
           (is (= "/" (get (:headers r) "Location"))))
         (let [stored (edn/read-string (slurp (str (fs/path home "projects" (str project ".edn")))))]
           (is (= [src] (:repos stored)) "a checkout can be dropped")
-          (is (= [{:role "implement" :harness "claude" :model "kimi"}] (:roles stored))
+          (is (= [{:role "implement" :harness "cc_auto" :model "kimi"}] (:roles stored))
               "and a role, and a role's vendor, all in one save"))
         (testing "a bad edit is refused and the project on disk is untouched"
           (let [r (request env :post (str "/projects/" project) {:body "role%3Aimplement=on"})]
@@ -828,9 +828,9 @@
           (is (str/includes? body "value=\"cc_alt\""))))
       (testing "each role card opens on the model that role is meant to run"
         ;; Not one default for everyone. A quiet quality drop in a building role
-        ;; ships wrong code, so those get Opus; specifier and review get a
-        ;; different VENDOR on purpose, so a diff is read by a model that did
-        ;; not write it and cannot agree with its own reasoning.
+        ;; ships wrong code, so those get Opus; the specifier gets a different
+        ;; VENDOR on purpose, so a spec is read by a model that did not write it
+        ;; and cannot agree with its own reasoning.
         (let [body (:body (request env :get "/"))
               picked (fn [stage]
                        ;; the value sitting in that stage's own two controls
@@ -844,7 +844,30 @@
           (is (= "anthropic:claude-opus-5[1m]" (picked "qa")))
           (is (= "anthropic:claude-fable-5-1" (picked "architect")))
           (is (= "glm" (picked "specifier")) "a vendor with no id override needs no colon")
-          (is (= "deepseek" (picked "review")))))
+          (is (= "anthropic:claude-opus-5[1m]" (picked "review"))
+              "review reads on Opus and gets its second opinion from the panel, not from its own vendor")))
+      (testing "and on a harness whose brief the role inherits rather than replaces"
+        ;; A lane is claude plus an effort level, a narrowed MCP set, the SSO
+        ;; wrap and its own brief. The brief is the part that was being lost:
+        ;; --append-system-prompt-file takes the LAST occurrence, so the swarm's
+        ;; file replaced the lane's outright. write-prompt! now carries the
+        ;; lane's text ahead of this task's, and the harness default is what
+        ;; decides whether there is any lane text to carry.
+        ;;
+        ;; The lane also starts the model router, which is the only way a
+        ;; <vendor>/<model> slug resolves — the floor under a reviewer left on
+        ;; its frontmatter vendor, though not under one dispatched with an
+        ;; explicit opus or sonnet.
+        (let [body (:body (request env :get "/"))
+              harness (fn [stage]
+                        (let [at (str/index-of body (str "name=\"harness:" stage "\""))
+                              seg (subs body at (min (count body) (+ at 900)))]
+                          (second (re-find #"<option selected=\"selected\" value=\"([^\"]+)\"" seg))))]
+          (is (= "cc_auto" (harness "review")))
+          (is (= "cc_auto" (harness "implement")))
+          (is (= "cc_auto" (harness "run")))
+          (is (= "cc_alt" (harness "specifier"))
+              "one vendor and no panel: cc_alt points straight at it, no router in between")))
       (testing "a non-claude role's vendor select is disabled, not silently ignored"
         ;; Only the claude shim reads the vendor; the others pin the binary and
         ;; nothing else. Offering a choice that does nothing is worse than

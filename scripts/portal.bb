@@ -335,7 +335,7 @@
         roles (vec (for [stage (project-lib/stage-prompts)
                          :when (get params (str "role:" stage))]
                      {:role stage
-                      :harness (or (get params (str "harness:" stage)) "claude")
+                      :harness (or (get params (str "harness:" stage)) (project-lib/default-harness stage))
                       ;; Two controls, one field: the roles grammar has always
                       ;; been `model=<vendor>[:<model-id>]`, and splitting it
                       ;; across two form names here rather than two columns in
@@ -663,7 +663,7 @@
                           ;; project for edit and pressing Save silently reset
                           ;; every role to claude.
                           [[(str "role:" role) "on"]
-                           [(str "harness:" role) (or harness "claude")]
+                           [(str "harness:" role) (or harness (project-lib/default-harness role))]
                            [(str "model:" role) model]])
                         roles))))
 
@@ -718,7 +718,7 @@
             ;; everything but `claude` the vendor select is disabled rather than
             ;; offering a choice that silently does nothing, and the model id —
             ;; which every one of them honours — stays live.
-            (let [h (get params (str "harness:" stage) "claude")]
+            (let [h (get params (str "harness:" stage) (project-lib/default-harness stage))]
               (list
                [:select {:name (str "harness:" stage)}
                 (for [a (sort task-lib/known-agents)]

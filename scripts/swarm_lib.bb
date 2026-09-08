@@ -230,15 +230,25 @@
             (distinct (map :role rows)))))
 
 (defn write-prompt!
-  "prompts/<session>.md: the session header, the constitution, the stage prompt.
+  "prompts/<session>.md: the lane's own brief, then the session header, the
+   constitution, the stage prompt.
 
    The stage prompt is the ROLE's — every repo gets the same instructions for
-   what implement or review means; only the header and the draft names differ."
+   what implement or review means; only the header and the draft names differ.
+
+   The lane's brief leads because the swarm's text has to be able to overrule
+   it: cc_auto tells a session to finish with commit-push-pr and a run-folder
+   nudge, and a swarm role hands off instead. Later instruction wins, so the
+   general layer goes first and the specific one after — the ordinary overlay,
+   which is not what the flag was doing before. A lane appending no file of its
+   own (cc_full, cc_alt) contributes nothing and the prompt is unchanged."
   [ctx rows row]
   (fs/create-dirs (:prompts-dir ctx))
-  (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))]
+  (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))
+        lane (task-lib/lane-system-prompt (:harness row))]
     (spit (str file)
-          (str (role-header ctx rows row)
+          (str (when lane (str (slurp lane) "\n\n---\n\n"))
+               (role-header ctx rows row)
                (own-drafts (str (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
                                 "\n## Stage: " (:role row) "\n\n"
                                 (stage-prompt (:role row)))
@@ -333,7 +343,13 @@
        ;; A lane script execs claude with its own flags and appends ours, and
        ;; the parser takes the last occurrence — so this same argv, handed to a
        ;; lane, inherits the lane's model, effort, MCP set and SSO wrap while
-       ;; still overriding the three flags the swarm has to own.
+       ;; still overriding the two flags the swarm has to own.
+       ;;
+       ;; --append-system-prompt-file is NOT one of them any more. Last-wins
+       ;; applies to it too, so passing ours REPLACED the lane's brief rather
+       ;; than layering over it. The file written by write-prompt! now carries
+       ;; the lane's own text ahead of the swarm's, so the flag stays single
+       ;; and nothing is dropped.
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
                         ["--append-system-prompt-file" (str prompt)

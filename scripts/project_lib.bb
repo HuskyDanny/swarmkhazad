@@ -160,15 +160,47 @@
    "qa"         opus
    "architect"  "anthropic:claude-fable-5-1"
    "specifier"  "glm"
-   "review"     "deepseek"})
+   "review"     opus})
 
 (defn default-model
   "A stage with no opinion recorded here runs on the operator's own login."
   [role]
   (get role-models role "anthropic"))
 
+(def role-harness
+  "Which launcher a role runs under unless a project says otherwise.
+
+   cc_auto for everyone but specifier. Not for its permission mode — the swarm
+   already states `bypassPermissions` for a bare `claude` role, so that part is
+   a wash. What the lane adds is everything a role would otherwise have to be
+   taught twice: `--effort xhigh`, an MCP set narrowed to the three servers a
+   role actually uses (codegraph for a blast-radius read, chrome-devtools for a
+   browser check) instead of the operator's whole `~/.claude.json`, the SSO wrap
+   its Bash calls need, and its own brief — which `write-prompt!` now carries
+   ahead of this task's rather than replacing it.
+
+   The lane also starts the local model router (`lane_router_env`), which is the
+   only way a `<vendor>/<model>` slug resolves at all. That matters for any role
+   whose reviewers are left on their frontmatter vendors; it does NOT matter for
+   a reviewer dispatched with an explicit `opus` or `sonnet`, which resolves on
+   the ordinary path. So the router is the floor under the vendor case, not the
+   reason for the default.
+
+   specifier is the exception: one vendor, no panel, so cc_alt points straight
+   at that vendor with no router in between.
+
+   review reads on Opus rather than on a foreign vendor, which reverses an
+   earlier default. Its second opinion no longer comes from its own model — it
+   comes from `/code-review` and `/security-review`, which are built into the
+   CLI, plus a panel picked from what the diff touches. A lead that can dispatch
+   a panel is worth more than a lead that is itself one foreign vendor and reads
+   everything alone."
+  {"specifier" "cc_alt"})
+
+(defn default-harness [role] (get role-harness role "cc_auto"))
+
 (def default-roles
-  (mapv (fn [r] {:role r :harness "claude" :model (default-model r)})
+  (mapv (fn [r] {:role r :harness (default-harness r) :model (default-model r)})
         ["implement" "review" "run"]))
 
 (defn valid-role-spec?
