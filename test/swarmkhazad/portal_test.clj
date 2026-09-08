@@ -92,7 +92,8 @@
             (is (str/includes? (:body r) "action=\"/projects\"") "the new-project composer is on the index")
             (is (str/includes? (:body r) "Tasks outside a project") "a task with no project is still reachable")
             (is (str/includes? (:body r) "<details class=\"composer\">") "the composer starts collapsed when there is nothing to report")
-            (is (str/includes? (:body r) "harnesses: claude, codex, copilot, grok"))))
+            (is (str/includes? (:body r) "harness runs the role, vendor is the model it talks to")
+                "the footer names the two axes the cards now offer, not one list of harnesses")))
         (testing "the task page: checkboxes follow the verdicts, never the file"
           (let [body (:body (request env :get (str "/tasks/" id)))]
             (is (not (str/includes? body "http-equiv=\"refresh\""))
@@ -796,3 +797,51 @@
         (is (= 404 (:status (request env :post (str "/projects/" project "/delete"))))))
       (finally
         (fs/delete-tree sandbox)))))
+
+(deftest the-role-picker-declares-the-harness-and-not-only-the-vendor
+  ;; Two axes: the harness is which CLI runs the role, the vendor is which model
+  ;; that CLI talks to. Every layer already carried both — the form reader
+  ;; defaults `harness:<stage>`, `valid-role-spec?` checks it, `roles-text`
+  ;; writes it as the second field — and the page offered only the vendor, so a
+  ;; project could be given a codex role by hand-editing `roles` and never
+  ;; through the page that claims to declare them.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-h."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src"))}
+        project "p-harness"]
+    (try
+      (make-source-repo! src)
+      (testing "both selects are on the card, one per axis"
+        (let [body (:body (request env :get "/"))]
+          (is (str/includes? body "name=\"harness:implement\"") "the harness axis has a control at all")
+          (is (str/includes? body "name=\"model:implement\""))
+          (is (str/includes? body "value=\"codex\"") "and every known harness is offered")
+          (is (str/includes? body "value=\"grok\""))))
+      (testing "a non-claude role's vendor select is disabled, not silently ignored"
+        ;; Only the claude shim reads the vendor; the others pin the binary and
+        ;; nothing else. Offering a choice that does nothing is worse than
+        ;; offering none, because the roles file then records a lie.
+        (let [body (:body (request env :post "/projects"
+                                   {:body (str "name=bad%2Fid&repo%3A" src "=on"
+                                               "&role%3Aimplement=on&harness%3Aimplement=codex")}))]
+          (is (= 400 (:status (request env :post "/projects"
+                                       {:body (str "name=bad%2Fid&repo%3A" src "=on&role%3Aimplement=on")}))))
+          (is (str/includes? body "disabled=\"disabled\"")
+              "the rejection re-renders with codex still picked, and its vendor select off")))
+      (testing "the harness reaches the roles file"
+        (let [r (request env :post "/projects"
+                         {:body (str "name=" project "&repo%3A" src "=on"
+                                     "&role%3Aimplement=on&harness%3Aimplement=codex"
+                                     "&role%3Areview=on&harness%3Areview=claude&model%3Areview=glm")})]
+          (is (= 303 (:status r)) (:body r)))
+        (let [body (:body (request env :get (str "/projects/" project "/edit")))]
+          (is (str/includes? body "selected=\"selected\" value=\"codex\"")
+              "and comes back selected on edit — without the round-trip, pressing Save reset every role to claude")
+          (is (str/includes? body "selected=\"selected\" value=\"glm\"")))
+        ;; and into the saved project, which is what `new` turns into a roles
+        ;; file — the swarm never learns a project exists, it only reads that.
+        (let [saved (slurp (str (fs/path home "projects" (str project ".edn"))))]
+          (is (str/includes? saved "codex") saved)
+          (is (str/includes? saved "glm") saved)))
+      (finally (fs/delete-tree sandbox)))))

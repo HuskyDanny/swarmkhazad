@@ -640,8 +640,13 @@
   [{:keys [name repos roles]}]
   (into {"name" name}
         (concat (for [r repos] [(str "repo:" r) "on"])
-                (mapcat (fn [{:keys [role model]}]
-                          [[(str "role:" role) "on"] [(str "model:" role) model]])
+                (mapcat (fn [{:keys [role harness model]}]
+                          ;; The harness round-trips too, or opening a saved
+                          ;; project for edit and pressing Save silently reset
+                          ;; every role to claude.
+                          [[(str "role:" role) "on"]
+                           [(str "harness:" role) (or harness "claude")]
+                           [(str "model:" role) model]])
                         roles))))
 
 (defn project-form
@@ -686,15 +691,27 @@
            [:label.card.rolecard
             [:div.card-top [:span.name stage]
              [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
-            [:select {:name (str "model:" stage)}
-             (for [v (sort task-lib/known-vendors)]
-               [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
+            ;; Two axes, and they are not the same one: the harness is which CLI
+            ;; runs the role, the vendor is which model that CLI talks to. Only
+            ;; claude reads the vendor — the shim says so, and the others ignore
+            ;; it — so the vendor select is disabled for the rest rather than
+            ;; offering a choice that silently does nothing.
+            (let [h (get params (str "harness:" stage) "claude")]
+              (list
+               [:select {:name (str "harness:" stage)}
+                (for [a (sort task-lib/known-agents)]
+                  [:option {:value a :selected (= a h)} a])]
+               [:select (cond-> {:name (str "model:" stage)}
+                          (not= "claude" h) (assoc :disabled true
+                                                   :title (str h " does not take a vendor; it uses its own login")))
+                (for [v (sort task-lib/known-vendors)]
+                  [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]))
             ;; No checkout picker: a role works in every repo the project holds,
             ;; and a task narrows that with `@repo` tags on its goal lines.
             ])]
         [:div.go
          [:button {:type "submit"} (if project "Save project" "Create project")]
-         [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]
+         [:span.muted (count available) " checkouts found · harness runs the role, vendor is the model it talks to"]]]
        ;; Its own form, so Enter in the name field can never reach it.
        (when project
          [:form.danger {:method "post" :action (str "/projects/" (:name project) "/delete")}
