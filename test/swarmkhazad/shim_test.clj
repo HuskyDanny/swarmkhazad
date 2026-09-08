@@ -72,9 +72,10 @@
       (finally
         (fs/delete-tree sandbox)))))
 
-(deftest roles-tsv-model-column-is-the-sixth-the-shim-reads
+(deftest sessions-tsv-columns-are-the-ones-the-shim-reads
   (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
-  (is (= 5 (.indexOf @(resolve 'task-lib/roles-tsv-columns) :model)) "shim.sh reads $6 for the vendor")
+  (is (= 0 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :session)) "shim.sh matches $1 against the session")
+  (is (= 6 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :model)) "shim.sh reads $7 for the vendor")
   (is (= #{"anthropic" "glm" "kimi" "deepseek" "qwen"} @(resolve 'task-lib/known-vendors)) "vendors.tsv rows plus anthropic")
   (is (= "moonshotai/kimi-k3:exacto" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
   (is (= "" (:ctx-tokens (get ((resolve 'task-lib/read-vendors)) "qwen"))) "an empty last column survives"))
@@ -141,13 +142,21 @@
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)]
         (spit (str (fs/path dir "roles"))
-              (str "plain claude " src " task\n"
-                   "fast claude " src " task model=kimi\n"
-                   "deep claude " src " task model=deepseek --model sonnet\n"))
+              (str "plain claude task\n"
+                   "fast claude task model=kimi\n"
+                   "deep claude task model=deepseek --model sonnet\n"
+                   ;; `<vendor>:<model-id>`: the vendor half picks the endpoint
+                   ;; and the credential, the suffix names the exact model. A
+                   ;; vendors.tsv row pins one pair for everyone who picks that
+                   ;; vendor, so without this a role can ask for kimi and not
+                   ;; for a particular kimi.
+                   "exact claude task model=anthropic:claude-opus-5[1m]\n"
+                   "pinned claude task model=kimi:moonshotai/kimi-k2.5:exacto\n"))
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (let [result (run {:env env} cli "smoke" id)
               out (:out result)]
           (testing "every role reports OK and sent its note to itself"
-            (doseq [role ["plain" "fast" "deep"]]
+            (doseq [role ["plain" "fast" "deep" "exact" "pinned"]]
               (is (re-find (re-pattern (str "(?m)^OK +" role " ")) out) (str role ": " out))
               (is (str/includes? (slurp (str (fs/path dir "tmp" (str "smoke-" role ".out")))) "HANDOFF QUEUED") "the stub ran swarm_handoff.bb"))
             (is (empty? (fs/glob (fs/path dir "mail") "**/outbox/*.handoff")) "smoke notes are removed so a later open does not deliver them"))
@@ -165,8 +174,33 @@
               (is (= "otlp" (get e "OTEL_METRICS_EXPORTER")))
               (is (= "http/protobuf" (get e "OTEL_EXPORTER_OTLP_PROTOCOL")))
               (is (= "http://127.0.0.1:8428/opentelemetry" (get e "OTEL_EXPORTER_OTLP_ENDPOINT")))
-              (is (= (str "task_id=" id ",role=plain") (get e "OTEL_RESOURCE_ATTRIBUTES")))
+              (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
               (is (not (some #{"--model"} (str/split-lines (slurp (str (fs/path dir "tmp" "launch-plain.argv")))))) "no --model pin for anthropic")))
+          (testing "an exact model on the operator's own login: pinned, and still no vendor routing"
+            (let [e (env-map (fs/path dir "tmp" "launch-exact.env"))
+                  argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-exact.argv"))))]
+              (is (nil? (get e "ANTHROPIC_BASE_URL"))
+                  "`anthropic:` is still anthropic — naming a model does not route it anywhere")
+              (is (nil? (get e "ANTHROPIC_AUTH_TOKEN")))
+              (is (= ["--model" "claude-opus-5[1m]"]
+                     (->> argv (drop-while #(not= "--model" %)) (take 2)))
+                  "and the model reaches the CLI, which is the whole point of the suffix")))
+          (testing "an exact model on a vendor's endpoint: that vendor's URL and token, this role's model"
+            (let [e (env-map (fs/path dir "tmp" "launch-pinned.env"))
+                  argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-pinned.argv"))))]
+              (is (= "https://openrouter.ai/api" (get e "ANTHROPIC_BASE_URL"))
+                  "the vendor half still selects the endpoint")
+              (is (= "tok-from-test:openrouter-token" (get e "ANTHROPIC_AUTH_TOKEN"))
+                  "and the credential")
+              (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL"))
+                  "but the model is this role's, not the row's `moonshotai/kimi-k3:exacto` — and the id carries a colon of its own, which is why the split is on the FIRST one")
+              (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_SONNET_MODEL")))
+              (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL"))
+                  "the row's small model is not overridden; nothing else in the row moves either")
+              (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+                  "the context window still comes from the vendor row")
+              (is (= ["--model" "moonshotai/kimi-k2.5:exacto"]
+                     (->> argv (drop-while #(not= "--model" %)) (take 2))))))
           (testing "a kimi role gets the cc_alt env and a --model pin, and the run reports that model"
             (let [e (env-map (fs/path dir "tmp" "launch-fast.env"))
                   argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-fast.argv"))))]
@@ -177,7 +211,7 @@
               (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
               (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS")))
               (is (= "1" (get e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")))
-              (is (= (str "task_id=" id ",role=fast") (get e "OTEL_RESOURCE_ATTRIBUTES")))
+              (is (= (str "task_id=" id ",role=fast,session=fast,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
               (is (= ["--model" "moonshotai/kimi-k3:exacto"] (take 2 argv)) "the pin comes first so declared args can still override")
               (is (str/includes? out "used=moonshotai/kimi-k3:exacto"))))
           (testing "a deepseek role with declared extra args keeps both the pin and the args"
@@ -198,7 +232,8 @@
       (let [id "t-smoke-bad"
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task model=kimi\n"))
+        (spit (str (fs/path dir "roles")) "a claude task model=kimi\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (testing "a run that answers with some other model is a collision, not a pass"
           (let [result (run {:env (assoc env "SWARMKHAZAD_STUB_MODEL" "claude-opus-5") :ok? false} cli "smoke" id)]
             (is (not= 0 (:exit result)))
@@ -217,23 +252,23 @@
             _ (run {:env env} cli "new" id "--repo" src)
             dir (fs/path home "tasks" id)
             socket (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")]
-        (spit (str (fs/path dir "roles")) (str "a claude " src " task\nb claude none\n"))
+        (spit (str (fs/path dir "roles")) "a claude task\nb claude\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
         (try
           (run {:env env} cli "open" id)
           (let [cfg (json/parse-string (slurp claude-json))
                 projects (get cfg "projects")
-                a-real (str (fs/canonicalize (fs/path dir "worktrees" "a")))
-                task-real (str (fs/canonicalize dir))]
-            (is (= true (get-in projects [a-real "hasTrustDialogAccepted"])) "role a's worktree is trusted")
-            (is (= true (get-in projects [task-real "hasTrustDialogAccepted"])) "a repo-less role works in the task folder, which is trusted too")
+                wt-real (str (fs/canonicalize (fs/path dir "worktrees" "fixture")))]
+            (is (= true (get-in projects [wt-real "hasTrustDialogAccepted"])) "the repo's worktree is trusted")
             (is (= true (get-in projects ["/somewhere/else" "hasTrustDialogAccepted"])) "existing entries untouched")
             (is (= [] (get-in projects ["/somewhere/else" "allowedTools"])) "existing entry fields untouched")
             (is (= 7 (get cfg "numStartups")) "other top-level keys untouched")
-            (is (= 3 (count projects)))
+            (is (= 2 (count projects))
+                "both roles share the repo's worktree, so trust is seeded once")
             (testing "a second open adds nothing"
               (run {:env env} cli "close" id)
               (run {:env env} cli "open" id)
-              (is (= 3 (count (get (json/parse-string (slurp claude-json)) "projects")))))
+              (is (= 2 (count (get (json/parse-string (slurp claude-json)) "projects")))))
             (testing "close removes exactly the entries open added"
               (run {:env env} cli "close" id)
               (let [after (get (json/parse-string (slurp claude-json)) "projects")]
@@ -242,3 +277,134 @@
           (finally
             (run {:env env :ok? false} cli "close" id)
             (process/sh {:continue true} "tmux" "-S" socket "kill-server")))))))
+
+(deftest a-lane-script-is-a-harness-and-the-task-layers-over-it-without-restating-it
+  ;; Base home -> lane -> task. Each layer adds; none restates the one below.
+  ;;
+  ;; This works because of one measured fact about the CLI (RAN, real binary):
+  ;;
+  ;;   claude --model claude-haiku-4-5-20251001 --model bogus-model-xyz  -> error
+  ;;   claude --model bogus-model-xyz --model claude-haiku-4-5-20251001  -> ok
+  ;;
+  ;; The LAST occurrence wins. `lane_exec` is
+  ;; `exec aws-vault exec dev --duration=8h --server -- claude "$@"`, so a lane
+  ;; puts its flags first and appends ours — which is why the task layer can
+  ;; override the one flag it must own and inherit everything else.
+  ;;
+  ;; The same fact is why `--settings` had to stop being passed twice: ours
+  ;; REPLACED the lane's file, and every hook the lane installs stopped running.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-lane."})
+        cc-home (str (fs/path sandbox "cc"))
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home "CLAUDE_CONFIG_DIR" cc-home}
+        id "t-lane"]
+    (try
+      (make-source-repo! src)
+      ;; the operator's own lane: a launcher script and the settings it loads
+      (fs/create-dirs (fs/path cc-home "scripts"))
+      (fs/create-dirs (fs/path cc-home "auto"))
+      (write! (fs/path cc-home "scripts" "cc-auto.sh") "#!/bin/bash\nexec claude \"$@\"\n")
+      (fs/set-posix-file-permissions (fs/path cc-home "scripts" "cc-auto.sh") "rwxr-xr-x")
+      (write! (fs/path cc-home "auto" "settings.json")
+              (json/generate-string
+               {:hooks {:SessionStart [{:hooks [{:type "command" :command "/lane/persona.sh"}]}]
+                        :PreCompact [{:hooks [{:type "command" :command "/lane/compact.sh"}]}]}
+                :env {:LANE_ONLY "1"}}))
+      (run {:env env} cli "new" id "--repo" src)
+      (let [dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles"))
+              (str "implement cc_auto task model=anthropic:claude-opus-5[1m]\n"
+                   "review claude task model=deepseek\n"))
+        (spit (str (fs/path dir "repos")) (str src "\n"))
+        (run {:env env} cli "prepare" id)
+        ;; `open` writes these; this test only needs argv, so it stands them in.
+        (doseq [sess ["implement" "review"]]
+          (write! (fs/path dir "prompts" (str sess ".md")) "role prompt\n"))
+        (testing "a lane name validates as a harness and survives into sessions.tsv"
+          (let [rows (str/split-lines (slurp (str (fs/path dir "state" "sessions.tsv"))))
+                cols (fn [n] (str/split (some #(when (str/starts-with? % n) %) rows) #"\t" -1))]
+            (is (= "cc_auto" (nth (cols "implement") 4)) (str rows))
+            (is (= "anthropic:claude-opus-5[1m]" (nth (cols "implement") 6)))
+            (is (= "claude" (nth (cols "review") 4)) "and a bare CLI still resolves as itself")))
+        (testing "the task contributes only its own settings — the CLI merges the lane's"
+          (let [argv (run {:env env} "bb" "-e"
+                          (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                               "(let [ctx (task-lib/task-ctx \"" id "\") "
+                               "      rows (task-lib/read-sessions-tsv ctx) "
+                               "      row (first (filter #(= \"implement\" (:session %)) rows))] "
+                               "  (prn (swarm-lib/harness-argv ctx row \"/bin/cc-auto.sh\" "
+                               "        (str (:prompts-dir ctx) \"/implement.md\") :interactive nil)))"))
+                argv (read-string (str/trim (:out argv)))
+                settings-path (second (drop-while #(not= "--settings" %) argv))
+                merged (json/parse-string (slurp settings-path) true)]
+            ;; RAN against the real CLI, which is why this file holds only our
+            ;; hooks rather than a copy of the lane's:
+            ;;
+            ;;   claude --settings A --settings B   BOTH files' SessionStart
+            ;;                                      hooks fire, either order
+            ;;
+            ;; and the base layer is not replaced either — with `--settings`
+            ;; passed, ~/.claude/settings.json's own PreToolUse guard still
+            ;; refused `sudo`. Settings LAYER. Copying the lane's hooks in here
+            ;; would add nothing and would make this file claim hooks that are
+            ;; not its own.
+            (testing "our own hooks are here"
+              (is (str/includes? (str (mapv :command (mapcat :hooks (:SessionStart (:hooks merged)))))
+                                 "run-contract.sh")
+                  "the truth lock")
+              (is (seq (:Stop (:hooks merged))) "and the goal judge"))
+            (testing "and the lane's are NOT copied in — the CLI merges its file, this one does not restate it"
+              (is (= 1 (count (:SessionStart (:hooks merged))))
+                  "one entry, ours")
+              (is (not (str/includes? (str merged) "/lane/persona.sh")))
+              (is (nil? (:PreCompact (:hooks merged)))
+                  "an event only the lane has stays only the lane's")
+              (is (nil? (:env merged))
+                  "and nothing else of the lane's is duplicated here either"))
+            (testing "the permission mode is the lane's, not restated"
+              ;; cc_auto bypasses and cc_control screens. Passing ours would
+              ;; make picking between them meaningless.
+              (is (not (some #{"--permission-mode"} argv)) (str argv)))
+            (testing "but the role's own prompt still wins — a lane's prompt describes its own delivery arc, not this task's"
+              (is (some #{"--append-system-prompt-file"} argv)))))
+        (testing "a bare claude role is unchanged: its own settings, and the permission mode stated"
+          (let [argv (run {:env env} "bb" "-e"
+                          (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                               "(let [ctx (task-lib/task-ctx \"" id "\") "
+                               "      rows (task-lib/read-sessions-tsv ctx) "
+                               "      row (first (filter #(= \"review\" (:session %)) rows))] "
+                               "  (prn (swarm-lib/harness-argv ctx row \"/bin/claude\" "
+                               "        (str (:prompts-dir ctx) \"/review.md\") :interactive nil)))"))
+                argv (read-string (str/trim (:out argv)))
+                settings (json/parse-string (slurp (second (drop-while #(not= "--settings" %) argv))) true)]
+            (is (= ["--permission-mode" "bypassPermissions"]
+                   (->> argv (drop-while #(not= "--permission-mode" %)) (take 2))))
+            (is (nil? (:PreCompact (:hooks settings)))
+                "and a bare claude role's file is the same file — nothing lane-shaped in it"))))
+      (finally (fs/delete-tree sandbox)))))
+
+(deftest the-session-settings-file-carries-hooks-and-nothing-else
+  ;; Not a style rule — a measured constraint. `--settings` has two precedence
+  ;; rules, and they point in opposite directions (RAN, real CLI):
+  ;;
+  ;;   hook arrays   union: every file's hooks run, whatever the order
+  ;;   scalar keys   the FIRST --settings wins
+  ;;
+  ;;     --settings A --settings B --settings C  ->  SK_PROBE=AAA
+  ;;     --settings B --settings A --settings C  ->  SK_PROBE=BBB
+  ;;
+  ;; A lane passes its own --settings and appends ours (`lane_exec … "$@"`), so
+  ;; ours is always LAST — and last loses for anything that is not a hook. A
+  ;; scalar added here would be honoured on a bare `claude` role and silently
+  ;; overridden by the lane on a `cc_*` one: the same config, two behaviours,
+  ;; with nothing in the output to say which applied.
+  (let [ks (read-string
+            (str/trim (:out (run {} "bb" "-e"
+                                 (str "(load-file \"" (str (fs/path repo-root "scripts")) "/swarm_lib.bb\") "
+                                      "(prn (vec (keys swarm-lib/hook-settings)))")))))]
+    (is (= [:hooks] ks)
+        (str "session settings must contain only :hooks; found "
+             (pr-str (remove #{:hooks} ks))
+             " — a non-hook setting belongs on the argv, where last-wins puts the "
+             "task's value on top instead of underneath the lane's"))))

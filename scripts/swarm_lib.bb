@@ -154,14 +154,20 @@
   (when (server-up? ctx) (tmux ctx "kill-server"))
   (fs/delete-if-exists (fs/path (:tmux-socket ctx))))
 
-(defn boot-sessions! [ctx roles]
+(defn boot-sessions!
+  "One tmux session per (role, repo), each opened in that repo's worktree.
+
+   The window carries the session's own name rather than the role's: two
+   sessions of one role differ only by repo, and a pane titled `implement`
+   twice is a pane you cannot tell apart."
+  [ctx rows]
   (fs/create-dirs (fs/parent (fs/path (:tmux-socket ctx))))
   (spit (str (:tmux-socket-file ctx)) (str (:tmux-socket ctx) "\n"))
-  (doseq [{:keys [role worktree-path]} roles
-          :let [session (task-lib/session-name role)]]
-    (tmux! ctx "new-session" "-d" "-s" session "-n" role "-c" worktree-path)
-    (tmux! ctx "set-option" "-t" session "history-limit" (str pane-history-limit))
-    (tmux! ctx "set-window-option" "-t" (str session ":" role) "allow-rename" "off")))
+  (doseq [{:keys [session worktree-path]} rows
+          :let [name (task-lib/session-name session)]]
+    (tmux! ctx "new-session" "-d" "-s" name "-n" session "-c" worktree-path)
+    (tmux! ctx "set-option" "-t" name "history-limit" (str pane-history-limit))
+    (tmux! ctx "set-window-option" "-t" (str name ":" session) "allow-rename" "off")))
 
 ;; ---------------------------------------------------------------- prompts
 
@@ -170,29 +176,73 @@
         fallback (fs/path prompts-src-dir "default.prompt")]
     (slurp (str (if (fs/regular-file? specific) specific fallback)))))
 
-(defn role-header [ctx roles row]
-  (let [names (mapv :role roles)
-        idx (.indexOf names (:role row))
-        next-role (get names (inc idx))]
-    (str "# swarmkhazad · task " (:task-id ctx) " · role " (:role row) "\n\n"
+(defn role-header [ctx rows row]
+  (let [roles (vec (distinct (map :role rows)))
+        idx (.indexOf roles (:role row))
+        next-role (get roles (inc idx))
+        mine (->> rows (filter #(= (:role row) (:role %))) (mapv :repo))]
+    (str "# swarmkhazad · task " (:task-id ctx) " · " (:session row) "\n\n"
          "- Task folder: " (:task-dir ctx) "\n"
-         (if (:repo row)
-           (str "- Your worktree: " (:worktree-path row) " (branch " (task-lib/role-branch ctx (:role row)) ", off the task's clone of " (:repo row) ")\n")
-           "- You have no repo; work in the task folder.\n")
-         "- Roles in order: " (str/join " → " names) ". You are #" (inc idx) " of " (count names) "."
-         (if next-role (str " Forward finished work to `" next-role "`.\n") " You are the last role: your git_handoff goes to every other role and closes the task.\n")
-         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb, merge_and_process.bb\n\n")))
+         "- Your repo: " (:repo row) "\n"
+         "- Your worktree: " (:worktree-path row) " (branch " (task-lib/task-branch ctx) ")\n"
+         (when (> (count mine) 1)
+           (str "- As " (:role row) " you cover " (str/join ", " mine)
+                " — one session each, run in that order. This one is only " (:repo row) ".\n"))
+         ;; The lineup names ROLES, and so does the address. A session that was
+         ;; told to forward to the next row of sessions.tsv was told to forward
+         ;; to a sibling of its own role — the card then moved into the lane it
+         ;; was already in, and the task never advanced past `implement`.
+         "- Roles in order: " (str/join " → " roles) ". You are `" (:role row) "`, #" (inc idx) " of " (count roles) "."
+         (if next-role
+           (str " Forward finished work to `" next-role "` — the role, not a session. Every session it has gets it.\n")
+           " You are the last role: your git_handoff goes to every other session and closes the task.\n")
+         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb\n\n")))
+
+(defn own-drafts
+  "Rewrite every `draft-<role>.md` a prompt names into the draft of that role's
+   session IN THIS REPO.
+
+   The prompts name roles, because that is what a reader understands and what
+   `draft-implement.md` means to a person. The judge (goal_judge.bb) and the
+   handoff (swarm_handoff.bb) both read `draft-<session>.md`, because two
+   sessions of one role would otherwise overwrite each other's write-up. Past
+   one repo those two names differ, so a role that followed its own instructions
+   literally wrote a file nothing read — the judge reports `(not written)` for
+   real work and the handoff drops it from `artifacts:`.
+
+   A cross-role reference is rewritten to the sibling in THIS repo: review is
+   told to read implement's draft, and it wants the implement that worked on the
+   tree it is reviewing. In a one-repo task session and role are the same string
+   and every replacement here is a no-op."
+  [text rows row]
+  (let [in-repo (fn [role]
+                  (or (some #(when (and (= role (:role %)) (= (:repo row) (:repo %))) (:session %)) rows)
+                      (some #(when (= role (:role %)) (:session %)) rows)
+                      role))]
+    (reduce (fn [t role] (str/replace t (str "draft-" role ".md") (str "draft-" (in-repo role) ".md")))
+            (reduce #(str/replace %1 %2 (str "draft-" (:session row) ".md"))
+                    text
+                    ;; Both spellings of "your own draft" a prompt uses. A
+                    ;; placeholder left unresolved is the same defect as a role
+                    ;; name left unresolved: the agent writes a file whose name
+                    ;; nothing downstream reads.
+                    ["draft-<your role>.md" "draft-<role>.md"])
+            (distinct (map :role rows)))))
 
 (defn write-prompt!
-  "prompts/<role>.md: the role header, the constitution, the stage prompt."
-  [ctx roles row]
+  "prompts/<session>.md: the session header, the constitution, the stage prompt.
+
+   The stage prompt is the ROLE's — every repo gets the same instructions for
+   what implement or review means; only the header and the draft names differ."
+  [ctx rows row]
   (fs/create-dirs (:prompts-dir ctx))
-  (let [file (fs/path (:prompts-dir ctx) (str (:role row) ".md"))]
+  (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))]
     (spit (str file)
-          (str (role-header ctx roles row)
-               (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
-               "\n## Stage: " (:role row) "\n\n"
-               (stage-prompt (:role row))))
+          (str (role-header ctx rows row)
+               (own-drafts (str (slurp (str (fs/path prompts-src-dir "constitution.prompt")))
+                                "\n## Stage: " (:role row) "\n\n"
+                                (stage-prompt (:role row)))
+                           rows row)))
     file))
 
 ;; ---------------------------------------------------------------- hooks
@@ -212,20 +262,51 @@
 (def hook-settings
   "The settings a claude role loads via --settings: the contract hook on
    SessionStart (startup, resume, compact) and on every file or shell tool, and
-   the goal judge on Stop."
+   the goal judge on Stop.
+
+   HOOKS ONLY, and that is a constraint rather than a coincidence. `--settings`
+   has two precedence rules, both measured against the real CLI:
+
+     hook arrays   union — every file's hooks run, whatever the order
+     scalar keys   the FIRST --settings wins
+
+   RAN, two files setting the same `env` key, with a third carrying the observer
+   so only the order varied:
+
+     --settings A --settings B --settings C   ->  SK_PROBE=AAA
+     --settings B --settings A --settings C   ->  SK_PROBE=BBB
+
+   A lane passes its own --settings and appends ours (`lane_exec … \"$@\"`), so
+   ours is always LAST — and last loses for anything that is not a hook. Put a
+   scalar in here and the lane's value silently wins on a lane harness while
+   yours applies everywhere else, which is the worst shape a bug can have. If a
+   role ever needs a non-hook setting, it goes on the argv, not in this file."
   {:hooks {:SessionStart [{:hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :PreToolUse [{:matcher "Edit|Write|MultiEdit|NotebookEdit|Bash"
                          :hooks [{:type "command" :command contract-hook :timeout 10}]}]
            :Stop [{:hooks [{:type "command" :command goal-judge :timeout 180}]}]}})
 
-(defn write-hook-settings! [ctx row]
+(defn write-hook-settings!
+  "This session's own settings, and only its own.
+
+   Settings files MERGE — measured against the real CLI, not assumed:
+
+     claude --settings A --settings B   both files' SessionStart hooks fire,
+                                        in either order
+
+   So a lane's file and this one both apply, and copying the lane's hooks in
+   here would only make this file lie about whose hooks they are. Two flags do
+   NOT merge and are last-wins, which is why the argv still appends them:
+   `--append-system-prompt-file` and `--model`."
+  [ctx row]
   (fs/create-dirs (:hooks-dir ctx))
-  (let [file (fs/path (:hooks-dir ctx) (str (:role row) ".settings.json"))]
+  (let [file (fs/path (:hooks-dir ctx) (str (:session row) ".settings.json"))]
     (spit (str file) (json/generate-string hook-settings {:pretty true}))
     file))
 
 (defn start-text [ctx row]
-  (str "You are role " (:role row) " in task " (:task-id ctx) ". Read " (:goal-file ctx) " and " (:metrics-file ctx)
+  (str "You are role " (:role row) " working in " (:repo row) " (session " (:session row)
+       ") of task " (:task-id ctx) ". Read " (:goal-file ctx) " and " (:metrics-file ctx)
        ", then run ready_for_next.bb and follow its output."))
 
 ;; ---------------------------------------------------------------- launch
@@ -246,14 +327,22 @@
         message (if (= mode :interactive) (start-text ctx row) text)
         prompt-text (slurp (str prompt))
         led (str prompt-text "\n\n" message)
-        name (str "sk " (:role row))]
+        name (str "sk " (:session row))]
     (vec
-     (case (:harness row)
+     (case (if (task-lib/lane-agents (:harness row)) "claude" (:harness row))
+       ;; A lane script execs claude with its own flags and appends ours, and
+       ;; the parser takes the last occurrence — so this same argv, handed to a
+       ;; lane, inherits the lane's model, effort, MCP set and SSO wrap while
+       ;; still overriding the three flags the swarm has to own.
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
                         ["--append-system-prompt-file" (str prompt)
-                         "--settings" (str (write-hook-settings! ctx row))
-                         "--permission-mode" "bypassPermissions"]
+                         "--settings" (str (write-hook-settings! ctx row))]
+                        ;; A lane already declares its own permission posture —
+                        ;; cc_auto bypasses, cc_control screens — and restating
+                        ;; ours would collapse the two into one choice.
+                        (when-not (task-lib/lane-agents (:harness row))
+                          ["--permission-mode" "bypassPermissions"])
                         (when (= mode :interactive) ["-n" name])
                         extra
                         ["--" message])
@@ -268,26 +357,28 @@
 
 (defn launch-script [ctx row prompt]
   (str "#!/bin/bash\n"
-       "# swarmkhazad launch for role " (:role row) " of task " (:task-id ctx) " — generated by open\n"
+       "# swarmkhazad launch for session " (:session row) " of task " (:task-id ctx) " — generated by open\n"
        "export SWARMFORGE_ROLE=" (sq (:role row)) "\n"
+       "export SWARMKHAZAD_SESSION=" (sq (:session row)) "\n"
+       "export SWARMKHAZAD_REPO=" (sq (str (:repo row))) "\n"
        "export SWARMKHAZAD_TASK_ID=" (sq (:task-id ctx)) "\n"
        "export SWARMKHAZAD_TASK_DIR=" (sq (:task-dir ctx)) "\n"
        "export PATH=" (sq (str (:bin-dir ctx))) ":" (sq (str script-dir)) ":\"$PATH\"\n"
        "cd " (sq (:worktree-path row)) " || exit 1\n"
        "exec " (str/join " " (map sq (harness-argv ctx row (shim-path ctx (:harness row)) prompt :interactive nil))) "\n"))
 
-(defn launch-role!
-  "Write prompts/<role>.launch.sh and type `bash <path>` into the role's pane.
+(defn launch-session!
+  "Write prompts/<session>.launch.sh and type `bash <path>` into its pane.
    The command itself is typed, not the launch: a tty still in canonical mode
    (zsh not yet up) drops everything past 1024 bytes, and a full launch line with
    temp-dir paths is longer than that (RAN: the pane showed a truncated command
    and no launch)."
-  [ctx roles row]
-  (let [prompt (write-prompt! ctx roles row)
-        script (fs/path (:prompts-dir ctx) (str (:role row) ".launch.sh"))]
+  [ctx rows row]
+  (let [prompt (write-prompt! ctx rows row)
+        script (fs/path (:prompts-dir ctx) (str (:session row) ".launch.sh"))]
     (spit (str script) (launch-script ctx row prompt))
     (fs/set-posix-file-permissions script "rwxr-xr-x")
-    (tmux! ctx "send-keys" "-t" (task-lib/session-name (:role row)) (str "bash " (sq script)) "Enter")
+    (tmux! ctx "send-keys" "-t" (task-lib/session-name (:session row)) (str "bash " (sq script)) "Enter")
     (str script)))
 
 ;; ---------------------------------------------------------------- board + mail
@@ -346,56 +437,64 @@
 ;; ---------------------------------------------------------------- open / close
 
 (defn open!
-  "Open the swarm for task-id. Returns the ctx plus :roles and :commands."
+  "Open the swarm for task-id. Returns the ctx plus :sessions and :commands.
+
+   The board card is a ROLE's — a lane is a stage of the work, and a role
+   working three repos is still in one stage. The opening note is a SESSION's,
+   because mail is delivered to a pane."
   [task-id]
   (let [ctx (task-lib/task-ctx task-id)
-        {:keys [roles]} (task-lib/prepare! ctx)]
+        {:keys [roles repos sessions]} (task-lib/prepare! ctx)]
     (check-dependencies!)
     (resolve-harnesses! ctx roles)
     (stop-handoffd! ctx)
     (kill-server! ctx)
-    (boot-sessions! ctx roles)
+    (boot-sessions! ctx sessions)
     (write-shims! ctx)
     (lock-truth! ctx)
-    (trust-worktrees! ctx roles)
+    (trust-worktrees! ctx sessions)
     (when-not (board-lib/card-lane ctx task-id)
-      (board-lib/create-card! ctx task-id (:role (first roles)))
-      (queue-new-task-note! ctx (:role (first roles))))
+      (board-lib/create-card! ctx task-id (:role (first sessions)))
+      (queue-new-task-note! ctx (:session (first sessions))))
     (start-handoffd! ctx)
-    (assoc ctx :roles roles :commands (mapv #(launch-role! ctx roles %) roles))))
+    (assoc ctx :roles roles :repos repos :sessions sessions
+           :commands (mapv #(launch-session! ctx sessions %) sessions))))
 
 ;; ---------------------------------------------------------------- smoke
 
 (defn smoke-prompt
-  "The smoke asks the role to note itself: a one-role task has no other recipient."
-  [ctx role]
-  (str "Smoke test for role " role ". Do exactly these steps and nothing else.\n"
+  "The smoke asks the session to note itself: a one-session task has no other
+   recipient."
+  [ctx session]
+  (str "Smoke test for session " session ". Do exactly these steps and nothing else.\n"
        "1. Read " (:goal-file ctx) " (one Read call).\n"
-       "2. Write the file " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) " with exactly these four lines:\n"
-       "type: note\nto: " role "\npriority: 50\nmessage: smoke from " role "\n"
-       "3. Run: swarm_handoff.bb " (fs/path (:tmp-dir ctx) (str "smoke-" role ".txt")) "\n"
+       "2. Write the file " (fs/path (:tmp-dir ctx) (str "smoke-" session ".txt")) " with exactly these four lines:\n"
+       "type: note\nto: " session "\npriority: 50\nmessage: smoke from " session "\n"
+       "3. Run: swarm_handoff.bb " (fs/path (:tmp-dir ctx) (str "smoke-" session ".txt")) "\n"
        "4. Reply with the single line HANDOFF_OK if that command printed HANDOFF QUEUED, else the error text."))
 
 (defn smoke-note
-  "The note this role's smoke queued, if any."
-  [ctx role]
+  "The note this session's smoke queued, if any."
+  [ctx session]
   (some (fn [f]
           (let [h (:headers (handoff-lib/parse-message f))]
-            (when (and (= "note" (get h "type")) (= role (get h "from"))
+            (when (and (= "note" (get h "type")) (= session (get h "from"))
                        (str/starts-with? (or (get h "message") "") "smoke from"))
               f)))
-        (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx role))))
+        (handoff-lib/handoff-files (handoff-lib/outbox-dir ctx session))))
 
 (defn smoke-role!
-  "Launch, read goal.md, send one note, exit clean — through the role's shim."
-  [ctx roles row]
-  (let [role (:role row)
-        prompt (write-prompt! ctx roles row)
+  "Launch, read goal.md, send one note, exit clean — through the shim."
+  [ctx rows row]
+  (let [role (:session row)
+        prompt (write-prompt! ctx rows row)
         argv (harness-argv ctx row (shim-path ctx (:harness row)) prompt :smoke (smoke-prompt ctx role))
         started (System/currentTimeMillis)
         p (process/process argv {:dir (:worktree-path row)
                                  :out :string :err :string
-                                 :extra-env {"SWARMFORGE_ROLE" role
+                                 :extra-env {"SWARMFORGE_ROLE" (:role row)
+                                             "SWARMKHAZAD_SESSION" (:session row)
+                                             "SWARMKHAZAD_REPO" (str (:repo row))
                                              "SWARMKHAZAD_TASK_ID" (:task-id ctx)
                                              "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))
                                              "PATH" (str (:bin-dir ctx) ":" script-dir ":" (System/getenv "PATH"))}})
@@ -410,31 +509,94 @@
                  (or (nil? expected) (some #{expected} models))
                  (or (not= "claude" (:harness row)) (some? json-out)))]
     (when note (fs/delete note))
-    {:role role :harness (:harness row) :vendor (:model row) :ok ok?
+    {:role role :repo (:repo row) :harness (:harness row) :vendor (:model row) :ok ok?
      :exit (:exit result) :seconds (quot (- (System/currentTimeMillis) started) 1000)
      :models models :expected expected :note (some? note)
      :cost (get json-out "total_cost_usd") :turns (get json-out "num_turns")
      :detail (when-not ok? (str/trim (str (:err result) "\n" (subs (or (:out result) "") 0 (min 600 (count (or (:out result) "")))))))}))
 
 (defn smoke!
-  "Prepare the task (no tmux, no daemon) and smoke every declared role, in parallel."
+  "Prepare the task (no tmux, no daemon) and smoke every declared role.
+
+   One session per role, not every session: the smoke proves harness
+   resolution, the vendor pin and the mail round-trip, none of which vary by
+   repo — and a role over four repos would otherwise pay for four launches to
+   learn the same thing once."
   [task-id]
   (let [ctx (task-lib/task-ctx task-id)
-        {:keys [roles]} (task-lib/prepare! ctx)]
+        {:keys [roles sessions]} (task-lib/prepare! ctx)
+        one-each (mapv #(first (filter (fn [r] (= (:role %) (:role r))) sessions)) roles)]
     (check-dependencies!)
     (resolve-harnesses! ctx roles)
     (write-shims! ctx)
-    (doall (pmap #(smoke-role! ctx roles %) roles))))
+    (doall (pmap #(smoke-role! ctx sessions %) one-each))))
+
+(defn pushed?
+  "Whether the source already has this branch on its remote, at the same commit.
+
+   The one question worth asking before deleting a worktree: work that is on
+   origin can be got back, and work that is not cannot. A task that shipped
+   answers yes for every repo, which is the case task.md §10 describes."
+  [source branch]
+  (let [remote (str "refs/remotes/origin/" branch)]
+    (boolean (and (task-lib/git-ok? source "rev-parse" "--verify" "--quiet" (str remote "^{commit}"))
+                  (= (task-lib/git source "rev-parse" (str remote "^{commit}"))
+                     (task-lib/git source "rev-parse" (str branch "^{commit}")))))))
+
+(defn reclaim!
+  "Give the disk back: clean each worktree, remove it, drop the task branch from
+   the source it was added to. Returns a line per repo, for the caller to print.
+
+   This is where the space is. A worktree is a checkout, and a checkout that has
+   built anything is mostly untracked build output — 6.4G across three of them
+   in the task that started all this, none of it in git. Nothing else removes
+   it: `reap` only fires on tasks whose folder is already gone, so a task folder
+   that is kept for its notes keeps three checkouts alive with it.
+
+   A worktree holding commits the source's remote has never seen is KEPT, and
+   said so, because that is also what an unpushed day of work looks like. Same
+   rule reap uses, and `--force` is the same override."
+  [ctx force?]
+  (let [rows (task-lib/read-sessions-tsv ctx)
+        branch (task-lib/task-branch ctx)
+        by-repo (into {} (for [r rows :when (:repo r)] [(:repo r) r]))
+        sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
+                           [(:name r) (:path r)]))]
+    (vec
+     (for [[repo row] (sort by-repo)
+           :let [worktree (:worktree-path row)
+                 source (get sources repo)]]
+       (cond
+         (not (and worktree (fs/directory? worktree)))
+         (str "  " repo ": already gone")
+
+         (and source (not force?) (not (pushed? source branch)))
+         (str "  " repo ": kept — " branch " is not on origin; --force to remove it anyway")
+
+         :else
+         (do
+           ;; `worktree remove` refuses a tree with untracked files in it, and a
+           ;; worktree that has built anything is nothing but untracked files.
+           (process/sh {:continue true :dir (str worktree)} "git" "clean" "-xdf")
+           (process/sh {:continue true :dir (str worktree)} "git" "worktree" "remove" "--force" (str worktree))
+           (when (fs/directory? worktree) (fs/delete-tree worktree))
+           (when source
+             (process/sh {:continue true :dir (str source)} "git" "worktree" "prune")
+             (process/sh {:continue true :dir (str source)} "git" "branch" "-D" branch))
+           (str "  " repo ": worktree removed, " branch " deleted from " (or source "its source"))))))))
 
 (defn close!
   "Tear the swarm down: archive panes, stop the daemon, kill the tmux server,
-   drop the trust entries open added."
-  [task-id]
-  (let [ctx (task-lib/task-ctx task-id)]
-    (when (server-up? ctx)
-      (handoff-lib/archive-all! ctx))
-    (stop-handoffd! ctx)
-    (kill-server! ctx)
-    (when (fs/regular-file? (:roles-tsv ctx))
-      (untrust-worktrees! ctx (task-lib/read-roles-tsv ctx)))
-    ctx))
+   drop the trust entries open added. With `reclaim?`, also give the disk back."
+  ([task-id] (close! task-id false false))
+  ([task-id reclaim? force?]
+   (let [ctx (task-lib/task-ctx task-id)]
+     (when (server-up? ctx)
+       (handoff-lib/archive-all! ctx))
+     (stop-handoffd! ctx)
+     (kill-server! ctx)
+     (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
+     (when reclaim?
+       (println "reclaiming:")
+       (doseq [line (reclaim! ctx force?)] (println line)))
+     ctx)))

@@ -21,6 +21,12 @@
 (load-file (str (fs/path script-dir "task_lib.bb")))
 (load-file (str (fs/path script-dir "ask.bb")))
 
+(def merge-order-heading
+  "The section ship reads its order from. One name, in one place: the prompt
+   asks for this heading and ship parses this heading, so a rename cannot
+   leave the two disagreeing about a section that then silently goes missing."
+  "Merge order")
+
 (def diff-budget 60000)
 (def file-budget 12000)
 
@@ -72,8 +78,10 @@
    so: a missing decision.md and an unread one look identical otherwise, and the
    answer leans on which it was."
   [ctx]
-  (let [roles (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) [])
-        per-role (int (max 4000 (quot diff-budget (max 1 (count roles)))))
+  (let [repos (->> (task-lib/read-sessions-tsv ctx)
+                   (keep (fn [r] (when (:worktree-path r) [(or (:repo r) "?") (:worktree-path r)])))
+                   distinct)
+        per-repo (int (max 4000 (quot diff-budget (max 1 (count repos)))))
         section (fn [title body] (str "## " title "\n" (or (not-empty (str/trim (str body))) "(none)") "\n\n"))]
     (str
      (section "goal.md" (read-file (:goal-file ctx) file-budget))
@@ -81,10 +89,16 @@
      (section "decision.md — what the roles chose, and why" (read-file (:decision-file ctx) file-budget))
      (section "gotcha.md — what tripped them" (read-file (:gotcha-file ctx) file-budget))
      (section "escalation.md — what they say needs a human" (read-file (:escalation-file ctx) file-budget))
+     ;; Splitting findings out of escalation.md took them away from the only
+     ;; reader that weighs them before a merge. Ten of gobel's 22 escalation
+     ;; lines were findings; a verdict that cannot see them is reading half the
+     ;; task's own notes.
+     (section "finding.md — what they established that nobody asked for" (read-file (:finding-file ctx) file-budget))
      (section "evidence — each bar's own output" (evidence-section ctx))
-     (str/join "" (for [{:keys [role worktree-path repo]} roles]
-                    (section (str "diff — role " role " in " (task-lib/repo-name (or repo "?")))
-                             (worktree-diff worktree-path per-role)))))))
+     ;; One diff per repo, not per session: roles sharing a repo share its
+     ;; worktree, so a per-session loop would print the same diff twice.
+     (str/join "" (for [[repo worktree] repos]
+                    (section (str "diff — " repo) (worktree-diff worktree per-repo)))))))
 
 (def system-prompt
   (str
@@ -121,6 +135,15 @@
    "the reason, not a finding.\n"
    "- Treat gotcha.md as known. Do not report something the roles already wrote "
    "down and worked around.\n\n"
+   "## Per repo\n"
+   "One line per repo you were given a diff for, `<repo>: <verdict> — <why>`, "
+   "using the same verdict words as above. A repo whose diff is empty says "
+   "`no change`. Skip this section entirely when there is only one repo.\n\n"
+   "## " merge-order-heading "\n"
+   "The repos, one per line, in the order they must merge, each `<repo> — "
+   "<why it goes here>`. Name every repo that has a diff, even when the order "
+   "does not matter — say so as the reason. A repo that depends on another "
+   "merges after it. Skip this section entirely when there is only one repo.\n\n"
    "## Risk\n"
    "What could go wrong if this merges as it stands. Blast radius: who else "
    "moves with this change, what breaks if it is wrong, and how it is noticed. "

@@ -115,8 +115,11 @@
         (is (denied? (edit task "Write" (str task "/metrics.md"))))
         (is (denied? (edit task "MultiEdit" "goal.md")) "relative to the tool cwd")
         (is (denied? (edit task "Edit" (str task "/../t-hook/goal.md"))) "dot-dot path")
-        (is (allowed? (edit task "Edit" (str task "/decision.md"))))
-        (is (allowed? (edit task "Write" (str task "/draft-implement.md"))))
+        (is (denied? (edit task "Edit" (str task "/decision.md")))
+            "the bullet files are note.bb's to write — the tag and the format come from it")
+        (is (denied? (edit task "Write" (str task "/finding.md"))))
+        (is (allowed? (edit task "Write" (str task "/draft-implement.md")))
+            "a role's own write-up is its own to edit")
         (is (allowed? (edit task "Edit" (str sandbox "/elsewhere/goal.md"))) "a goal.md outside the task is not ours")
         (is (str/includes? (get-in (:json (edit task "Edit" (str task "/goal.md"))) ["hookSpecificOutput" "permissionDecisionReason"])
                            "escalation.md line")))
@@ -132,19 +135,279 @@
                      (str "rm -f " task "/goal.md")
                      (str "python3 -c \"open('" task "/goal.md','w').write('x')\"")]]
           (is (denied? (bash task task cmd)) cmd)))
+      (testing "the bullet files are locked in bash too, or the lock has a hole the shell walks through"
+        (doseq [cmd ["printf -- '- **x** — y\\n' >> decision.md"
+                     "chmod 644 escalation.md"
+                     (str "echo x > " task "/finding.md")
+                     (str "python3 -c \"open('" task "/gotcha.md','a').write('x')\"")]]
+          (is (denied? (bash task task cmd)) cmd))
+        (is (str/includes? (get-in (:json (bash task task "printf x >> decision.md"))
+                                   ["hookSpecificOutput" "permissionDecisionReason"])
+            "note.bb")
+            "and the denial says what to run instead"))
       (testing "bash reads and unrelated commands pass"
         (doseq [cmd [(str "cat " task "/goal.md 2>/dev/null")
                      "grep -c '^- \\[ \\]' goal.md"
                      "sed -n 1,5p metrics.md"
-                     "printf -- '- **x** — y\\n' >> decision.md"
-                     "chmod 644 escalation.md"
+                     "cat decision.md"
+                     "grep -c FIND finding.md"
                      "git status --short"]]
           (is (allowed? (bash task task cmd)) cmd))
         (is (allowed? (bash task sandbox "echo x > goal.md")) "a goal.md in some other cwd is not ours"))
-      (testing "denials are logged under the task's state"
+      (testing "denials are logged under the task's state, with the reason that fired"
         (let [log (fs/path task "state" "denials.jsonl")]
           (is (fs/regular-file? log))
-          (let [entry (json/parse-string (last (str/split-lines (slurp (str log)))))]
-            (is (= "implement" (get entry "role")))
-            (is (= "Bash" (get entry "tool")))
-            (is (str/includes? (get entry "reason") "truth"))))))))
+          (let [entries (mapv #(json/parse-string %) (str/split-lines (slurp (str log))))
+                reasons (mapv #(get % "reason") entries)]
+            (is (every? #(= "implement" (get % "role")) entries))
+            (is (some #(str/includes? % "truth") reasons) "the truth denials are logged")
+            (is (some #(str/includes? % "note.bb") reasons) "and so are the bullet-file ones")
+            (is (some #(= "Bash" (get % "tool")) entries))
+            (is (some #(= "Edit" (get % "tool")) entries))))))))
+
+(deftest the-truth-lock-holds-against-the-three-ways-round-it
+  ;; `chmod 444` alone only stops a plain write; this hook is what stops the
+  ;; chmod. Each case below defeated it, and each is what a role that cannot
+  ;; meet a bar is most motivated to try.
+  (with-task
+    (fn [task sandbox]
+      (session-start task)
+      (testing "a name split by quotes is the name the shell will open"
+        ;; The pre-filter and the match both read the raw word, so `go""al.md`
+        ;; was a file the guard had never heard of. One word to the shell.
+        (doseq [cmd ["chmod 644 go\"\"al.md"
+                     "chmod 644 'goal'.md"
+                     ;; Relative, so the command names neither the task dir nor
+                     ;; any spelling the pre-filter recognises — the only thing
+                     ;; standing between this and the file is the pre-filter
+                     ;; reading the command with its quotes removed.
+                     (str "chmod 644 " task "/go\"\"al.md")
+                     (str "chmod 644 " task "/'goal'.md")
+                     (str "rm -f " task "/met\"\"rics.md")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a tool the denylist never heard of is not therefore a reader"
+        ;; patch, ed, ex, sh — none were on the mutating-verb list, and all of
+        ;; them rewrite a file. The list is an allowlist of READERS now, so the
+        ;; next tool nobody thought of denies instead of passing.
+        (doseq [cmd [(str "patch " task "/goal.md < /tmp/p.diff")
+                     (str "printf '1d\nw\n' | ed -s " task "/goal.md")
+                     (str "ex -sc '1d|x' " task "/goal.md")
+                     (str "sh -c 'echo x > " task "/goal.md'")
+                     (str "install -m 644 /dev/null " task "/metrics.md")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a symlink beside the truth is the truth"
+        ;; Only the DIRECTORY was canonicalized, so `notes.md -> goal.md` was an
+        ;; unknown name in a trusted directory. Three allowed operations —
+        ;; chmod the link, write the link — rewrote the acceptance criteria.
+        (let [link (str task "/notes.md")]
+          (fs/create-sym-link link (str task "/goal.md"))
+          (is (denied? (bash task task (str "chmod 644 " link))))
+          (is (denied? (bash task task (str "printf zzz > " link))))
+          (is (denied? (edit task "Write" link)))
+          (is (denied? (edit task "Edit" "notes.md")) "relative to the tool cwd, too")
+          (fs/delete link))
+        (let [link (str task "/notes.md")]
+          (fs/create-sym-link link (str task "/decision.md"))
+          (is (denied? (edit task "Write" link))
+              "the bullet files are note.bb's to write, by whatever name they are reached")
+          (fs/delete link)))
+      (testing "and the reads the contract promises still pass"
+        ;; The failure mode of an allowlist is over-denial, and a guard that
+        ;; denies `grep bar metrics.md` is a guard someone switches off. Tested
+        ;; on the arguments that look most like commands: a grep pattern and a
+        ;; sed range.
+        (doseq [cmd [(str "grep -n 'bar:' " task "/metrics.md")
+                     (str "sed -n '1,5p' " task "/goal.md")
+                     (str "awk '/Goal/{print}' " task "/goal.md")
+                     (str "cat " task "/goal.md | wc -l")
+                     (str "diff " task "/goal.md " task "/metrics.md")
+                     (str "head -20 " task "/goal.md")
+                     "note.bb escalation 'a claim' 'a why'"]]
+          (is (allowed? (bash task task cmd)) cmd))
+        (is (allowed? (bash task sandbox "patch elsewhere/goal.md < /tmp/p.diff"))
+            "and a goal.md outside the task is still not ours")))))
+
+(deftest the-truth-lock-holds-against-three-more-found-by-probing-for-them
+  ;; sec3's three were not the whole set. These came from asking what else
+  ;; reaches a file without spelling its name the way the guard expects.
+  (with-task
+    (fn [task sandbox]
+      (session-start task)
+      (testing "every spelling of the variable the shell would expand"
+        ;; Only `$SWARMKHAZAD_TASK_DIR` and `${SWARMKHAZAD_TASK_DIR}` were
+        ;; substituted, so the default- and error-forms — which expand to the
+        ;; same directory — resolved to a path outside the task. RAN, allowed.
+        (doseq [cmd ["chmod 644 ${SWARMKHAZAD_TASK_DIR:-}/goal.md"
+                     "chmod 644 ${SWARMKHAZAD_TASK_DIR:?}/metrics.md"
+                     "rm -f ${SWARMKHAZAD_TASK_DIR}/goal.md"
+                     "rm -f $SWARMKHAZAD_TASK_DIR/goal.md"]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "a path this cannot see until the shell builds it"
+        ;; The substitution has not run, so the word scan sees `/goal.md` — not
+        ;; a path in the task dir — and nothing matched. A command that reaches
+        ;; into the task folder AND builds a path is treated as naming the truth
+        ;; rather than assumed innocent.
+        (doseq [cmd [(str "chmod 644 $(echo " task ")/goal.md")
+                     (str "chmod 644 `echo " task "`/goal.md")
+                     "rm -f $(printf %s ${SWARMKHAZAD_TASK_DIR})/metrics.md"]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "tools that can write are not readers, however ordinary they look"
+        ;; `git` and `bb` were on the reader allowlist and both write:
+        ;; `git checkout -- goal.md` restores the file over itself.
+        (doseq [cmd [(str "git -C " task " checkout -- goal.md")
+                     (str "bb -e '(spit \"" task "/goal.md\" \"x\")'")
+                     (str "echo " task "/goal.md | xargs chmod 644")
+                     (str "find " task " -name goal.md -exec chmod 644 {} +")]]
+          (is (denied? (bash task task cmd)) cmd)))
+      (testing "and the work a role actually does is untouched"
+        ;; The whole risk of an allowlist is over-denial, and scratch under
+        ;; tmp/ plus the role's own draft are what a role writes all day.
+        (doseq [cmd ["printf x > $SWARMKHAZAD_TASK_DIR/tmp/draft.txt"
+                     "rm -rf $SWARMKHAZAD_TASK_DIR/tmp/draft.txt"
+                     (str "mkdir -p " task "/tmp/work")
+                     (str "printf x > " task "/draft-implement.md")
+                     (str "git -C " sandbox " status --short")]]
+          (is (allowed? (bash task task cmd)) cmd)))
+      (testing "a hard link is the same file, by whatever name"
+        ;; The reach `follow_link` cannot see: not a symlink, and named whatever
+        ;; its maker chose. `stat` tells them apart. Closed at both ends —
+        ;; nothing in a task can make one, AND an existing one is recognised.
+        (doseq [cmd [(str "ln " task "/goal.md " task "/hard.md")
+                     "ln goal.md hard.md"
+                     (str "cp -l " task "/goal.md " task "/hard.md")
+                     (str "link " task "/metrics.md " task "/hard.md")]]
+          (is (denied? (bash task task cmd)) cmd))
+        (let [hard (str task "/hard.md")]
+          ;; Made outside the hook, which is the only way it can exist.
+          (process/sh "ln" (str task "/goal.md") hard)
+          (is (denied? (edit task "Write" hard))
+              "a Write here rewrites goal.md, and the name gives nothing away")
+          (is (denied? (bash task task (str "chmod 644 " hard))))
+          (is (denied? (bash task task "printf x > hard.md")) "relative, too")
+          (fs/delete hard))
+        (let [hard (str task "/hardnote.md")]
+          (process/sh "ln" (str task "/decision.md") hard)
+          (is (denied? (edit task "Write" hard)) "and the bullet files the same way")
+          (fs/delete hard)))
+      (testing "a cd the hook cannot resolve does not move the truth out of reach"
+        ;; Relative paths resolve against the cwd the TOOL CALL reported, and a
+        ;; cd inside the command changes what they mean. A literal target the
+        ;; hook can resolve was fine; `$SWARMKHAZAD_HOME/tasks/$SWARMKHAZAD_TASK_ID`
+        ;; and a variable were not. RAN, both allowed.
+        (doseq [cmd ["cd $SWARMKHAZAD_TASK_DIR/../t-hook && chmod 644 goal.md"
+                     "D=$SWARMKHAZAD_TASK_DIR; cd $D; sed -i \"\" s/a/b/ goal.md"
+                     (str "cd " task " && chmod 644 goal.md")
+                     ;; Denied before this change too, but only because the
+                     ;; hook's own unquoted `for w in $cmd` expanded the glob
+                     ;; against the same disk — luck, not understanding.
+                     (str "cd " task " && chmod 644 goa?.md")
+                     (str "cd " task " && printf x >> decision.md")
+                     ;; Joined to the operator, which is a different word to the
+                     ;; scanner: `>>decision.md` is one token, so the previous
+                     ;; word is `printf` and the redirect has to be read off the
+                     ;; token itself.
+                     (str "cd " task " && printf x >>decision.md")
+                     (str "cd " task " && printf x >goal.md")]]
+          (is (denied? (bash task sandbox cmd)) cmd))
+        (testing "and reading after a cd is still reading"
+          ;; `cd` is not a writer. Denying `cd <task> && cat goal.md` is exactly
+          ;; the over-denial that gets a guard switched off — it was denied by
+          ;; the first version of this rule, because `cd` was not on the reader
+          ;; allowlist.
+          (doseq [cmd [(str "cd " task " && cat goal.md")
+                       (str "cd " task " && grep -n 'bar:' metrics.md")
+                       (str "cd " task " && head -5 goal.md")]]
+            (is (allowed? (bash task sandbox cmd)) cmd)))))))
+
+(defn tool-call
+  "A PreToolUse payload for any tool name and any tool_input shape — `edit` and
+   `bash` above only build the shapes the hook knows by name, which is exactly
+   the assumption under test."
+  [task-dir tool input]
+  (fire task-dir {} {"hook_event_name" "PreToolUse" "tool_name" tool
+                     "cwd" (str task-dir) "tool_input" input}))
+
+(deftest a-tool-this-hook-has-never-heard-of-does-not-get-a-free-pass
+  ;; The tool dispatch named the writers — Edit, Write, MultiEdit, NotebookEdit,
+  ;; Bash — and waved everything else through before looking at a path. The same
+  ;; denylist mistake as the verb list, one level up, and a live one: roles load
+  ;; the operator's whole ~/.claude.json, so a filesystem MCP server is a tool
+  ;; that exists. RAN: `mcp__fs__write` with the path nested under
+  ;; `tool_input.edits[0].path` was allowed without the path being read once.
+  (with-task
+    (fn [task _]
+      (session-start task)
+      (testing "an MCP write is asked the same question the file tools are asked"
+        (is (denied? (tool-call task "mcp__fs__write"
+                                {"edits" [{"path" (str task "/goal.md") "new" "x"}]}))
+            "nested two levels deep, and found without a schema for this tool")
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/metrics.md")})))
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/decision.md")}))
+            "the bullet files too — note.bb is the writer whatever tool is asking")
+        (is (denied? (tool-call task "ApplyPatch" {"target" "goal.md"}))
+            "relative to the tool cwd, like everywhere else")
+        (is (denied? (tool-call task "mcp__fs__write" {"path" (str task "/../t-hook/goal.md")}))))
+      (testing "and the reads the contract promises still pass"
+        ;; The catch-all can be strict only because the readers are named. A
+        ;; role must always be able to read its own truth.
+        (is (allowed? (tool-call task "Read" {"file_path" (str task "/goal.md")})))
+        (is (allowed? (tool-call task "Grep" {"pattern" "bar" "path" (str task "/metrics.md")})))
+        (is (allowed? (tool-call task "Glob" {"pattern" (str task "/*.md")})))
+        (is (allowed? (tool-call task "mcp__linear-server__get_issue" {"id" "MITH-1"}))
+            "and an unrelated MCP call names nothing of ours")
+        (is (allowed? (tool-call task "mcp__fs__write" {"path" (str task "/draft-implement.md")}))
+            "a role's own write-up is its own to write, by any tool")))))
+
+
+(deftest the-guard-does-not-deny-the-swarms-own-mail-loop
+  ;; Found in the first live run, not by any test here: twelve denials in two
+  ;; minutes, all of them the same command.
+  ;;
+  ;;   cd <task> && ls -la && ready_for_next.bb 2>&1
+  ;;   -> "goal.md and metrics.md are the task's truth (chmod 444)…"
+  ;;
+  ;; That is the mail loop — the single most common command in the system, and
+  ;; the first thing every role runs. Two independent causes, both of which
+  ;; produce a denial that reads as the truth-lock working:
+  ;;
+  ;;   1. The reader allowlist named `note.bb` and none of the other helpers,
+  ;;      so a role could write a bullet but not collect its own mail.
+  ;;   2. The pipeline split is on `|;&`, so `ready_for_next.bb 2>&1` arrives as
+  ;;      TWO segments and the second one's first word is the file descriptor
+  ;;      `1`. Read as a command name, `1` is on no allowlist.
+  ;;
+  ;; An over-denial is not a safe failure here: it stops the swarm dead while
+  ;; looking exactly like the guard doing its job.
+  (with-task
+    (fn [task _]
+      (session-start task)
+      (testing "the exact command the live run denied"
+        (is (allowed? (bash task task (str "cd " task " && ls -la && ready_for_next.bb 2>&1")))))
+      (testing "every helper a role is told to run"
+        (doseq [c ["ready_for_next.bb"
+                   "done_with_current.bb"
+                   "swarm_handoff.bb tmp/draft.txt"
+                   "run_evidence.bb"
+                   "goal_judge.bb"
+                   "note.bb finding 'a claim' 'a why'"]]
+          (is (allowed? (bash task task (str "cd " task " && " c)))
+              (str "helper denied: " c))))
+      (testing "a redirect is not a command name"
+        ;; Each of these splits on `&` or leaves a `>`-leading token where the
+        ;; head-word scan looks for a command.
+        (is (allowed? (bash task task "ready_for_next.bb 2>&1")))
+        (is (allowed? (bash task task "ready_for_next.bb > /tmp/out.txt 2>&1")))
+        (is (allowed? (bash task task "cat goal.md 2>&1 | head -3")))
+        (is (allowed? (bash task task "ls -la 1>&2"))))
+      (testing "and the lock still holds against every way round it"
+        ;; The reason this test exists is that widening an allowlist is exactly
+        ;; how a guard is quietly turned off. Each of these was a kill in the
+        ;; mutation run and must stay one.
+        (is (denied? (bash task task (str "cd " task " && chmod 644 goal.md"))))
+        (is (denied? (bash task task (str "cd " task " && sed -i '' s/a/b/ goal.md"))))
+        (is (denied? (bash task task (str "cd " task " && echo x >> escalation.md"))))
+        (is (denied? (bash task task (str "cd " task " && patch goal.md < /tmp/p.diff"))))
+        (is (denied? (bash task task (str "ready_for_next.bb 2>&1 && chmod 644 " task "/goal.md")))
+            "a redirect earlier in the line does not buy the rest of it a pass")
+        (is (denied? (bash task task (str "cd " task " && ready_for_next.bb > goal.md")))
+            "an allowed reader is still not allowed to redirect over the truth"))))) 

@@ -109,12 +109,9 @@
   (str/lower-case issue-key))
 
 (defn write-from-issue!
-  "Write the task's goal.md and roles from an already-fetched issue."
+  "Write the task's goal.md, roles and repos from an already-fetched issue."
   [ctx issue repos]
   (spit (str (:goal-file ctx)) (goal-md (:task-id ctx) issue))
-  (spit (str (:roles-file ctx))
-        (str task-lib/roles-grammar-comment
-             (if (seq repos)
-               (str/join "" (for [r repos] (str "implement claude " r " task\n")))
-               "implement claude none task\n")))
+  (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
+  (spit (str (:repos-file ctx)) (task-lib/repos-text repos))
   issue)

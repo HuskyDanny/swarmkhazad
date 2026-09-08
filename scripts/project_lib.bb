@@ -70,6 +70,15 @@
     (spit (str f) (with-out-str (pprint/pprint {:repos (vec repos) :roles (vec roles)})))
     (read-project name)))
 
+(defn delete-project!
+  "Remove the project. Its tasks are not touched — they keep their own repos and
+   roles, snapshotted at scaffold time, and the index lists them again under
+   `Tasks outside a project`. Deleting a project is forgetting a lineup, never
+   deleting work."
+  [name]
+  (when-let [f (project-file name)]
+    (fs/delete-if-exists f)))
+
 ;; ---------------------------------------------------------------- repo scan
 
 (defn scan-repos
@@ -130,10 +139,37 @@
         known (filterv on-disk pipeline-order)]
     (into known (sort (remove (set pipeline-order) on-disk)))))
 
+(def opus "anthropic:claude-opus-5[1m]")
+
+(def role-models
+  "What each role runs on unless a project says otherwise.
+
+   Not one default for everyone: the roles do different work and the cost of
+   getting them wrong differs. The building roles get Opus because a quiet
+   quality drop there ships wrong code; architect gets Fable for design work;
+   specifier and review get a different VENDOR on purpose, so the diff is read
+   by a model that did not write it and cannot agree with its own reasoning.
+
+   `<vendor>:<model-id>` — the vendor picks the endpoint and the credential,
+   the suffix names the exact model."
+  {"implement"  opus
+   "refactorer" opus
+   "cleaner"    opus
+   "hardener"   opus
+   "run"        opus
+   "qa"         opus
+   "architect"  "anthropic:claude-fable-5-1"
+   "specifier"  "glm"
+   "review"     "deepseek"})
+
+(defn default-model
+  "A stage with no opinion recorded here runs on the operator's own login."
+  [role]
+  (get role-models role "anthropic"))
+
 (def default-roles
-  [{:role "implement" :harness "claude" :model "anthropic"}
-   {:role "review" :harness "claude" :model "anthropic"}
-   {:role "run" :harness "claude" :model "anthropic"}])
+  (mapv (fn [r] {:role r :harness "claude" :model (default-model r)})
+        ["implement" "review" "run"]))
 
 (defn valid-role-spec?
   "The role itself. Its checkout is not re-checked here — a role may only name
@@ -141,7 +177,7 @@
   [{:keys [role harness model]}]
   (and (task-lib/valid-role? role)
        (contains? task-lib/known-agents harness)
-       (contains? task-lib/known-vendors model)))
+       (contains? task-lib/known-vendors (first (task-lib/split-model model)))))
 
 ;; ---------------------------------------------------------------- roles file
 
@@ -149,24 +185,20 @@
   "The project's `roles` declaration, in the same grammar a hand-written one
    uses — the swarm never learns that a project exists.
 
-   Each role names its OWN checkout. An earlier version bound the whole lineup
-   to the first repo and invented an `implement.<repo-name>` role for the rest,
-   which is one-project-per-repo thinking wearing a multi-repo hat: it decided
-   for you which checkout the swarm actually worked in. A role card carries a
-   checkout, and this writes what the card says."
-  [{:keys [repos roles]}]
-  (let [fallback (or (first repos) "none")]
-    (str task-lib/roles-grammar-comment
-         (str/join "" (for [{:keys [role harness model repo]} roles]
-                        (str role " " harness " " (or repo fallback) " task model=" model "\n"))))))
+   A role names no checkout. The project holds the repos and every role can
+   work in all of them; which ones a role actually opens is decided by the
+   `@repo` tags on its goal lines, task by task. Binding a role to one checkout
+   here was one-project-per-repo thinking wearing a multi-repo hat: it settled,
+   before the goal was written, which repo the work was allowed to touch."
+  [{:keys [roles]}]
+  (str task-lib/roles-grammar-comment
+       (str/join "" (for [{:keys [role harness model]} roles]
+                      (str role " " harness " task model=" model "\n")))))
 
-(defn unused-repos
-  "Checkouts the project clones but no role works in. Not an error — a checkout
-   can be there to be read — but the portal says so, because one nobody opens is
-   usually a role that was meant to be picked and was not."
-  [{:keys [repos roles]}]
-  (let [used (set (keep :repo roles))]
-    (vec (remove used repos))))
+(defn repos-text
+  "The project's `repos` declaration — every checkout it holds."
+  [{:keys [repos]}]
+  (task-lib/repos-text repos))
 
 ;; ---------------------------------------------------------------- task <-> project
 

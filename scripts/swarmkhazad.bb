@@ -13,15 +13,21 @@
   (str "Usage:\n"
        "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]\n"
        "                                                 scaffold goal.md, metrics.md, roles\n"
-       "  swarmkhazad prepare <task-id>                  layout, clones, worktrees, mail dirs, roles.tsv\n"
+       "  swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
        "  swarmkhazad open --linear <KEY> [--repo <path>]...\n"
        "                                                 scaffold from a Linear issue, then open\n"
-       "  swarmkhazad close <task-id>                    archive panes, stop the daemon, kill the tmux server\n"
+       "  swarmkhazad close <task-id> [--reclaim] [--force]\n"
+       "                                                 archive panes, stop the daemon, kill the tmux server;\n"
+       "                                                 --reclaim also cleans and removes the worktrees and\n"
+       "                                                 deletes the task branch (kept if not on origin)\n"
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"
        "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"
-       "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"))
+       "  swarmkhazad telemetry <task-id>                cost, tokens and sessions per role, from VictoriaMetrics\n"
+       "  swarmkhazad summary <task-id>                  ask whether the work is ready to merge, for its goals\n"
+       "  swarmkhazad ship <task-id> [--yes]             push each repo's branch and open a draft PR, in the summary's merge order\n"
+       "  swarmkhazad reap [--force]                     prune stale worktrees and delete orphaned sk/* branches from your checkouts\n"))
 
 (defn usage! []
   ;; flush before exit: `print` leaves the text in the buffer and System/exit
@@ -32,7 +38,15 @@
 (defn goal-template [task-id]
   (str "# " task-id " — <what this task is, one line>\n"
        "Opened by <who> · " (java.time.LocalDate/now) "\n\n"
-       "## Goal\n- [ ] <role or repo> — <the outcome, one line>\n\n"
+       "## Goal\n"
+       ;; The grammar goes in an HTML comment, not in a live checkbox: a
+       ;; placeholder `@<repo>` inside a real goal line reads as a tag naming a
+       ;; repo the task does not have, and prepare would refuse the task it had
+       ;; just scaffolded.
+       "<!-- one line per outcome: `- [ ] <role> @<repo> — <outcome>`.\n"
+       "     The role and the @repo tags are both optional; a line with neither\n"
+       "     belongs to every role and every repo. -->\n"
+       "- [ ] <the outcome, one line>\n\n"
        "## Not-goal\n- <deliberately not doing X — why>\n\n"
        "## Hints\n- <absolute path> — why it matters\n"))
 
@@ -65,16 +79,17 @@
         (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos)
             (println (str "linear: " (:identifier issue) " " (:title issue))))
         (do (spit (str (:goal-file ctx)) (goal-template task-id))
-            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))))
+            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
+            (spit (str (:repos-file ctx)) (task-lib/repos-text repos))))
       (println (str (:task-dir ctx))))))
 
 (defn prepare! [task-id]
   (let [result (task-lib/prepare! (task-lib/task-ctx task-id))]
     (println "task:" (:task-dir result))
-    (doseq [{:keys [clone fresh branch sha upstream]} (:clones result)]
-      (println (str "clone: " clone (if fresh (str " " branch " @ " sha " origin=" (or upstream "none")) " (existing)"))))
-    (doseq [{:keys [role harness receive-mode model worktree-path]} (:roles result)]
-      (println (str "role: " role " " harness " " receive-mode " model=" model " " worktree-path)))))
+    (doseq [{:keys [name source path branch start]} (:repos result)]
+      (println (str "repo: " name " " path " " branch " @ " start " from " source)))
+    (doseq [{:keys [session harness receive-mode model worktree-path]} (:sessions result)]
+      (println (str "session: " session " " harness " " receive-mode " model=" model " " worktree-path)))))
 
 (defn paths! [task-id]
   (doseq [[k v] (sort-by (comp str key) (task-lib/task-ctx task-id))]
@@ -84,9 +99,9 @@
   (let [ctx (swarm-lib/open! task-id)]
     (println "swarm open:" task-id)
     (println "tmux socket:" (:tmux-socket ctx))
-    (doseq [{:keys [role harness model worktree-path]} (:roles ctx)]
-      (println (str "  " (task-lib/session-name role) "  " harness " model=" model "  " worktree-path)))
-    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>"))))
+    (doseq [{:keys [session harness model worktree-path]} (:sessions ctx)]
+      (println (str "  " (task-lib/session-name session) "  " harness " model=" model "  " worktree-path)))
+    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>_<repo>"))))
 
 (defn open-cmd!
   "`open <task-id>`, or `open --linear <KEY> [--repo <path>]...`, which scaffolds
@@ -112,8 +127,10 @@
       (new! task-id args))
     (open! task-id)))
 
-(defn close! [task-id]
-  (swarm-lib/close! task-id)
+(defn close! [task-id args]
+  (swarm-lib/close! task-id
+                    (boolean (some #{"--reclaim"} args))
+                    (boolean (some #{"--force"} args)))
   (println "swarm closed:" task-id))
 
 (defn smoke! [task-id]
@@ -134,13 +151,19 @@
       "new" (if (second args) (new! (second args) (drop 2 args)) (usage!))
       "prepare" (if (second args) (prepare! (second args)) (usage!))
       "open" (open-cmd! (rest args))
-      "close" (if (second args) (close! (second args)) (usage!))
+      "close" (if (second args) (close! (second args) args) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
       "portal" (do (load-file (str (fs/path script-dir "portal.bb")))
                    (apply (resolve 'portal/-main) (rest args)))
       "telemetry" (do (load-file (str (fs/path script-dir "telemetry.bb")))
                       (apply (resolve 'telemetry/-main) (rest args)))
+      "summary" (do (load-file (str (fs/path script-dir "summary.bb")))
+                    (apply (resolve 'summary/-main) (rest args)))
+      "ship" (do (load-file (str (fs/path script-dir "ship.bb")))
+                 (apply (resolve 'ship/-main) (rest args)))
+      "reap" (do (load-file (str (fs/path script-dir "reap.bb")))
+                 (apply (resolve 'reap/-main) (rest args)))
       (usage!))
     (catch clojure.lang.ExceptionInfo e
       (task-lib/fail! (str "swarmkhazad: " (ex-message e))))))

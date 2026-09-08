@@ -1,6 +1,6 @@
 (ns swarmkhazad.task-test
-  "task_lib.bb + `swarmkhazad prepare`: the task-folder layout, the roles
-   declaration, and the clone that leaves the source checkout untouched."
+  "task_lib.bb + `swarmkhazad prepare`: the task-folder layout, the roles and
+   repos declarations, and the worktrees added from the source checkouts."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
             [clojure.string :as str]
@@ -72,22 +72,28 @@
         (fs/delete-tree sandbox)))))
 
 (defn scaffold-task!
-  [{:keys [env src]} task-id roles-text]
-  (run {:env env} cli "new" task-id "--repo" src)
-  (let [dir (fs/path (get env "SWARMKHAZAD_HOME") "tasks" task-id)]
-    (spit (str (fs/path dir "roles")) roles-text)
-    dir))
+  "Scaffold a task and overwrite its two declarations. repos-text defaults to
+   the fixture source, so a test that only cares about roles says nothing."
+  ([h task-id roles-text] (scaffold-task! h task-id roles-text (str (:src h) "\n")))
+  ([{:keys [env src]} task-id roles-text repos-text]
+   (run {:env env} cli "new" task-id "--repo" src)
+   (let [dir (fs/path (get env "SWARMKHAZAD_HOME") "tasks" task-id)]
+     (spit (str (fs/path dir "roles")) roles-text)
+     (spit (str (fs/path dir "repos")) repos-text)
+     dir)))
 
 (defn prepare-fails
-  "Scaffold a task with roles-text, run prepare, return its stderr (asserting non-zero exit)."
-  [h label task-id roles-text]
-  (scaffold-task! h task-id roles-text)
-  (let [result (run {:env (:env h) :ok? false} cli "prepare" task-id)]
-    (is (not= 0 (:exit result)) label)
-    (:err result)))
+  "Scaffold a task with these declarations, run prepare, return its stderr
+   (asserting non-zero exit)."
+  ([h label task-id roles-text] (prepare-fails h label task-id roles-text (str (:src h) "\n")))
+  ([h label task-id roles-text repos-text]
+   (scaffold-task! h task-id roles-text repos-text)
+   (let [result (run {:env (:env h) :ok? false} cli "prepare" task-id)]
+     (is (not= 0 (:exit result)) label)
+     (:err result))))
 
 (defn tsv-rows [dir]
-  (->> (slurp (str (fs/path dir "state" "roles.tsv"))) str/split-lines (mapv #(str/split % #"\t" -1))))
+  (->> (slurp (str (fs/path dir "state" "sessions.tsv"))) str/split-lines (mapv #(str/split % #"\t" -1))))
 
 (deftest new-scaffolds-the-three-truth-files
   (with-home
@@ -100,199 +106,294 @@
         (let [again (run {:env env :ok? false} cli "new" "t-new")]
           (is (not= 0 (:exit again)) "a second `new` on the same id refuses"))))))
 
-(deftest prepare-clones-worktrees-and-writes-roles-tsv
+(deftest prepare-adds-worktrees-from-the-sources-and-writes-sessions-tsv
   (with-home
-    (fn [{:keys [env src shas] :as h}]
-      (let [dir (scaffold-task! h "t-prep" (str "implement claude " src " task model=kimi --model sonnet\n"
-                                                 "review claude " src " model=deepseek batch\n"
-                                                 "brainstorm claude none\n"))
+    (fn [{:keys [env src sandbox shas] :as h}]
+      (let [second-src (str (fs/path sandbox "src" "other"))
+            _ (make-source-repo! second-src)
+            dir (scaffold-task! h "t-prep"
+                                (str "implement claude task model=kimi --model sonnet\n"
+                                     "review claude model=deepseek batch\n")
+                                (str src "\n" second-src "\n"))
+            _ (spit (str (fs/path dir "goal.md"))
+                    (str "## Goal\n"
+                         "- [ ] implement @fixture — the exporter\n"
+                         "- [ ] review — read it\n"))
             before (snapshot src)
             out (:out (run {:env env} cli "prepare" "t-prep"))
-            clone (fs/path dir "repos" "fixture")]
-        (testing "the clone is pinned to the source's origin/main, not its local HEAD"
-          (is (= (:upstream-sha shas) (git clone "rev-parse" "HEAD")))
-          (is (= (:upstream-sha shas) (git clone "rev-parse" "refs/remotes/origin/main")))
-          (is (= "main" (git clone "branch" "--show-current")))
-          (is (= "one\n" (slurp (str (fs/path clone "README.md"))))))
-        (testing "origin now means the source's upstream URL, and only main survives"
-          (is (= "https://example.invalid/acme/fixture.git" (git clone "remote" "get-url" "origin")))
-          (is (= ["refs/remotes/origin/HEAD" "refs/remotes/origin/main"]
-                 (str/split-lines (git clone "for-each-ref" "--format=%(refname)" "refs/remotes/")))
-              "the source's `scratch` branch did not come along")
-          (is (= (:upstream-sha shas) (git clone "rev-parse" "origin/HEAD")) "origin/HEAD is not dangling")
-          (is (= ["main"] (->> (str/split-lines (git clone "for-each-ref" "--format=%(refname:short)" "refs/heads/"))
-                               (remove #(str/starts-with? % "sk/"))))
-              "no stray local branch from the source's checked-out branch, only main and the role branches")
-          (is (= "origin/main" (git clone "rev-parse" "--abbrev-ref" "main@{upstream}"))))
-        (testing "objects are hardlinked from the source, not copied"
-          (let [obj (->> (fs/glob clone ".git/objects/**/*") (filter fs/regular-file?) first)
-                links (str/trim (:out (run {} "stat" "-f" "%l" (str obj))))]
-            (is (some? obj))
-            (is (>= (Long/parseLong links) 2) (str obj " has link count " links))))
-        (testing "one worktree per repo-bearing role, on its own branch off main"
-          (is (= (:upstream-sha shas) (git (fs/path dir "worktrees" "implement") "rev-parse" "HEAD")))
-          (is (= "sk/t-prep/implement" (git (fs/path dir "worktrees" "implement") "branch" "--show-current")))
-          (is (= "sk/t-prep/review" (git (fs/path dir "worktrees" "review") "branch" "--show-current")))
-          (is (not (fs/exists? (fs/path dir "worktrees" "brainstorm"))) "a `none` repo gets no worktree")
-          (is (= 3 (count (str/split-lines (git clone "worktree" "list"))))))
-        (testing "mail dirs exist per role"
-          (doseq [role ["implement" "review" "brainstorm"]
-                  sub ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"]]
-            (is (fs/directory? (fs/path dir "mail" role sub)) (str role "/" sub))))
-        (testing "roles.tsv carries the declaration, first column is the role, optional tokens in any order"
+            wt (fs/path dir "worktrees" "fixture")]
+        (testing "the worktree starts from the source's origin/main, not its local HEAD"
+          (is (= (:upstream-sha shas) (git wt "rev-parse" "HEAD")))
+          (is (= "one\n" (slurp (str (fs/path wt "README.md"))))
+              "the source's local-only second commit did not come along"))
+        (testing "one worktree per repo, all on the one task branch"
+          (is (= "sk/t-prep" (git wt "branch" "--show-current")))
+          (is (= "sk/t-prep" (git (fs/path dir "worktrees" "other") "branch" "--show-current")))
+          (is (= #{"fixture" "other"} (set (map fs/file-name (fs/list-dir (fs/path dir "worktrees")))))
+              "roles do not get their own worktrees; repos do"))
+        (testing "the source is left clean, on its own branch, plus exactly one new ref"
+          (is (= "" (git src "status" "--porcelain")))
+          (is (= "main" (git src "branch" "--show-current")))
+          (is (= ["main" "scratch" "sk/t-prep"]
+                 (sort (str/split-lines (git src "for-each-ref" "--format=%(refname:short)" "refs/heads/")))))
+          (is (fs/directory? (fs/path src ".git" "worktrees"))
+              "a worktree IS registered in the source — that is the cost of not cloning, and `reap` is what clears it")
+          (is (= (dissoc before (str (fs/path src ".git")))
+                 (dissoc (snapshot src) (str (fs/path src ".git"))))
+              "nothing outside .git changed"))
+        (testing "sessions.tsv is the (role, repo) table, denormalized for the shim"
           (let [rows (tsv-rows dir)]
-            (is (= ["implement" "review" "brainstorm"] (mapv first rows)))
-            (is (= ["implement" "claude" src (str (fs/path dir "worktrees" "implement")) "task" "kimi" "none" "--model sonnet"]
+            (is (= ["implement_fixture" "review_fixture" "review_other"] (mapv first rows)))
+            (is (= ["implement_fixture" "implement" "fixture" (str (fs/path dir "worktrees" "fixture"))
+                    "claude" "task" "kimi" "--model sonnet"]
                    (first rows)))
-            (is (= ["review" "claude" src (str (fs/path dir "worktrees" "review")) "batch" "deepseek" "none" ""]
+            (is (= ["review_fixture" "review" "fixture" (str (fs/path dir "worktrees" "fixture"))
+                    "claude" "batch" "deepseek" ""]
                    (second rows))
                 "`model=deepseek batch` parses the same as `batch model=deepseek`")
-            (is (= ["brainstorm" "claude" "none" (str dir) "task" "anthropic" "none" ""]
-                   (nth rows 2))
-                "a role without a repo works in the task folder and says `none`, never an empty cell")))
-        (testing "the three bullet files exist and are empty; only the dirs this stage fills exist"
-          (doseq [f ["decision.md" "gotcha.md" "escalation.md"]]
+            (is (= "kimi" (nth (first rows) 6)) "the shim reads the vendor from column 7")))
+        (testing "an @repo tag narrows a role to that repo; an untagged role works in all of them"
+          (is (= ["implement_fixture"] (->> (tsv-rows dir) (filter #(= "implement" (second %))) (mapv first))))
+          (is (= ["review_fixture" "review_other"] (->> (tsv-rows dir) (filter #(= "review" (second %))) (mapv first)))))
+        (testing "mail dirs exist per session, not per role"
+          (is (= #{"_system" "implement_fixture" "review_fixture" "review_other"}
+                 (set (map fs/file-name (fs/list-dir (fs/path dir "mail"))))))
+          (doseq [session ["implement_fixture" "review_fixture" "review_other"]
+                  sub ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"]]
+            (is (fs/directory? (fs/path dir "mail" session sub)) (str session "/" sub))))
+        (testing "the four bullet files exist and are empty; nothing clones into the task folder"
+          (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
-          (is (= #{"decision.md" "escalation.md" "evidence" "goal.md" "gotcha.md" "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
+          (is (= #{"decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md" "mail"
+                   "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
                  (set (map fs/file-name (fs/list-dir dir))))))
-        (testing "nothing under the source checkout changed"
-          (is (= before (snapshot src)))
-          (is (= "" (git src "status" "--porcelain")))
-          (is (not (fs/exists? (fs/path src ".git" "worktrees")))))
-        (testing "prepare is idempotent"
-          (let [again (:out (run {:env env} cli "prepare" "t-prep"))]
-            (is (str/includes? again "(existing)"))
-            (is (= 3 (count (str/split-lines (git clone "worktree" "list")))))))
-        (is (str/includes? out "role: implement claude task model=kimi"))
-        (is (str/includes? out "origin=https://example.invalid/acme/fixture.git"))))))
+        (testing "prepare is idempotent, and a re-prepare keeps a commit the role made"
+          (spit (str (fs/path wt "probe.txt")) "x\n")
+          (run {:dir (str wt)} "git" "add" "probe.txt")
+          (run {:dir (str wt)} "git" "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "probe")
+          (let [sha (git wt "rev-parse" "HEAD")]
+            (run {:env env} cli "prepare" "t-prep")
+            (is (= sha (git wt "rev-parse" "HEAD")) "re-prepare must not reset the task branch")
+            (testing "and rebuilding a worktree someone deleted reattaches to the branch, losing nothing"
+              ;; The one case where re-prepare could throw work away: the
+              ;; directory is gone, so the guard that skips existing worktrees
+              ;; does not fire and the add runs for real.
+              (fs/delete-tree wt)
+              (let [r (run {:env env :ok? false} cli "prepare" "t-prep")]
+                (is (zero? (:exit r)) (str "a deleted worktree must be rebuilt, not refused: " (:err r)))
+                (is (= sha (git wt "rev-parse" "HEAD"))
+                    "reattached to sk/t-prep at the role's commit, not reset to the start ref")
+                (is (fs/exists? (fs/path wt "probe.txt")))))))
+        (is (str/includes? out "session: implement_fixture claude task model=kimi"))
+        (is (str/includes? out "repo: fixture "))))))
 
 (deftest prepare-handles-unusual-sources
   (with-home
     (fn [{:keys [env src sandbox shas] :as h}]
-      (testing "a source with no origin remote leaves the clone with NO origin, so nothing can fetch from ~/repos later"
+      (testing "a source with no origin remote starts from its own branch tip"
         (let [lonely (str (fs/path sandbox "src" "lonely"))]
           (make-source-repo! lonely)
+          ;; `remote remove` takes refs/remotes/origin/* with it, so after this
+          ;; there is no upstream ref at all and the start ref falls back.
           (git lonely "remote" "remove" "origin")
-          (let [dir (scaffold-task! h "t-lonely" (str "a claude " lonely "\n"))
-                out (:out (run {:env env} cli "prepare" "t-lonely"))
-                clone (fs/path dir "repos" "lonely")]
-            (is (= "" (git clone "remote")) "no remote at all")
-            (is (str/includes? out "origin=none"))
-            (is (= "main" (git clone "branch" "--show-current"))))))
-      (testing "a source whose upstream default branch is master is pinned to master, not renamed"
+          (let [dir (scaffold-task! h "t-lonely" "a claude\n" (str lonely "\n"))]
+            (run {:env env} cli "prepare" "t-lonely")
+            (is (= (git lonely "rev-parse" "main")
+                   (git (fs/path dir "worktrees" "lonely") "rev-parse" "HEAD"))))))
+      (testing "a source whose upstream default branch is master starts from master, not a renamed main"
         (let [old (str (fs/path sandbox "src" "oldstyle"))
               old-shas (make-source-repo! old "master")
-              dir (scaffold-task! h "t-master" (str "a claude " old "\n"))
-              _ (run {:env env} cli "prepare" "t-master")
-              clone (fs/path dir "repos" "oldstyle")]
-          (is (= "master" (git clone "branch" "--show-current")))
-          (is (= (:upstream-sha old-shas) (git clone "rev-parse" "HEAD")))
-          (is (= (:upstream-sha old-shas) (git clone "rev-parse" "origin/HEAD")))
-          (is (= "sk/t-master/a" (git (fs/path dir "worktrees" "a") "branch" "--show-current")))))
+              dir (scaffold-task! h "t-master" "a claude\n" (str old "\n"))]
+          (run {:env env} cli "prepare" "t-master")
+          (is (= (:upstream-sha old-shas) (git (fs/path dir "worktrees" "oldstyle") "rev-parse" "HEAD")))
+          (is (= "sk/t-master" (git (fs/path dir "worktrees" "oldstyle") "branch" "--show-current")))))
       (testing "a source that is itself a linked worktree is a valid checkout"
         (let [linked (str (fs/path sandbox "src" "fixture-linked"))]
           (git src "worktree" "add" "-q" linked "scratch")
-          (let [before (snapshot src)
-                dir (scaffold-task! h "t-linked" (str "a claude " linked "\n"))
-                _ (run {:env env} cli "prepare" "t-linked")
-                clone (fs/path dir "repos" "fixture-linked")]
-            (is (= (:upstream-sha shas) (git clone "rev-parse" "HEAD")) "still pinned to the source's origin/main")
-            (is (= before (snapshot src)) "the main checkout of that worktree is untouched too")))))))
-
-(deftest prepare-rejects-bad-declarations
-  (with-home
-    (fn [{:keys [env src sandbox] :as h}]
-      (doseq [[label roles-text needle]
-              [["duplicate role" (str "a claude " src "\na claude " src "\n") "duplicate roles"]
-               ["underscore" (str "my_role claude " src "\n") "must match"]
-               ["slash in role (absolute path escape)" (str "/tmp/pwn claude " src "\n") "must match"]
-               ["dot-dot role (relative escape)" "../../x claude none\n" "must match"]
-               ["slash inside an otherwise valid role" "a/../../x claude none\n" "must match"]
-               ["leading dash role" (str "-rf claude " src "\n") "must match"]
-               ["unknown harness" (str "a gemini " src "\n") "unknown harness"]
-               ["unknown vendor" (str "a claude " src " model=llama\n") "unknown model vendor"]
-               ["missing repo" "a claude /nope/not-a-repo\n" "not a git checkout"]
-               ["too few fields" "a claude\n" "need <role> <harness> <repo>"]
-               ["empty" "# only a comment\n" "empty"]]]
-        (let [id (str "t-bad-" (str/replace label #"[^a-z]" ""))
-              err (prepare-fails h label id roles-text)]
-          (is (str/includes? err needle) (str label ": " err))))
-      (testing "two different checkouts with the same basename would share one clone — refused"
-        (let [twin (str (fs/path sandbox "other" "fixture"))]
-          (make-source-repo! twin)
-          (is (str/includes? (prepare-fails h "basename collision" "t-twin"
-                                            (str "a claude " src "\nb claude " twin "\n"))
-                             "share the basename"))))
-      (testing "branch= pins the clone to that branch, and a branch the checkout lacks is refused"
-        (let [other (str (fs/path sandbox "src" "branched"))
-              home (get env "SWARMKHAZAD_HOME")]
+          (let [dir (scaffold-task! h "t-linked" "a claude\n" (str linked "\n"))]
+            (run {:env env} cli "prepare" "t-linked")
+            (is (= (:upstream-sha shas) (git (fs/path dir "worktrees" "fixture-linked") "rev-parse" "HEAD"))
+                "still started from origin/main, not from the scratch branch that worktree holds"))))
+      (testing "branch= starts the task branch from that branch instead of the default"
+        (let [other (str (fs/path sandbox "src" "branched"))]
           (make-source-repo! other)
           (run {:dir other} "git" "checkout" "-q" "-b" "feature")
           (write! (fs/path other "feature.txt") "f\n")
           (run {:dir other} "git" "add" "feature.txt")
-          (run {:dir other} "git" "commit" "-q" "-m" "on feature")
+          (run {:dir other} "git" "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "on feature")
           (run {:dir other} "git" "checkout" "-q" "main")
-          (run {:env env} cli "new" "t-branch")
-          (spit (str (fs/path home "tasks" "t-branch" "roles")) (str "a claude " other " task branch=feature\n"))
-          (is (zero? (:exit (run {:env env :ok? false} cli "prepare" "t-branch"))))
-          (let [wt (str (fs/path home "tasks" "t-branch" "worktrees" "a"))]
-            (is (fs/exists? (fs/path wt "feature.txt")) "the clone is pinned to the named branch, not the default")
-            (is (= "feature" (str/trim (:out (run {:dir (str (fs/path home "tasks" "t-branch" "repos" "branched"))}
-                                                  "git" "rev-parse" "--abbrev-ref" "HEAD"))))))
-          (is (= "feature" (nth (first (tsv-rows (fs/path home "tasks" "t-branch"))) 6))
-              "the branch is in roles.tsv's seventh column")
-          (is (str/includes? (prepare-fails h "ghost branch" "t-ghost" (str "a claude " other " task branch=ghost\n"))
-                             "has no branch ghost"))
-          (is (str/includes? (prepare-fails h "branch disagreement" "t-disagree"
-                                            (str "a claude " other " task branch=feature\nb claude " other " task branch=main\n"))
-                             "roles disagree on the branch"))
-          (is (str/includes? (prepare-fails h "branch vs default" "t-mixed"
-                                            (str "a claude " other " task branch=feature\nb claude " other " task\n"))
-                             "roles disagree on the branch")
-              "a role naming no branch wants the default, which disagrees with a sibling's branch=")))
-      (testing "a pin the clone never received falls back to the branch tip it holds"
-        ;; The real shape, from lothlorien: the source's origin/main names a
-        ;; commit the source itself does not hold — a shallow checkout whose
-        ;; remote ref points past its own boundary. Pinning the clone to that
-        ;; sha died with "nonexistent object". (A plain local clone copies every
-        ;; object, so a merely-unmerged commit would not reproduce it.)
-        (let [ahead (str (fs/path sandbox "src" "ahead"))
-              home (get env "SWARMKHAZAD_HOME")]
+          (let [dir (scaffold-task! h "t-branch" "a claude\n" (str other " branch=feature\n"))]
+            (is (zero? (:exit (run {:env env :ok? false} cli "prepare" "t-branch"))))
+            (is (fs/exists? (fs/path dir "worktrees" "branched" "feature.txt"))
+                "started from the named branch, not the default"))))
+      (testing "a shallow source needs no special handling now that nothing is cloned"
+        (let [shallow (str (fs/path sandbox "src" "shallow"))]
+          (run {} "git" "clone" "-q" "--depth" "1" (str "file://" src) shallow)
+          (let [dir (scaffold-task! h "t-shallow" "a claude\n" (str shallow "\n"))
+                r (run {:env env :ok? false} cli "prepare" "t-shallow")]
+            (is (zero? (:exit r)) (str "a shallow source must still prepare: " (:err r)))
+            (is (fs/directory? (fs/path dir "worktrees" "shallow")))))))))
+
+(deftest prepare-rejects-bad-declarations
+  (with-home
+    (fn [{:keys [env src sandbox] :as h}]
+      (testing "the roles declaration"
+        (doseq [[label roles-text needle]
+                [["duplicate role" "a claude\na claude\n" "duplicate roles"]
+                 ["underscore" "my_role claude\n" "must match"]
+                 ["dot in role" "a.b claude\n" "must match"]
+                 ["slash in role (absolute path escape)" "/tmp/pwn claude\n" "must match"]
+                 ["dot-dot role (relative escape)" "../../x claude\n" "must match"]
+                 ["slash inside an otherwise valid role" "a/../../x claude\n" "must match"]
+                 ["leading dash role" "-rf claude\n" "must match"]
+                 ["unknown harness" "a gemini\n" "unknown harness"]
+                 ["unknown vendor" "a claude model=llama\n" "unknown model vendor"]
+                 ["too few fields" "a\n" "need <role> <harness>"]
+                 ["a repo on a role line" (str "a claude " src " task\n") "no longer names a repo"]
+                 ["empty" "# only a comment\n" "empty"]]]
+          (let [id (str "t-bad-" (str/replace label #"[^a-z]" ""))
+                err (prepare-fails h label id roles-text)]
+            (is (str/includes? err needle) (str label ": " err)))))
+      (testing "a dot in a role name is refused because tmux cannot target it"
+        ;; RAN: `new-session -s sk-a.b` succeeds and every later `-t sk-a.b`
+        ;; fails `can't find pane: b`, since tmux reads a dot as session.pane.
+        (is (str/includes? (prepare-fails h "dotted role" "t-dotrole" "im.plement claude\n") "must match")))
+      (testing "the repos declaration"
+        (doseq [[label repos-text needle]
+                [["not a checkout" "/nope/not-a-repo\n" "not a git checkout"]
+                 ["unknown token" (str src " depth=1\n") "unknown token"]
+                 ["empty" "# only a comment\n" "empty"]]]
+          (let [id (str "t-repo-" (str/replace label #"[^a-z]" ""))
+                err (prepare-fails h label id "a claude\n" repos-text)]
+            (is (str/includes? err needle) (str label ": " err)))))
+      (testing "two checkouts with the same basename would share one worktree name — refused"
+        (let [twin (str (fs/path sandbox "other" "fixture"))]
+          (make-source-repo! twin)
+          (is (str/includes? (prepare-fails h "basename collision" "t-twin" "a claude\n"
+                                            (str src "\n" twin "\n"))
+                             "share the basename"))))
+      (testing "a branch the checkout lacks is refused rather than silently starting from HEAD"
+        (is (str/includes? (prepare-fails h "ghost branch" "t-ghost" "a claude\n" (str src " branch=ghost\n"))
+                           "has no branch ghost")))
+      (testing "a goal line tagging a repo the task does not have is a typo, not a wildcard"
+        (let [dir (scaffold-task! h "t-badtag" "a claude\n")]
+          (spit (str (fs/path dir "goal.md")) "## Goal\n- [ ] a @fixtur — typo\n")
+          (let [r (run {:env env :ok? false} cli "prepare" "t-badtag")]
+            (is (not= 0 (:exit r)))
+            (is (str/includes? (:err r) "not one of this task's repos")))))
+      (testing "an upstream ref naming a commit the checkout does not hold falls back to what it has"
+        ;; The real shape, from lothlorien: origin/main points past a shallow
+        ;; checkout's own boundary. rev-parse answers with the sha anyway, and
+        ;; a worktree started there dies with "nonexistent object".
+        (let [ahead (str (fs/path sandbox "src" "ahead"))]
           (make-source-repo! ahead)
-          (let [c1 (str/trim (:out (run {:dir ahead} "git" "rev-parse" "HEAD")))]
+          (let [c1 (git ahead "rev-parse" "HEAD")
+                dir (scaffold-task! h "t-ahead" "a claude\n" (str ahead "\n"))]
             (write! (fs/path ahead ".git" "refs" "remotes" "origin" "main")
                     "c31eff2d2d5a5cee31e529a6df5df548cc3813dd\n")
-            (run {:env env} cli "new" "t-ahead")
-            (spit (str (fs/path home "tasks" "t-ahead" "roles")) (str "a claude " ahead " task\n"))
             (let [r (run {:env env :ok? false} cli "prepare" "t-ahead")]
               (is (zero? (:exit r)) (str "must not die with \"nonexistent object\": " (:err r)))
-              (is (= c1 (str/trim (:out (run {:dir (str (fs/path home "tasks" "t-ahead" "repos" "ahead"))}
-                                             "git" "rev-parse" "HEAD"))))
-                  "pinned to what the clone holds, not to the commit the source's ref named")))))
-      (testing "a shallow source is prepared, with a note that its objects are copied"
-        (let [shallow (str (fs/path sandbox "src" "shallow"))
-              home (get env "SWARMKHAZAD_HOME")]
-          (run {} "git" "clone" "-q" "--depth" "1" (str "file://" src) shallow)
-          (run {:env env} cli "new" "t-shallow")
-          (spit (str (fs/path home "tasks" "t-shallow" "roles")) (str "a claude " shallow "\n"))
-          (let [r (run {:env env :ok? false} cli "prepare" "t-shallow")]
-            (is (zero? (:exit r)) (str "a shallow source must still prepare: " (:err r)))
-            (is (str/includes? (:err r) "is shallow; its clone copies objects"))
-            (is (fs/directory? (fs/path home "tasks" "t-shallow" "worktrees" "a"))))
-          (testing "and a commit in that worktree merges by bare SHA into a sibling — the thing the old refusal claimed was impossible"
-            (let [wt (str (fs/path home "tasks" "t-shallow" "worktrees" "a"))
-                  clone (str (fs/path home "tasks" "t-shallow" "repos" "shallow"))]
-              (spit (str (fs/path wt "probe.txt")) "x\n")
-              (run {:dir wt} "git" "add" "probe.txt")
-              (run {:dir wt} "git" "commit" "-q" "-m" "probe")
-              (let [sha (str/trim (:out (run {:dir wt} "git" "rev-parse" "--short=10" "HEAD")))
-                    sib (str (fs/path sandbox "sibling"))]
-                (run {:dir clone} "git" "worktree" "add" "-q" "-B" "sk/t/b" sib "HEAD")
-                (is (zero? (:exit (run {:dir sib :ok? false} "git" "merge" "--no-edit" sha))))
-                (is (fs/exists? (fs/path sib "probe.txt"))))))))
+              (is (= c1 (git (fs/path dir "worktrees" "ahead") "rev-parse" "HEAD"))
+                  "started from what the source holds, not from the commit its ref named")))))
       (testing "nothing escaped the sandbox on any rejected declaration"
         (is (not (fs/exists? "/tmp/pwn")))
         (is (not (fs/exists? (fs/path (get env "SWARMKHAZAD_HOME") "x"))))))))
+
+(deftest reap-clears-what-a-task-leaves-in-your-own-checkouts
+  (with-home
+    (fn [{:keys [env src sandbox] :as h}]
+      (let [reap (fn [& args]
+                   (apply run {:env (assoc env "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src")))
+                               :ok? false}
+                          cli "reap" args))
+            branches #(->> (git src "for-each-ref" "--format=%(refname:short)" "refs/heads/")
+                           str/split-lines (remove str/blank?) sort vec)]
+        (doseq [id ["t-live" "t-empty" "t-work"]]
+          (scaffold-task! h id "a claude\n")
+          (run {:env env} cli "prepare" id))
+        (git src "branch" "keepme")
+        (testing "one worktree registration per task, and one branch each"
+          (is (= ["keepme" "main" "scratch" "sk/t-empty" "sk/t-live" "sk/t-work"] (branches)))
+          (is (= 3 (count (fs/list-dir (fs/path src ".git" "worktrees"))))))
+        (let [wt (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-work" "worktrees" "fixture")]
+          (write! (fs/path wt "work.txt") "a day of work\n")
+          (run {:dir (str wt)} "git" "add" "work.txt")
+          (run {:dir (str wt)} "git" "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "work"))
+        (fs/delete-tree (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-empty"))
+        (fs/delete-tree (fs/path (get env "SWARMKHAZAD_HOME") "tasks" "t-work"))
+        (testing "an orphan holding nothing is deleted; one holding work is not"
+          (let [out (:out (reap))]
+            (is (str/includes? out "deleted") out)
+            (is (str/includes? out "sk/t-empty"))
+            (is (str/includes? out "it holds 1 commit(s); --force to delete anyway"))
+            (is (str/includes? out "sk/t-live") "and a live task's branch says why it was kept")
+            (is (str/includes? out "its task folder is still there"))
+            (is (str/includes? out "1 deleted, 2 kept")
+                "the summary is the whole answer for anyone who does not read the rows"))
+          (is (= ["keepme" "main" "scratch" "sk/t-live" "sk/t-work"] (branches))))
+        (testing "the stale registrations are pruned, the live one is not"
+          (is (= 1 (count (fs/list-dir (fs/path src ".git" "worktrees"))))))
+        (testing "a branch the checkout has checked out is left alone, not failed on"
+          ;; The stale registration was pruned on the run above, which is the
+          ;; only reason the source can check this branch out at all.
+          (run {:dir src} "git" "checkout" "-q" "sk/t-work")
+          (let [r (reap "--force")]
+            (is (zero? (:exit r)) (:err r))
+            (is (str/includes? (:out r) "a worktree still has it: "))
+            (is (some #{"sk/t-work"} (branches))
+                "git refuses the delete anyway; saying so beats an error nobody can act on"))
+          (run {:dir src} "git" "checkout" "-q" "main"))
+        (testing "and so is one held by a worktree that is not this checkout"
+          ;; The case the old check could not see: it compared the SOURCE's own
+          ;; HEAD, so a branch checked out in any other linked worktree read as
+          ;; deletable. `git branch -D` refused, task-lib/git threw on the
+          ;; non-zero exit, and the sweep ended there — with the checkouts it
+          ;; had already reaped reaped, and the rest never looked at.
+          (let [elsewhere (str (fs/path sandbox "elsewhere"))]
+            (run {:dir src} "git" "worktree" "add" "-q" elsewhere "sk/t-work")
+            (let [r (reap "--force")]
+              (is (zero? (:exit r)) (str "one held branch must not end the sweep: " (:err r)))
+              (is (str/includes? (:out r) (str "a worktree still has it: "
+                                              (str (fs/canonicalize elsewhere))))
+                  "named, so the operator knows which worktree to close")
+              (is (some #{"sk/t-work"} (branches)) "and it is still there"))
+            (run {:dir src} "git" "worktree" "remove" "--force" elsewhere)))
+        (testing "--force takes the one holding work, and nothing else"
+          (is (str/includes? (:out (reap "--force")) "sk/t-work"))
+          (is (= ["keepme" "main" "scratch" "sk/t-live"] (branches))
+              "a branch that is not sk/<task-id> is never a candidate, forced or not"))))))
+
+(deftest a-task-opened-before-sessions-tsv-existed-still-reads
+  ;; roles.tsv was the runtime table until sessions.tsv replaced it. Tasks
+  ;; written under the old shape are still running, and every helper they call
+  ;; reads this function.
+  (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
+  (with-home
+    (fn [{:keys [env src] :as h}]
+      (let [dir (scaffold-task! h "t-legacy" "a claude\n")
+            _ (run {:env env} cli "prepare" "t-legacy")
+            ;; The ctx is built here rather than by task-ctx, which reads
+            ;; SWARMKHAZAD_HOME from THIS process's environment and would
+            ;; silently answer for the real ~/.swarmkhazad instead of the
+            ;; sandbox — an empty read that looks like a passing assertion.
+            ctx {:sessions-tsv (fs/path dir "state" "sessions.tsv")
+                 :roles-tsv (fs/path dir "state" "roles.tsv")}
+            read #((resolve 'task-lib/read-sessions-tsv) ctx)]
+        (fs/delete (fs/path dir "state" "sessions.tsv"))
+        (is (= [] (read)) "with neither table there is nothing to read")
+        ;; role, harness, repo, worktree, receive-mode, model, branch, extra
+        (spit (str (fs/path dir "state" "roles.tsv"))
+              (str "a\tclaude\t" src "\t" (fs/path dir "worktrees" "fixture") "\ttask\tkimi\tnone\t--flag\n"
+                   "b\tclaude\tnone\t" dir "\tbatch\tanthropic\tnone\t\n"))
+        (let [rows (read)]
+          (is (= ["a" "b"] (mapv :session rows))
+              "an old row is one session named after its role — it already has mail/<role>/ and a pane called sk-<role>")
+          (is (= "fixture" (:repo (first rows))) "the repo path becomes the repo name")
+          (is (= (str (fs/path dir "worktrees" "fixture")) (:worktree-path (first rows))))
+          (is (= "kimi" (:model (first rows))))
+          (is (= "--flag" (:extra-args (first rows))))
+          (is (nil? (:repo (second rows))) "`none` reads back as no repo, not as a repo called none")
+          (is (= "batch" (:receive-mode (second rows)))))))))
 
 (deftest prepare-refuses-without-truth-files
   (with-home
@@ -325,3 +426,54 @@
         (let [r (run {:env env :ok? false} cli "frobnicate")]
           (is (= 1 (:exit r)))
           (is (str/includes? (:err r) "Usage:")))))))
+
+(deftest a-task-opened-before-the-repos-file-can-still-be-reopened
+  ;; A reboot kills the tmux socket, and `open` is how anyone gets a running
+  ;; task back. Requiring the `repos` file unconditionally turned that into a
+  ;; hard failure for every task that started before the file existed — which
+  ;; is every task on disk when this branch lands.
+  (with-home
+    (fn [{:keys [env] :as h}]
+      (let [dir (scaffold-task! h "t-old" "implement claude\nreview claude\n")]
+        (run {:env env} cli "prepare" "t-old")
+        (let [wt (fs/path dir "worktrees" "fixture")
+              ;; A commit the old task made, so a rebuilt worktree would be
+              ;; visibly the wrong one rather than an identical empty tree.
+              _ (do (spit (str (fs/path wt "work.txt")) "x\n")
+                    (git wt "add" "work.txt")
+                    (git wt "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "work"))
+              sha (git wt "rev-parse" "HEAD")]
+          ;; Roll the folder back to the old shape: the runtime table is
+          ;; roles.tsv, in its own columns, and nothing on disk says which repos
+          ;; the task covers.
+          ;; role, harness, repo, worktree, receive-mode, model, branch, extra
+          (fs/delete (fs/path dir "state" "sessions.tsv"))
+          (spit (str (fs/path dir "state" "roles.tsv"))
+                (str "implement\tclaude\t" (:src h) "\t" wt "\ttask\tkimi\tnone\t--flag\n"
+                     "review\tclaude\t" (:src h) "\t" wt "\tbatch\tanthropic\tnone\t\n"))
+          (fs/delete (fs/path dir "repos"))
+          (let [r (run {:env env :ok? false} cli "prepare" "t-old")]
+            (is (zero? (:exit r)) (str "an old task must reopen, not fail: " (:err r))))
+          (testing "the old rows become the session table, unchanged in what they say"
+            (let [rows (tsv-rows dir)]
+              (is (= ["implement" "review"] (mapv first rows))
+                  "an old row is one session named after its role — its mail dir and pane already carry that name")
+              (is (= ["implement" "implement" "fixture" (str wt) "claude" "task" "kimi" "--flag"]
+                     (first rows)))
+              (is (= "batch" (nth (second rows) 5)) "and the second row keeps its own receive mode")))
+          (testing "no worktree was rebuilt underneath it"
+            (is (= sha (git wt "rev-parse" "HEAD"))
+                "rebuilding sessions the new way would add worktrees beside these and point the task at the empty ones")
+            (is (fs/exists? (fs/path wt "work.txt"))))
+          (testing "and its mail dirs are there for the sessions it actually has"
+            (is (fs/directory? (fs/path dir "mail" "implement")))
+            (is (fs/directory? (fs/path dir "mail" "review"))))))))
+  (testing "a task with neither repos nor roles.tsv is not a legacy task, it is broken"
+    (with-home
+      (fn [{:keys [env] :as h}]
+        (let [dir (scaffold-task! h "t-nothing" "a claude\n")]
+          (fs/delete (fs/path dir "repos"))
+          (let [r (run {:env env :ok? false} cli "prepare" "t-nothing")]
+            (is (not= 0 (:exit r)))
+            (is (str/includes? (:err r) "missing repos"))))))))
+

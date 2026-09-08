@@ -40,6 +40,7 @@
 (load-file (str (fs/path script-dir "telemetry.bb")))
 (load-file (str (fs/path script-dir "ask.bb")))
 (load-file (str (fs/path script-dir "summary.bb")))
+(load-file (str (fs/path script-dir "pr_watch.bb")))
 
 (def cli (str (fs/path script-dir "swarmkhazad.bb")))
 (def default-port 8765)
@@ -54,15 +55,30 @@
   (->> (str/split-lines (or s "")) (map str/trim) (remove str/blank?) vec))
 
 (defn goal-lines
-  "The checkbox lines of goal.md's Goal section: {:text :ticked}."
+  "The checkbox lines of goal.md's Goal section: {:text :ticked :role :repos}.
+   Parsed by the same function the judge uses, so the portal and the grader
+   never disagree about which repo a line belongs to."
   [goal-md]
   (->> (str/split-lines (or goal-md ""))
        (drop-while #(not (re-matches #"(?i)##\s+goal\s*" (str/trim %))))
        rest
        (take-while #(not (str/starts-with? (str/trim %) "## ")))
-       (keep #(when-let [[_ box body] (re-matches #"\s*- \[([ xX])\]\s*(.*)" %)]
-                {:text (str/trim body) :ticked (not= " " box)}))
+       (keep task-lib/goal-line)
        vec))
+
+(defn goals-by-repo
+  "The goal lines grouped under the repo each one names, in the task's own repo
+   order, with the untagged lines last under `every repo` — a line that never
+   said belongs to all of them. Returns nil when the task has one repo: there
+   is nothing to group by and a heading over every line is noise."
+  [repos goals]
+  (when (> (count repos) 1)
+    (concat (for [r repos
+                  :let [mine (filter #(some #{r} (:repos %)) goals)]
+                  :when (seq mine)]
+              [r mine])
+            (when-let [untagged (seq (remove #(seq (:repos %)) goals))]
+              [["every repo" untagged]]))))
 
 (defn verdicts
   "role → the latest judge verdict, from state/judge/<role>.json."
@@ -114,7 +130,12 @@
 (defn opened? [ctx] (fs/regular-file? (:tmux-socket-file ctx)))
 
 (defn attention
-  "What needs a human: escalation lines, failed mail, denials, a down judge, a dead daemon."
+  "What needs a human: escalation lines, failed mail, denials, a down judge, a
+   dead daemon.
+
+   finding.md is deliberately NOT here. A finding is something the swarm worked
+   out, not something waiting on anyone — counted as an ask it reads as a
+   problem nobody is solving, which is how one task showed 22."
   [ctx]
   (let [esc (nonblank-lines (text (:escalation-file ctx)))
         failed (when (fs/directory? (:mail-dir ctx))
@@ -135,39 +156,12 @@
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
 
-(defn- assoc-or-dissoc [m k on?]
-  (if on? (assoc m k (str (java.time.Instant/now))) (dissoc m k)))
-
-(defn attention-key
-  "A stable id for one attention item. Escalations are append-only bullets and
-   the other kinds are derived from files, so the text is the only thing that
-   survives a re-render — there is no row id to use. Hashed because the raw text
-   is a paragraph and this goes in a form field."
-  [{:keys [kind text]}]
-  (let [d (java.security.MessageDigest/getInstance "SHA-1")
-        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
-    (apply str (map #(format "%02x" %) (take 8 b)))))
-
-(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
-
-(defn handled
-  "key → when it was crossed off. A separate file, never escalation.md: the
-   roles own that one and append to it, and a portal that edited it would be
-   rewriting what a role said rather than recording what a person did about it."
-  [ctx]
-  (into {} (for [l (nonblank-lines (text (handled-file ctx)))
-                 :let [[k at] (str/split l #"\t" 2)]
-                 :when (seq k)]
-             [k (or at "")])))
-
-(defn set-handled!
-  "Cross one off, or put it back. Rewrites the file rather than appending, so
-   unticking actually removes the row instead of leaving both states in it."
-  [ctx key on?]
-  (let [now (assoc-or-dissoc (handled ctx) key on?)]
-    (fs/create-dirs (:state-dir ctx))
-    (spit (str (handled-file ctx))
-          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))
+;; The cross-off store lives in task_lib: a role that fixes what it escalated
+;; crosses the item off with note.bb, so the portal is no longer its only
+;; writer. Aliased here because the call sites below read better unqualified.
+(def attention-key task-lib/attention-key)
+(def handled task-lib/handled)
+(def set-handled! task-lib/set-handled!)
 
 (defn open-attention
   "What still needs a human: the list minus what someone has crossed off. Both
@@ -177,8 +171,11 @@
   (let [done (handled ctx)]
     (remove #(contains? done (attention-key %)) (attention ctx))))
 
-(defn roles [ctx]
-  (if (fs/regular-file? (:roles-tsv ctx)) (task-lib/read-roles-tsv ctx) []))
+(defn sessions
+  "The task's (role, repo) sessions — the unit that has a pane, an inbox and a
+   verdict. A one-repo task has one per role, which is what it always had."
+  [ctx]
+  (task-lib/read-sessions-tsv ctx))
 
 (def sgr-class
   "The SGR codes an agent TUI actually emits, and the class each becomes.
@@ -232,38 +229,71 @@
                              text))
                  out)))))))
 
-(defn pane-state
-  "Whether the pane the rail shows is a running tmux session, the capture taken
+(defn pane-view
+  "The pane, and where it came from: the running tmux session, the capture taken
    when the task closed, or nothing yet. A closed task still has a terminal to
-   read — that is the whole point of archiving it at close."
-  [ctx role]
-  (cond
-    (not-empty (try (handoff-lib/capture-pane ctx role) (catch Exception _ nil))) :live
-    (text (fs/path (:sessions-dir ctx) role "pane.txt")) :archived
-    :else :none))
+   read — that is the whole point of archiving it at close.
+
+   One capture answers both. Asking tmux separately for the text and for whether
+   the session is live was two subprocesses for one question, on a page that
+   refreshes every five seconds for every session the task has — and sessions
+   are the axis a multi-repo task multiplies."
+  ([ctx role] (pane-view ctx role {}))
+  ([ctx role {:keys [ansi]}]
+   (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
+         archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))]
+     {:state (cond (not-empty live) :live archived :archived :else :none)
+      :text (str/join "\n" (take-last pane-tail-lines
+                                      (str/split-lines (or (not-empty live) archived ""))))})))
 
 (defn pane-text
   "The live pane when the task's tmux server is up, else the archived capture."
-  ([ctx role] (pane-text ctx role {}))
-  ([ctx role {:keys [ansi]}]
-  (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
-        archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))
-        s (or (not-empty live) archived "")]
-    (str/join "\n" (take-last pane-tail-lines (str/split-lines s))))))
+  ([ctx role] (:text (pane-view ctx role)))
+  ([ctx role opts] (:text (pane-view ctx role opts))))
 
-(defn role-cards [ctx]
+(defn session-cards [ctx]
   (let [vs (verdicts ctx)]
-    (for [row (roles ctx)
-          :let [role (:role row) mail (task-lib/role-mail-dir ctx role)]]
-      {:role role :harness (:harness row) :model (:model row) :mode (:receive-mode row)
-       :verdict (get vs role)
+    (for [row (sessions ctx)
+          :let [name (:session row) mail (task-lib/session-mail-dir ctx name)]]
+      {:session name :role (:role row) :repo (:repo row)
+       :harness (:harness row) :model (:model row) :mode (:receive-mode row)
+       :verdict (get vs name)
        :sent (count-files (fs/path mail "sent"))
        :inbox (+ (count-files (fs/path mail "inbox" "new")) (count-files (fs/path mail "inbox" "in_process")))
-       :last-line (last (nonblank-lines (pane-text ctx role)))})))
+       :last-line (last (nonblank-lines (pane-text ctx name)))})))
+
+(defn session-summary
+  "`implement: superset, gobel · review: superset, gobel`.
+
+   The four session ids on their own made a reader group them by prefix to see
+   there were two roles and two repos. Roles come out in the roles file's order,
+   which is the order the work moves through."
+  [rows]
+  (str/join " · "
+            (for [role (distinct (map :role rows))]
+              (let [repos (for [r rows :when (= role (:role r))] (or (:repo r) (:session r)))]
+                (str role ": " (str/join ", " repos))))))
 
 (defn lane [ctx]
   (or (try (board-lib/card-lane ctx (:task-id ctx)) (catch Exception _ nil))
       (if (opened? ctx) "?" "not opened")))
+
+(defn lane-progress
+  "How much of the current lane is done — `2/3` when the role holds three repos
+   and two have handed off. nil when the role holds one repo: `implement 1/1`
+   is the same sentence as `implement`."
+  [ctx]
+  (let [total (count (filter #(= (lane ctx) (:role %)) (sessions ctx)))]
+    (when (> total 1)
+      (let [row (try (board-lib/card-row ctx (:task-id ctx)) (catch Exception _ nil))]
+        (str (count (board-lib/handed row)) "/" total)))))
+
+(defn lane-label
+  "The lane, plus how much of it is done. Three repo names do not fit in a 190px
+   card, and the fraction is the part a reader is actually asking for."
+  [ctx]
+  (let [name (lane ctx)]
+    (if-let [p (lane-progress ctx)] (str name " " p) name)))
 
 (defn doc-file
   "The canonical path of a file inside the task folder, or nil — never the
@@ -290,10 +320,12 @@
                  :let [[k v] (str/split pair #"=" 2)]]
              [(java.net.URLDecoder/decode k "UTF-8") (java.net.URLDecoder/decode (or v "") "UTF-8")])))
 
-(defn create-project!
-  "Write a project from the form. Repos come from the checkbox list plus any
-   typed paths; roles come from the cards that were ticked, in the order the
-   stage prompts are listed, which is the order the swimlane columns take."
+(defn project-from-form
+  "A project map from the form, or {:error}. Repos come from the checkbox list
+   plus any typed paths; roles come from the cards that were ticked, in the
+   order the stage prompts are listed, which is the order the swimlane columns
+   take. Everything here is true of a new project and of an edited one; only
+   whether the name may already exist differs, and that is the caller's."
   [{:strs [name extra-repos] :as params}]
   (let [nm (str/trim (or name ""))
         picked (->> (keys params)
@@ -304,20 +336,55 @@
                          :when (get params (str "role:" stage))]
                      {:role stage
                       :harness (or (get params (str "harness:" stage)) "claude")
-                      :model (or (get params (str "model:" stage)) "anthropic")
-                      :repo (or (not-empty (get params (str "repo-of:" stage))) (first repos))}))]
+                      ;; Two controls, one field: the roles grammar has always
+                      ;; been `model=<vendor>[:<model-id>]`, and splitting it
+                      ;; across two form names here rather than two columns in
+                      ;; the file keeps the swarm's own reader unchanged.
+                      :model (let [v (or (not-empty (get params (str "vendor:" stage)))
+                                         ;; a saved project's own params, and any
+                                         ;; caller still posting the single field
+                                         (not-empty (first (task-lib/split-model (get params (str "model:" stage) ""))))
+                                         (first (task-lib/split-model (project-lib/default-model stage))))
+                                   id (or (not-empty (str/trim (or (get params (str "modelid:" stage)) "")))
+                                          ;; a POST that names neither control —
+                                          ;; a scripted call, or the CLI — still
+                                          ;; gets the role's default model, not
+                                          ;; a bare vendor with the id dropped
+                                          (when-not (or (get params (str "vendor:" stage))
+                                                        (get params (str "modelid:" stage))
+                                                        (get params (str "model:" stage)))
+                                            (second (task-lib/split-model (project-lib/default-model stage)))))]
+                               (if id (str v ":" id) v))}))]
     (cond
       (not (project-lib/valid-project-name? nm)) {:error (str "invalid project name: " (pr-str nm))}
-      (project-lib/read-project nm) {:error (str "project already exists: " nm)}
       (empty? repos) {:error "pick at least one checkout"}
       (empty? roles) {:error "pick at least one role"}
       (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
                                                               (first (remove task-lib/git-checkout? repos)))}
-      (not (every? #(contains? (set repos) (:repo %)) roles))
-      {:error "a role was pointed at a checkout this project does not hold"}
       (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
-      :else (do (project-lib/write-project! {:name nm :repos repos :roles roles})
-                {:ok nm}))))
+      :else {:name nm :repos repos :roles roles})))
+
+(defn create-project! [params]
+  (let [p (project-from-form params)]
+    (cond
+      (:error p) p
+      (project-lib/read-project (:name p)) {:error (str "project already exists: " (:name p))}
+      :else (do (project-lib/write-project! p) {:ok (:name p)}))))
+
+(defn update-project!
+  "Rewrite an existing project. The name is fixed: a task points at its project
+   by name, so a rename would orphan every task already scaffolded from it.
+
+   Tasks already open are untouched — `repos` and `roles` were snapshotted into
+   the task folder at scaffold time, which is what makes an edit here safe while
+   a swarm is running."
+  [name params]
+  (if-not (project-lib/read-project name)
+    {:error (str "no such project: " name)}
+    (let [p (project-from-form (assoc params "name" name))]
+      (if (:error p)
+        p
+        (do (project-lib/write-project! p) {:ok name})))))
 
 (defn kickstart-project!
   "A task inside a project: the repos and the role lineup come from the project,
@@ -349,6 +416,7 @@
               (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
             (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
             (spit (str (:roles-file ctx)) (project-lib/roles-text project))
+            (spit (str (:repos-file ctx)) (project-lib/repos-text project))
             (fs/create-dirs (:state-dir ctx))
             (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
               (process/process ["bb" cli "open" id] {:out log :err log}))
@@ -376,6 +444,8 @@
    .title a{color:inherit;text-decoration:none}
    .title .sub{color:var(--muted);font-weight:400}
    h2{font-size:.9rem;font-weight:500;color:var(--muted);margin:2rem 0 .6rem;letter-spacing:.01em}
+   h3.repo{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;
+     font-weight:500;color:var(--blue);margin:1.2rem 0 .3rem}
    section{margin:0 0 1.6rem}
    .row{display:flex;align-items:center;gap:.75rem;background:var(--row);border-radius:12px;
      padding:.85rem 1.1rem;margin-bottom:.4rem;text-decoration:none;color:inherit;
@@ -430,6 +500,9 @@
    .composer{position:fixed;left:0;right:0;bottom:0;background:var(--paper);
      border-top:1px solid var(--line);padding:1rem 2rem 1.3rem}
    .composer .inner{max-width:1040px;margin:0 auto;max-height:60vh;overflow-y:auto}
+   /* On its own page there is nothing to dock to the foot of. */
+   .composer.own{position:static;padding:0;border-top:0}
+   .composer.own .inner{max-height:none;overflow:visible}
    .composer .fields{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem}
    input[type=text],textarea{font:inherit;color:inherit;background:var(--surface);
      border:1px solid var(--line);border-radius:10px;padding:.6rem .85rem;width:100%}
@@ -439,6 +512,9 @@
    .composer .go{display:flex;gap:.6rem;align-items:center}
    button{font:inherit;font-weight:500;color:#fff;background:var(--accent);border:0;
      border-radius:10px;padding:.6rem 1.2rem;cursor:pointer;white-space:nowrap;flex:none}
+   .danger{display:flex;gap:.6rem;align-items:center;margin-top:1.4rem;
+     padding-top:1rem;border-top:1px solid var(--line);font-size:.85rem}
+   button.linky{color:var(--red);background:none;padding:0;text-decoration:underline}
    .err{color:var(--red);font-size:.9rem;margin:0 0 .5rem}
    .empty{color:var(--muted);font-size:.9rem;padding:.6rem 0}
    main.wide{max-width:1560px}
@@ -492,6 +568,7 @@
      padding:.6rem .7rem;margin-bottom:.4rem;text-decoration:none;color:inherit}
    .tcard:hover{background:var(--row)}
    .tcard .name{font-weight:600;font-size:.92rem;margin-bottom:.15rem}
+   .tcard .status+.muted{margin-left:.45rem;font-size:.85rem}
    .picklist{max-height:210px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;
      background:var(--surface);padding:.35rem .5rem;margin-top:.25rem}
    .pick{display:flex;align-items:center;gap:.5rem;padding:.18rem 0;font-size:.85rem;color:var(--ink)}
@@ -512,7 +589,13 @@
    .row.head{align-items:flex-start}
    a.doc{color:var(--blue);text-decoration:none;font-size:.9rem;white-space:nowrap}
    .card-top{display:flex;align-items:center;justify-content:space-between}
-   .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}")
+   .card .pane-line{white-space:pre-wrap;word-break:break-all;margin-top:.35rem}
+   .rolegroups{display:flex;flex-direction:column;gap:.7rem}
+   .rolegroup{background:var(--row);border-radius:14px;padding:.5rem}
+   .rolegroup .rolename{font-size:.8rem;font-weight:600;color:var(--muted);
+     letter-spacing:.06em;text-transform:uppercase;padding:.25rem .55rem .45rem}
+   .rolegroup .card{background:var(--surface);margin-bottom:.5rem}
+   .rolegroup .card:last-child{margin-bottom:0}")
 
 (def poll-script
   "Two loops. The pane is appended to every two seconds and keeps its scroll
@@ -569,74 +652,131 @@
 (def default-roles
   "implement claude <repo-path> task\nreview claude <repo-path> task\nrun claude <repo-path> task")
 
+(defn project-params
+  "A saved project as the form's own params, so one form renders both new and
+   edit and there is no second layout to drift."
+  [{:keys [name repos roles]}]
+  (into {"name" name}
+        (concat (for [r repos] [(str "repo:" r) "on"])
+                (mapcat (fn [{:keys [role harness model]}]
+                          ;; The harness round-trips too, or opening a saved
+                          ;; project for edit and pressing Save silently reset
+                          ;; every role to claude.
+                          [[(str "role:" role) "on"]
+                           [(str "harness:" role) (or harness "claude")]
+                           [(str "model:" role) model]])
+                        roles))))
+
 (defn project-form
-  "New project: a name, the checkouts found under the repo roots, and the role
-   cards. The roles are picked once here so no task ever asks for them again."
-  [error params]
-  (let [available (project-lib/available-repos)
-        picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
-        first-run? (empty? params)
-        default (set (map :role project-lib/default-roles))]
-    [:details.composer {:open (boolean error)}
-     [:summary "New project — the checkouts and the swarm, set once"]
-     [:div.inner
-      (when error [:p.err error])
-      [:form {:method "post" :action "/projects"}
-       [:div.fields
-        [:label "project name"
-         [:input {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
-                  :value (get params "name" "")}]]
-        [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
-         [:div.picklist
-          (if (seq available)
-            (for [r available]
-              [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
-                                    :checked (contains? picked r)}]
-               [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
-            [:p.empty "no git checkouts found — type a path below"])]]
-        [:label "or paths not under those roots, one per line"
-         [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
-          (get params "extra-repos")]]]
-       [:p.muted "roles — the swimlane's columns, in this order"]
-       [:div.cards.rolepick
-        (for [stage (project-lib/stage-prompts)
-              :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
-          [:label.card.rolecard
-           [:div.card-top [:span.name stage]
-            [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
-           [:select {:name (str "model:" stage)}
-            (for [v (sort task-lib/known-vendors)]
-              [:option {:value v :selected (= v (get params (str "model:" stage) "anthropic"))} v])]
-           ;; Which checkout this role works in. One repo and there is nothing
-           ;; to choose; several and the choice is the whole point — a lineup
-           ;; silently pinned to repo one is how multi-repo stops being real.
-           (when (> (count picked) 1)
-             [:select {:name (str "repo-of:" stage)}
-              (for [r (sort picked)]
-                [:option {:value r :selected (= r (get params (str "repo-of:" stage)))}
-                 (task-lib/repo-name r)])])])]
-       [:div.go
-        [:button {:type "submit"} "Create project"]
-        [:span.muted (count available) " checkouts found · harnesses: " (str/join ", " (sort task-lib/known-agents))]]]]]))
+  "A project: a name, the checkouts found under the repo roots, and the role
+   cards. The roles are picked once here so no task ever asks for them again.
+   With `project` it edits that one instead, posting to its own URL."
+  ([error params] (project-form error params nil))
+  ([error params project]
+   (let [available (distinct (concat (project-lib/available-repos) (:repos project)))
+         picked (set (keep #(second (re-matches #"repo:(.+)" %)) (keys params)))
+         first-run? (empty? params)
+         default (set (map :role project-lib/default-roles))]
+     [:details.composer {:class (when project "own") :open (boolean (or error project))}
+      [:summary (if project
+                  (str "Edit " (:name project) " — its checkouts and its swarm")
+                  "New project — the checkouts and the swarm, set once")]
+      [:div.inner
+       (when error [:p.err error])
+       [:form {:method "post" :action (if project (str "/projects/" (:name project)) "/projects")}
+        [:div.fields
+         [:label "project name"
+          ;; Fixed once written: a task points at its project by name, so a
+          ;; rename would orphan every task already scaffolded from it.
+          [:input (cond-> {:type "text" :name "name" :placeholder "lothlorien-analytics" :required true
+                           :value (get params "name" "")}
+                    project (assoc :readonly true))]]
+         [:label "checkouts under " [:code (str/join ", " (project-lib/default-repo-roots))]
+          [:div.picklist
+           (if (seq available)
+             (for [r available]
+               [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
+                                     :checked (contains? picked r)}]
+                [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])
+             [:p.empty "no git checkouts found — type a path below"])]]
+         [:label "or paths not under those roots, one per line"
+          [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
+           (get params "extra-repos")]]]
+        [:p.muted "roles — the swimlane's columns, in this order"]
+        [:div.cards.rolepick
+         (for [stage (project-lib/stage-prompts)
+               :let [on? (if first-run? (contains? default stage) (boolean (get params (str "role:" stage))))]]
+           [:label.card.rolecard
+            [:div.card-top [:span.name stage]
+             [:input {:type "checkbox" :name (str "role:" stage) :checked on?}]]
+            ;; Three controls, three questions. The harness is what runs the
+            ;; role — a CLI, or one of the operator's own lane scripts, which is
+            ;; claude plus an SSO wrap, an effort level, an MCP set and a model
+            ;; router. The vendor is the endpoint, and only the bare `claude`
+            ;; harness reads it: a lane brings its own router, keyed on the
+            ;; model NAME, and codex and grok have their own logins. So for
+            ;; everything but `claude` the vendor select is disabled rather than
+            ;; offering a choice that silently does nothing, and the model id —
+            ;; which every one of them honours — stays live.
+            (let [h (get params (str "harness:" stage) "claude")]
+              (list
+               [:select {:name (str "harness:" stage)}
+                (for [a (sort task-lib/known-agents)]
+                  [:option {:value a :selected (= a h)} a])]
+               (let [declared (get params (str "model:" stage) (project-lib/default-model stage))
+                     [vendor model-id] (task-lib/split-model declared)
+                     off? (not= "claude" h)]
+                 (list
+                  [:select (cond-> {:name (str "vendor:" stage)}
+                             off? (assoc :disabled true
+                                         :title (if (task-lib/lane-agents h)
+                                                  (str h " brings its own routing — its model router picks the endpoint from the model name")
+                                                  (str h " does not take a vendor; it uses its own login"))))
+                   (for [v (sort task-lib/known-vendors)]
+                     [:option {:value v :selected (= v vendor)} v])]
+                  ;; Optional, and free text on purpose: the id after the colon
+                  ;; is the vendor's own namespace, not a set this repo can
+                  ;; enumerate without going stale every time a vendor ships.
+                  [:input (cond-> {:type "text" :name (str "modelid:" stage)
+                                   :value (or model-id "")
+                                   :autocomplete "off"
+                                   :placeholder "exact model (optional)"
+                                   :title "overrides the harness's default, e.g. claude-opus-5[1m]"}
+                            ;; live for a lane: the model name is the only thing
+                            ;; its router reads, so this is the whole choice
+                            (and off? (not (task-lib/lane-agents h))) (assoc :disabled true))]))))
+            ;; No checkout picker: a role works in every repo the project holds,
+            ;; and a task narrows that with `@repo` tags on its goal lines.
+            ])]
+        [:div.go
+         [:button {:type "submit"} (if project "Save project" "Create project")]
+         [:span.muted (count available)
+          " checkouts found · a cc_ harness is that launcher, inherited whole —"
+          " its SSO wrap, effort, MCP set and model router — with this task's prompt,"
+          " settings and permission mode layered over it"]]]
+       ;; Its own form, so Enter in the name field can never reach it.
+       (when project
+         [:form.danger {:method "post" :action (str "/projects/" (:name project) "/delete")}
+          [:button.linky {:type "submit"} "Delete project"]
+          [:span.muted "the lineup only — its tasks keep their own repos and roles, and are listed outside a project"]])]])))
 
 (defn project-section
   "One project: its role lanes as columns, its tasks as cards in the lane each
    one is actually in. The lane comes from the task's own board, so a card moves
    because a git handoff moved it, never because the portal said so."
   [project]
-  (let [columns (conj (mapv :role (:roles project)) "done")
+  (let [columns (conj (mapv :role (:roles project)) board-lib/review-lane "done")
         cards (for [id (project-lib/tasks-for (:name project))
                     :let [ctx (task-lib/task-ctx id)]]
-                {:id id :lane (lane ctx) :attention (count (open-attention ctx))})
+                {:id id :lane (lane ctx) :progress (lane-progress ctx)
+                 :attention (count (open-attention ctx))})
         placed (set (map :lane cards))
         stray (remove #(contains? (set columns) (:lane %)) cards)]
     [:section.project
      [:div.project-head
       [:h2.pname (:name project)]
       [:span.muted (str/join ", " (map #(task-lib/repo-name %) (:repos project)))]
-      (let [idle (project-lib/unused-repos project)]
-        (when (seq idle)
-          [:span.status.unmet "no role opens " (str/join ", " (map task-lib/repo-name idle))]))
+      [:a.doc {:href (str "/projects/" (:name project) "/edit")} "edit"]
       [:a.btn {:href (str "/projects/" (:name project) "/new")} "New task"]]
      [:div.scroll
       [:div.swim
@@ -649,7 +789,11 @@
               [:div.name.trunc (:id c)]
               (if (pos? (:attention c))
                 [:span.status.unmet (:attention c) " needs you"]
-                [:span.status.met "clear"])])]])]]
+                [:span.status.met "clear"])
+              ;; The column already names the role; the card says how much of it
+              ;; is done, which is what three repo names would have said in a
+              ;; space that fits none of them.
+              (when-let [p (:progress c)] [:span.muted p])])]])]]
      (when (seq stray)
        [:p.muted "not in a lane yet: "
         (interpose ", " (for [c stray] [:a {:href (str "/tasks/" (:id c))} (:id c) " (" (:lane c) ")"]))])]))
@@ -668,11 +812,11 @@
              (for [id loose :let [ctx (task-lib/task-ctx id) att (open-attention ctx)]]
                [:a.row {:href (str "/tasks/" id)}
                 [:div.grow [:div.name.trunc id]
-                 [:div.muted.trunc (str/join ", " (map :role (roles ctx)))]]
+                 [:div.muted.trunc (session-summary (sessions ctx))]]
                 (if (seq att)
                   [:span.status.unmet (count att) " needs you"]
                   [:span.status.met "clear"])
-                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane ctx)]
+                [:span.lane {:class (when (= "done" (lane ctx)) "done")} (lane-label ctx)]
                 [:span.chev "›"]])])
           ;; a plain child: .composer is position:fixed, so it needs no help
           ;; from the shell to sit at the bottom of the viewport.
@@ -704,15 +848,12 @@
          [:div.row.head
           [:div.grow
            [:div.name "the swarm"]
-           [:div.muted (str/join " · " (for [{:keys [role model repo]} (:roles project)]
-                                         (str role " (" model ") in " (task-lib/repo-name (or repo "none")))))]]]
+           [:div.muted (str/join " · " (for [{:keys [role model]} (:roles project)]
+                                         (str role " (" model ")")))]]]
          [:div.row.head
           [:div.grow
            [:div.name "checkouts"]
-           [:div.muted (str/join " · " (:repos project))
-            (let [idle (project-lib/unused-repos project)]
-              (when (seq idle)
-                [:span.status.pending "no role works in " (str/join ", " (map task-lib/repo-name idle))]))]]]
+           [:div.muted (str/join " · " (:repos project))]]]
          [:form {:method "post" :action (str "/projects/" (:name project) "/review")}
           [:div.fields.stack
            [:label "task id"
@@ -782,9 +923,10 @@
    the URL and survives a reload rather than living in a variable."
   [ctx watching]
   (let [id (:task-id ctx)
-        names (map :role (roles ctx))
+        names (map :session (sessions ctx))
         watching (or (some #{watching} names) (first names))
-        state (when watching (pane-state ctx watching))]
+        view (when watching (pane-view ctx watching {:ansi true}))
+        state (:state view)]
     [:aside.rail
      [:div.tabs
       (for [r names]
@@ -797,7 +939,7 @@
           (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
          [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
         [:pre#pane.term {:data-task id :data-role watching}
-         (ansi->hiccup (pane-text ctx watching {:ansi true}))]
+         (ansi->hiccup (:text view))]
         ;; The pane is the only way to reach an agent mid-turn: it owns the
         ;; terminal, and the inbox it reads between turns is no use to a role
         ;; that is already running. Until now that meant a tmux attach in
@@ -828,7 +970,23 @@
              [:div.muted "goal.md and metrics.md are read-only here — the checkboxes show the judge's latest verdicts, never an edit"]]
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
-            [:span.lane {:class (when (= "done" l) "done")} l]]]
+            [:span.lane {:class (when (= "done" l) "done")} (lane-label ctx)]]]
+          ;; First on the page, above Attention: the one question a reader opens
+          ;; this page to answer. Everything below it — attention, goals, bars,
+          ;; roles — is the evidence for the answer, so it reads as the summary
+          ;; and then its working, not as a footnote after four scrolls.
+          (let [cached (summary/read-summary ctx)]
+            [:section
+             [:h2 "Ready to merge?"
+              (when-let [h (:headers cached)]
+                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
+             [:form {:method "post" :action (str "/tasks/" id "/summary")}
+              [:button {:type "submit"} (if cached "Summarize again" "Summarize")]
+              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
+               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
+             (if cached
+               [:pre (:body cached)]
+               [:p.empty "not asked yet"])])
           (let [done (handled ctx)
                 keyed (for [a att] (assoc a :key (attention-key a) :done (get done (attention-key a))))
                 ;; crossed-off items sink to the bottom and stop counting, the
@@ -860,11 +1018,18 @@
                    [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
                    [:div.full (:text a)]]])
                [:p.empty "nothing needs a human"])])
-          [:section [:h2 "Goal"]
-           [:ul.plain
-            (for [g (goal-lines (text (:goal-file ctx))) :let [{:keys [status roles]} (goal-status g vs)]]
-              [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}] " " (:text g) " "
-               [:span.status {:class (name status)} (name status) (when (seq roles) (str ": " (str/join ", " roles)))]])]]
+          (let [goals (goal-lines (text (:goal-file ctx)))
+                item (fn [g]
+                       (let [{:keys [status roles]} (goal-status g vs)]
+                         [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}]
+                          " " (when (:role g) [:span.muted (:role g) " — "]) (:text g) " "
+                          [:span.status {:class (name status)} (name status)
+                           (when (seq roles) (str ": " (str/join ", " roles)))]]))]
+            [:section [:h2 "Goal"]
+             (if-let [grouped (goals-by-repo (distinct (keep :repo (sessions ctx))) goals)]
+               (for [[repo mine] grouped]
+                 (list [:h3.repo repo] [:ul.plain (map item mine)]))
+               [:ul.plain (map item goals)])])
           [:section [:h2 "Metrics bars"]
            [:div.scroll
             [:table.bars [:tr [:th "bar"] [:th "threshold"] [:th "latest evidence"]]
@@ -883,18 +1048,17 @@
                        " " [:span.muted (:at e)]
                        (when (seq (:tail e)) [:pre (:tail e)])]
                       [:span.status.pending "no evidence yet"])]])]]]
-          (let [cached (summary/read-summary ctx)]
+          (when-let [prs (seq (pr-watch/shipped ctx))]
             [:section
-             [:h2 "Ready to merge?"
-              (when-let [h (:headers cached)]
-                [:span.muted " · " (get h "model") " · $" (get h "cost") " · " (get h "at")])]
-             [:form {:method "post" :action (str "/tasks/" id "/summary")}
-              [:button {:type "submit"} (if cached "Ask again" "Ask")]
-              [:span.muted " reads goal.md, the verdicts, decision/gotcha/escalation, "
-               "every bar's evidence and each role's diff — one call, and it merges nothing"]]
-             (if cached
-               [:pre (:body cached)]
-               [:p.empty "not asked yet"])])
+             [:h2 "In review"]
+             [:ul.plain
+              (for [p prs]
+                [:li [:span.muted (:repo p) " "] [:a.doc {:href (:url p)} (:url p)]
+                 [:span.muted " as " (:account p)]])]
+             [:form {:method "post" :action (str "/tasks/" id "/pr")}
+              [:button {:type "submit"} "Check now"]
+              [:span.muted " handoffd asks every 60s; this asks now. New review comments and "
+               "failing checks become handoffs to whoever last committed in that repo."]]])
           (let [t (telemetry/task-totals id)]
             [:section [:h2 "Telemetry"
                        (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]
@@ -914,19 +1078,36 @@
               ;; link has to sum the window the same way telemetry.bb does.
               [:a {:href (str (telemetry/base-url) "/vmui/#/?g0.expr="
                               (java.net.URLEncoder/encode (str "sum by (role) (sum_over_time(claude_code.cost.usage{task_id=\"" id "\"}[7d]))") "UTF-8"))} "vmui"]
-              " · repo dashboard: dashboards/swarmkhazad.json"]])
+              " · "
+              ;; The trend boards VictoriaMetrics itself serves. Naming the JSON
+              ;; file was not a link and told a reader nothing they could click.
+              [:a {:href (str (telemetry/base-url) "/vmui/#/dashboards")} "trend dashboards"]
+              [:span.muted " (dashboards/swarmkhazad.json)"]]])
+          ;; Grouped by role, in the roles file's own order, because that order IS
+          ;; the sequence the work moves through — every implement repo, then every
+          ;; review repo. Flowing the sessions into one auto-fill grid put
+          ;; `review_gobel` beside `implement_gobel` and wrapped `review_superset`
+          ;; onto a second row, which reads as four unrelated agents rather than
+          ;; two stages of one task. The card names its repo; the band names the
+          ;; role, so the session name is not repeated on every card.
           [:section [:h2 "Roles"]
-           [:div.cards
-            (for [c (role-cards ctx)]
-              [:div.card
-               [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:role c))} (:role c)] [:span.chev "›"]]
-               [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
-               [:div "judge: " (if-let [v (:verdict c)]
-                                 [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
-                                 [:span.status.pending "no verdict"])]
-               [:div.muted "sent " (:sent c) " · inbox " (:inbox c)]
-               [:div.muted.pane-line (:last-line c)]])]]
-          (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file] ["escalation.md" :escalation-file]]]
+           (let [cs (session-cards ctx)]
+             [:div.rolegroups
+              (for [role (distinct (map :role cs))]
+                [:div.rolegroup
+                 [:div.rolename role]
+                 (for [c cs :when (= role (:role c))]
+                   [:div.card
+                    [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:repo c)] [:span.chev "›"]]
+                    [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
+                    [:div "judge: " (if-let [v (:verdict c)]
+                                      [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
+                                      [:span.status.pending "no verdict"])]
+                    [:div.muted "sent " (:sent c) " · inbox " (:inbox c)]
+                    [:div.muted.pane-line (:last-line c)]])])])]
+          (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file]
+                           ["finding.md — what the swarm worked out, not an ask" :finding-file]
+                           ["escalation.md" :escalation-file]]]
             [:section [:h2 title]
              (let [ls (nonblank-lines (text (get ctx k)))]
                (if (seq ls) [:ul.plain (for [l ls] [:li (str/replace l #"^- " "")])] [:p.empty "empty"]))])
@@ -964,6 +1145,25 @@
          (if (:ok result)
            {:status 303 :headers {"Location" "/"} :body ""}
            (html 400 (index-page (:error result) params)))))
+     (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/edit" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (html 200 (page {:title (str name " · edit") :crumb name}
+                         (project-form nil (project-params project) project)))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)" uri))]
+       (if-let [project (project-lib/read-project name)]
+         (let [params (parse-form (if (string? body) body (some-> body slurp)))
+               result (update-project! name params)]
+           (if (:ok result)
+             {:status 303 :headers {"Location" "/"} :body ""}
+             (html 400 (page {:title (str name " · edit") :crumb name}
+                             (project-form (:error result) (assoc params "name" name) project)))))
+         (not-found)))
+     (when-let [[_ name] (and (= :post method) (re-matches #"/projects/([^/]+)/delete" uri))]
+       (if (project-lib/read-project name)
+         (do (project-lib/delete-project! name)
+             {:status 303 :headers {"Location" "/"} :body ""})
+         (not-found)))
      (when-let [[_ name] (and (= :get method) (re-matches #"/projects/([^/]+)/new" uri))]
        (if-let [project (project-lib/read-project name)]
          (html 200 (new-task-page project nil {}))
@@ -995,10 +1195,10 @@
          (if-let [f (and ctx (doc-file ctx rel))] (plain 200 (slurp (str f))) (not-found))))
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx)))) (html 200 (role-page ctx role)) (not-found))))
+         (if (and ctx (some #{role} (map :session (sessions ctx)))) (html 200 (role-page ctx role)) (not-found))))
      (when-let [[_ id role] (and (= :get method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/pane" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
+         (if (and ctx (some #{role} (map :session (sessions ctx)))) (plain 200 (pane-text ctx role)) (not-found))))
      ;; Typing into a pane is what an attached operator already does, and the
      ;; attach command is printed beside the box — this route is that reach,
      ;; not a new one. The text is passed as one argv element to `tmux
@@ -1016,6 +1216,11 @@
              (set-handled! ctx key (= "handle" (get params "do"))))
            {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
          (not-found)))
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/pr" uri))]
+       (if-let [ctx (ctx-for id)]
+         (do (try (pr-watch/poll! ctx) (catch Exception _ nil))
+             {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
+         (not-found)))
      (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/summary" uri))]
        (if-let [ctx (ctx-for id)]
          (let [r (summary/summarize! ctx)]
@@ -1028,7 +1233,7 @@
          (not-found)))
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]
-         (if (and ctx (some #{role} (map :role (roles ctx))))
+         (if (and ctx (some #{role} (map :session (sessions ctx))))
            (let [params (parse-form (if (string? body) body (some-> body slurp)))]
              (if (= "stop" (get params "do"))
                (handoff-lib/press-key! ctx role "Escape")

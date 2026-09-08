@@ -17,7 +17,38 @@
             [babashka.process :as process]
             [clojure.string :as str]))
 
-(def known-agents #{"claude" "codex" "copilot" "grok"})
+(def cli-agents
+  "Harnesses that are a CLI on PATH."
+  #{"claude" "codex" "copilot" "grok"})
+
+(def lane-agents
+  "Harnesses that are one of the operator's own launcher scripts.
+
+   A lane is claude plus a fixed set of flags and an environment — the SSO wrap,
+   an effort level, its own MCP set, and a model router keyed on the model name.
+   Naming one here means a role inherits all of that; the swarm appends its own
+   three flags afterwards and, because the parser takes the last occurrence,
+   keeps the role's prompt, its truth-lock settings and its permission mode.
+
+   `cc_auto` resolves to `<claude-config-dir>/scripts/cc-auto.sh`. By convention
+   rather than a table: the path is derivable, and a table of one operator's
+   absolute paths in a shared repo is stale on any other machine."
+  #{"cc_full" "cc_auto" "cc_control" "cc_alt"})
+
+(def known-agents (into cli-agents lane-agents))
+
+(defn cc-home
+  "The operator's Claude Code config directory — where the lanes live."
+  []
+  (or (not-empty (or (System/getenv "CLAUDE_CONFIG_DIR") ""))
+      (str (fs/path (System/getProperty "user.home") ".claude"))))
+
+(defn lane-script
+  "The launcher a lane harness names, or nil if it is not a lane."
+  [harness]
+  (when (lane-agents harness)
+    (fs/path (cc-home) "scripts" (str (str/replace harness "_" "-") ".sh"))))
+
 (def receive-modes #{"task" "batch"})
 
 ;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the
@@ -36,13 +67,28 @@
 ;; there, not at the first agent launch.
 (def known-vendors (conj (set (keys (read-vendors))) "anthropic"))
 
-;; roles.tsv column order. Read by every helper; never index a column by number
-;; anywhere else. A role without a repo carries the literal `none` in :repo.
-;; :extra-args is space-joined — an argument can never contain whitespace because
-;; the declaration is split on whitespace — and must be re-split into argv by the
-;; consumer, never spliced into a shell string.
-(def roles-tsv-columns
-  [:role :harness :repo :worktree-path :receive-mode :model :branch :extra-args])
+(defn split-model
+  "`<vendor>[:<model-id>]` -> [vendor model-id-or-nil].
+
+   Split on the FIRST colon only: a model id carries colons of its own
+   (`moonshotai/kimi-k3:exacto`), and splitting on the last one would hand the
+   vendor half `kimi:moonshotai/kimi-k3` and lose the endpoint."
+  [s]
+  (let [i (str/index-of (or s "") ":")]
+    (if i
+      [(subs s 0 i) (not-empty (subs s (inc i)))]
+      [(or s "") nil])))
+
+(def sessions-tsv-columns
+  "state/sessions.tsv: the (role, repo) pairs this task runs, and where each
+   one's working directory is. Written once at prepare, read everywhere else —
+   the path used to be re-derived in five places, which is how :worktree-path
+   drifted from the truth.
+
+   Denormalized: each row also carries its role's harness and model, so the
+   shim and every helper read one table. The shim reads the session from column
+   1 and the vendor from column 7 (pinned by shim_test)."
+  [:session :role :repo :worktree-path :harness :receive-mode :model :extra-args])
 
 (defn fail! [message]
   (binding [*out* *err*]
@@ -79,7 +125,7 @@
 ;; start, then letters/digits/dot/dash. No underscore (handoff filenames use it
 ;; as the field separator), no slash, no leading dot or dash.
 (defn valid-role? [role]
-  (boolean (and (string? role) (re-matches #"[A-Za-z0-9][A-Za-z0-9.-]{0,63}" role))))
+  (boolean (and (string? role) (re-matches #"[A-Za-z0-9][A-Za-z0-9-]{0,63}" role))))
 
 (defn task-ctx
   "The path map for one task. Pure: builds paths, touches nothing."
@@ -96,8 +142,12 @@
      :decision-file (fs/path task-dir "decision.md")
      :gotcha-file (fs/path task-dir "gotcha.md")
      :escalation-file (fs/path task-dir "escalation.md")
+     ;; What the swarm worked out, as opposed to what it is waiting on. Kept
+     ;; apart from escalation.md because the portal counts asks, and a finding
+     ;; counted as an ask reads as a problem nobody is solving.
+     :finding-file (fs/path task-dir "finding.md")
      :evidence-dir (fs/path task-dir "evidence")
-     :repos-dir (fs/path task-dir "repos")
+     :repos-file (fs/path task-dir "repos")
      :worktrees-dir (fs/path task-dir "worktrees")
      :mail-dir (fs/path task-dir "mail")
      :tmp-dir (fs/path task-dir "tmp")
@@ -106,6 +156,7 @@
      :hooks-dir (fs/path task-dir "hooks")
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
+     :sessions-tsv (fs/path state-dir "sessions.tsv")
      :tmux-socket (tmux-socket-path task-id)
      :tmux-socket-file (fs/path state-dir "tmux-socket")
      :board-dir (fs/path state-dir "board")
@@ -136,21 +187,24 @@
 ;;
 ;; Grammar, one role per line, `#` comments and blank lines skipped:
 ;;
-;;   <role> <harness> <repo-path|none> [task|batch] [model=<vendor>] [cli args...]
+;;   <role> <harness> <repo-path|none> [task|batch] [model=<vendor>[:<model-id>]] [cli args...]
 ;;
 ;; The two optional tokens are recognised anywhere after the repo, in any order;
 ;; whatever is left is passed to the harness CLI verbatim.
 
 (def roles-grammar-comment
-  "# <role> <harness> <repo-path|none> [task|batch] [model=anthropic|glm|kimi|deepseek|qwen] [cli args...]\n")
+  "# <role> <harness> [task|batch] [model=anthropic|glm|kimi|deepseek|qwen[:<model-id>]] [cli args...]\n")
+
+(def repos-grammar-comment
+  "# one checkout per line; the task branches sk/<task-id> off origin/<default>\n# <abs-path> [branch=<name>]\n")
 
 (defn roles-template
-  "A starter `roles` file: one implement role per repo, or one repo-less role."
-  [repos]
-  (str roles-grammar-comment
-       (if (seq repos)
-         (str/join "" (map #(str "implement claude " % " task\n") repos))
-         "implement claude none task\n")))
+  "A starter `roles` file. Repos are the task's, not a role's — see repos-text."
+  [_repos]
+  (str roles-grammar-comment "implement claude task\n"))
+
+(defn repos-text [repos]
+  (str repos-grammar-comment (str/join "" (map #(str % "\n") repos))))
 
 (defn skip-line? [line]
   (or (str/blank? line) (str/starts-with? line "#")))
@@ -162,66 +216,112 @@
   (and (fs/directory? path)
        (sh-ok? "git" "-C" (str path) "rev-parse" "--git-dir")))
 
+(defn git [dir & args]
+  (apply sh-out "git" "-C" (str dir) args))
+
+(defn git-ok? [dir & args]
+  (apply sh-ok? "git" "-C" (str dir) args))
+
+(defn resolvable
+  "The commit a ref names, but only when this checkout actually holds it."
+  [src rev]
+  (when (git-ok? src "rev-parse" "--verify" "--quiet" (str rev "^{commit}"))
+    (git src "rev-parse" (str rev "^{commit}"))))
+
+(defn has-branch?
+  "True when the source knows this branch, locally or on origin."
+  [src branch]
+  (boolean (or (resolvable src (str "refs/remotes/origin/" branch))
+               (resolvable src (str "refs/heads/" branch)))))
+
 (defn parse-role-line
   "One `roles` line → a role map, or throws with the line number."
   [line-no line]
   (let [fields (str/split (str/trim line) #"\s+")
-        _ (when (< (count fields) 3)
-            (throw (ex-info (format "roles line %d: need <role> <harness> <repo>; got %s" line-no (pr-str line)) {})))
-        [role harness repo & trailing] fields
+        _ (when (< (count fields) 2)
+            (throw (ex-info (format "roles line %d: need <role> <harness>; got %s" line-no (pr-str line)) {})))
+        [role harness & trailing] fields
         harness (str/lower-case harness)
         receive-mode (or (some receive-modes trailing) "task")
         model-token (some #(when (str/starts-with? % "model=") %) trailing)
         model (if model-token (subs model-token (count "model=")) "anthropic")
-        branch-token (some #(when (str/starts-with? % "branch=") %) trailing)
-        branch (when branch-token (subs branch-token (count "branch=")))
-        extra (remove #(or (receive-modes %) (str/starts-with? % "model=") (str/starts-with? % "branch=")) trailing)]
+        extra (remove #(or (receive-modes %) (str/starts-with? % "model=")) trailing)]
     (when-not (valid-role? role)
       (throw (ex-info (format "roles line %d: role %s must match [A-Za-z0-9][A-Za-z0-9.-]* (a path component and a refname segment; no underscore, slash, or leading dot/dash)" line-no (pr-str role)) {})))
     (when-not (known-agents harness)
       (throw (ex-info (format "roles line %d: unknown harness %s (want %s)" line-no (pr-str harness) (str/join "|" (sort known-agents))) {})))
-    (when-not (known-vendors model)
-      (throw (ex-info (format "roles line %d: unknown model vendor %s (want %s)" line-no (pr-str model) (str/join "|" (sort known-vendors))) {})))
+    ;; Only the vendor half is a closed set — it selects a base URL and a
+    ;; keychain service, both of which have to exist. The model id after the
+    ;; colon is the vendor's own namespace and is not ours to enumerate.
+    (let [[vendor model-id] (split-model model)]
+      (when-not (known-vendors vendor)
+        (throw (ex-info (format "roles line %d: unknown model vendor %s (want %s, optionally %s:<model-id>)"
+                                line-no (pr-str vendor) (str/join "|" (sort known-vendors)) "<vendor>") {})))
+      (when (and model-id (str/blank? (str/trim model-id)))
+        (throw (ex-info (format "roles line %d: model=%s: names a vendor and an empty model id" line-no vendor) {}))))
+    (when (some #(str/starts-with? % "/") trailing)
+      (throw (ex-info (format "roles line %d: a role no longer names a repo — put checkouts in the task's `repos` file. Got %s"
+                              line-no (pr-str line)) {})))
     {:role role
      :harness harness
-     :repo (when-not (= "none" repo) (str (fs/expand-home repo)))
      :receive-mode receive-mode
      :model model
-     :branch branch
      :extra-args (str/join " " extra)}))
 
 (defn repo-name [repo-path]
   (str/replace (fs/file-name (fs/canonicalize (fs/path repo-path))) #"\.git$" ""))
 
-(defn check-repos!
-  "Every named repo is a git checkout, and no two distinct checkouts share a
-   basename (they would share one clone dir).
+(defn parse-repo-line
+  "One `repos` line → {:path :branch}, or throws with the line number."
+  [line-no line]
+  (let [[path & trailing] (str/split (str/trim line) #"\s+")
+        branch-token (some #(when (str/starts-with? % "branch=") %) trailing)
+        unknown (remove #(str/starts-with? % "branch=") trailing)]
+    (when (seq unknown)
+      (throw (ex-info (format "repos line %d: unknown token %s (want branch=<name>)"
+                              line-no (pr-str (first unknown))) {})))
+    {:path (str (fs/expand-home path))
+     :branch (when branch-token (not-empty (subs branch-token (count "branch="))))}))
 
-   A shallow source is allowed. Measured: cloning one, adding worktrees off the
-   clone and merging a bare SHA between them all work — every handoff commit
-   descends from the pinned HEAD, which is inside the shallow window, so the
-   merge base is always present. The one loss is that git declines to hardlink
-   objects out of a shallow repository, so the clone costs disk. That is worth
-   a warning, not a refusal: most working checkouts on this machine are shallow."
-  [rows]
-  (doseq [{:keys [repo role]} rows
-          :when repo]
-    (when-not (git-checkout? repo)
-      (throw (ex-info (format "role %s: repo %s is not a git checkout" role repo) {})))
-    (when (= "true" (sh-out "git" "-C" repo "rev-parse" "--is-shallow-repository"))
-      (binding [*out* *err*]
-        (println (format "note: role %s: %s is shallow; its clone copies objects instead of hardlinking them" role repo)))))
-  (let [by-name (->> rows
-                     (keep :repo)
-                     (map #(str (fs/canonicalize (fs/path %))))
-                     distinct
-                     (group-by repo-name))]
-    (doseq [[name paths] by-name
-            :when (> (count paths) 1)]
-      (throw (ex-info (format "repos %s share the basename %s and would share one clone; rename one checkout" (str/join " and " paths) (pr-str name)) {})))))
+(defn check-repos!
+  "Every repo is a git checkout, and no two share a basename. The basename is
+   the worktree's directory name and the `@tag` on a goal line, so a collision
+   would make both ambiguous."
+  [repos]
+  (doseq [{:keys [path branch]} repos]
+    (when-not (git-checkout? path)
+      (throw (ex-info (format "repos: %s is not a git checkout" path) {})))
+    ;; A named branch that does not exist would silently start the task from
+    ;; HEAD — the operator asked for one base and would get another.
+    (when (and branch (not (has-branch? path branch)))
+      (throw (ex-info (format "repos: %s has no branch %s" path branch) {}))))
+  (doseq [[name paths] (->> repos
+                            (map #(str (fs/canonicalize (fs/path (:path %)))))
+                            distinct
+                            (group-by repo-name))
+          :when (> (count paths) 1)]
+    (throw (ex-info (format "repos %s share the basename %s; it names a worktree and tags goal lines, so rename one checkout"
+                            (str/join " and " paths) (pr-str name)) {}))))
+
+(defn parse-repos
+  "The task's `repos` file → [{:name :path :branch}].
+
+   Repos belong to the task, not to a role. Every role can work in all of them;
+   which ones a role actually touches is a property of its goal lines."
+  [ctx]
+  (when-not (fs/regular-file? (:repos-file ctx))
+    (throw (ex-info (str "No repos declaration at " (:repos-file ctx)) {})))
+  (let [rows (->> (str/split-lines (slurp (str (:repos-file ctx))))
+                  (map-indexed (fn [i line] [(inc i) line]))
+                  (remove (fn [[_ line]] (skip-line? line)))
+                  (mapv (fn [[n line]] (parse-repo-line n line))))]
+    (when (empty? rows)
+      (throw (ex-info (str "repos declaration is empty: " (:repos-file ctx)) {})))
+    (check-repos! rows)
+    (mapv #(assoc % :name (repo-name (:path %))) rows)))
 
 (defn parse-roles
-  "Parse the task's `roles` declaration. Rejects duplicates and bad repos."
+  "Parse the task's `roles` declaration. Rejects duplicates."
   [ctx]
   (when-not (fs/regular-file? (:roles-file ctx))
     (throw (ex-info (str "No roles declaration at " (:roles-file ctx)) {})))
@@ -234,46 +334,151 @@
     (let [dupes (->> rows (map :role) frequencies (filter (fn [[_ n]] (> n 1))) (map first))]
       (when (seq dupes)
         (throw (ex-info (str "duplicate roles: " (str/join ", " dupes)) {}))))
-    (check-repos! rows)
-    (mapv (fn [row]
-            (assoc row :worktree-path (if (:repo row)
-                                        (str (fs/path (:worktrees-dir ctx) (:role row)))
-                                        (str (:task-dir ctx)))))
-          rows)))
+    rows))
 
-;; ---------------------------------------------------------------- roles.tsv
+;; -------------------------------------------------------------- goal lines
+;;
+;; goal.md's checkboxes carry the two facts that decide the session table:
+;; which role owns a line, and which repos it touches.
 
-(defn write-roles-tsv! [ctx roles]
+(defn goal-line
+  "One goal.md checkbox → {:ticked :role :repos :text}, or nil for other lines.
+
+   `- [ ] implement @gobel @cirdan — wire the exporter`. The role is the first
+   bare word before the em dash, `@tags` name repos, and both are optional: an
+   untagged line belongs to every role and every repo, which is what a
+   single-repo task writes and what the judge already assumed."
+  [line]
+  (when-let [[_ box head body]
+             (or (re-matches #"\s*- \[([ xX])\]\s*(.*?)\s*—\s*(.*)" line)
+                 (when-let [[_ box body] (re-matches #"\s*- \[([ xX])\]\s*(.*)" line)]
+                   [nil box "" body]))]
+    (let [tokens (remove str/blank? (str/split head #"\s+"))
+          tag? #(str/starts-with? % "@")]
+      {:ticked (not= " " box)
+       :role (first (remove tag? tokens))
+       :repos (mapv #(subs % 1) (filter tag? tokens))
+       :text (str/trim body)})))
+
+(defn goal-repos
+  "role → the repo names its goal lines tag, defaulting to every repo.
+
+   A role whose lines carry no tag works everywhere: that is both the one-repo
+   task and the honest reading of a line that never said. An unknown tag is a
+   typo, and a typo that silently widened a role to every repo would be found
+   only by watching it open the wrong worktree."
+  [goals-md roles repo-names]
+  (let [known (set repo-names)
+        lines (keep goal-line (str/split-lines (or goals-md "")))]
+    (doseq [l lines
+            tag (:repos l)
+            :when (not (known tag))]
+      (throw (ex-info (format "goal line tags @%s, which is not one of this task's repos (%s): %s"
+                              tag (str/join ", " (sort known)) (pr-str (:text l))) {})))
+    (into {} (for [{:keys [role]} roles
+                   :let [mine (filter #(or (nil? (:role %)) (= role (:role %))) lines)
+                         tagged (distinct (mapcat :repos mine))]]
+               [role (if (seq tagged) (vec tagged) (vec repo-names))]))))
+
+(defn session-id
+  "The name of a (role, repo) pair. It is a tmux session, a mail directory and
+   a verdict filename, so there is one spelling of it.
+
+   The separator is `_` because a role name cannot contain one and tmux cannot
+   take a `.`: RAN — `new-session -s sk-implement.gobel` succeeds and every
+   later `-t sk-implement.gobel` fails `can't find pane: gobel`, since tmux
+   reads a dot as `session.pane`."
+  [role repo-name]
+  (str role "_" repo-name))
+
+;; ------------------------------------------------------------- sessions.tsv
+
+(defn sessions
+  "The (role, repo) pairs this task runs, in lineup order.
+
+   A one-repo task names its sessions after the roles: `to: review` rather than
+   `to: review_gobel`, which is the same task swarmkhazad always ran and the
+   same ids its tasks already on disk carry. Past one repo the id has to say
+   which, so it does. Nothing derives that rule a second time — the id is a
+   column in sessions.tsv, and every reader looks it up there.
+
+   Denormalized on purpose: a session carries its role's harness and model, so
+   everything downstream reads one table. Roles sharing a repo share its
+   worktree — they are serialized, and a second checkout of the same branch
+   would be two views of one branch racing each other."
+  [ctx roles repos role->repos]
+  (let [path-of (into {} (map (juxt :name #(str (fs/path (:worktrees-dir ctx) (:name %)))) repos))
+        one-repo? (= 1 (count repos))]
+    (vec (for [{:keys [role] :as row} roles
+               name (get role->repos role)]
+           (assoc row
+                  :session (if one-repo? role (session-id role name))
+                  :repo name
+                  :worktree-path (path-of name))))))
+
+(defn write-sessions-tsv! [ctx rows]
   (fs/create-dirs (:state-dir ctx))
-  (spit (str (:roles-tsv ctx))
+  (spit (str (:sessions-tsv ctx))
         (apply str
-               (for [row roles]
-                 (str (str/join "\t" (map #(str (or (get row %) "none")) roles-tsv-columns)) "\n")))))
+               (for [row rows]
+                 (str (str/join "\t" (map #(str (or (get row %) "")) sessions-tsv-columns)) "\n")))))
 
-(defn read-roles-tsv
-  "roles.tsv → vector of role maps keyed by roles-tsv-columns, in declaration
-   order. A `none` repo or branch reads back as nil so `(when (:branch row) …)`
-   is honest — the file writes the literal `none` for an absent value, and a
-   reader that skips this sees the string and treats it as a real branch."
+(defn read-sessions-tsv
+  "sessions.tsv → session maps in lineup order.
+
+   Falls back to a pre-multi-repo roles.tsv, whose row is one session in one
+   repo. Tasks opened before this table existed are still running."
   [ctx]
-  (let [file (:roles-tsv ctx)]
-    (if (fs/regular-file? file)
+  (let [file (:sessions-tsv ctx)
+        legacy (:roles-tsv ctx)]
+    (cond
+      (fs/regular-file? file)
       (->> (str/split-lines (slurp (str file)))
            (remove str/blank?)
            (mapv (fn [line]
-                   (let [row (zipmap roles-tsv-columns (concat (str/split line #"\t" -1) (repeat "")))
-                         un-none #(when-not (= "none" %) (not-empty %))]
-                     (-> row (update :repo un-none) (update :branch un-none))))))
-      [])))
+                   (let [row (zipmap sessions-tsv-columns (concat (str/split line #"\t" -1) (repeat "")))]
+                     (into {} (for [[k v] row] [k (not-empty v)]))))))
 
-(defn role-row [ctx role]
-  (some #(when (= role (:role %)) %) (read-roles-tsv ctx)))
+      (fs/regular-file? legacy)
+      (->> (str/split-lines (slurp (str legacy)))
+           (remove str/blank?)
+           (mapv (fn [line]
+                   (let [[role harness repo worktree receive model _branch extra]
+                         (concat (str/split line #"\t" -1) (repeat ""))
+                         un-none #(when-not (= "none" %) (not-empty %))
+                         repo (un-none repo)]
+                     ;; The session id is the ROLE, always. A task written
+                     ;; under the old shape already has mail/<role>/ and a
+                     ;; pane called sk-<role>; renaming it here would orphan
+                     ;; both, which is the opposite of what the fallback is
+                     ;; for. The old shape was one repo per role anyway.
+                     {:session role
+                      :role role
+                      :repo (when repo (repo-name repo))
+                      :worktree-path (not-empty worktree)
+                      :harness harness
+                      :receive-mode receive
+                      :model model
+                      :extra-args (not-empty extra)}))))
 
-(defn role-names [ctx]
-  (mapv :role (read-roles-tsv ctx)))
+      :else [])))
+
+(defn session-row [ctx session]
+  (some #(when (= session (:session %)) %) (read-sessions-tsv ctx)))
+
+(defn session-names [ctx]
+  (mapv :session (read-sessions-tsv ctx)))
+
+(defn role-names
+  "The lineup, deduplicated — a role appears once per repo in sessions.tsv."
+  [ctx]
+  (->> (read-sessions-tsv ctx) (map :role) distinct vec))
+
+(defn role-sessions [ctx role]
+  (filterv #(= role (:role %)) (read-sessions-tsv ctx)))
 
 (defn extra-argv
-  "roles.tsv :extra-args back to argv. Never splice the string into a shell."
+  "A session's :extra-args back to argv. Never splice the string into a shell."
   [row]
   (vec (remove str/blank? (str/split (or (:extra-args row) "") #"\s+"))))
 
@@ -324,39 +529,36 @@
   [harness]
   (if-let [pinned (not-empty (or (System/getenv (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness))) ""))]
     {:path pinned :skipped [] :pinned true}
-    (let [all (harness-candidates harness)
-          [skipped [chosen]] (split-with wrapper-shim? all)]
-      (when chosen {:path chosen :skipped (vec skipped)}))))
+    ;; A lane is a script at a known path, not a name on PATH — the operator
+    ;; reaches it through a shell alias, and an alias is not a file a child
+    ;; process can exec.
+    (if-let [script (lane-script harness)]
+      (when (fs/executable? script) {:path (str script) :skipped []})
+      (let [all (harness-candidates harness)
+            [skipped [chosen]] (split-with wrapper-shim? all)]
+        (when chosen {:path chosen :skipped (vec skipped)})))))
 
-(defn session-name [role]
-  (str "sk-" role))
+(defn session-name [session]
+  (str "sk-" session))
 
 ;; ---------------------------------------------------------------- mail dirs
 
 (def mail-subdirs ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"])
 
-(defn role-mail-dir [ctx role]
-  (fs/path (:mail-dir ctx) role))
+(defn session-mail-dir [ctx session]
+  (fs/path (:mail-dir ctx) session))
 
 (defn system-mail-dir
   "Where phantom senders — the New Task note `open` queues — leave their mail."
   [ctx]
   (fs/path (:mail-dir ctx) "_system"))
 
-(defn prepare-mail-dirs! [ctx roles]
-  (doseq [row roles
+(defn prepare-mail-dirs! [ctx rows]
+  (doseq [row rows
           sub mail-subdirs]
-    (fs/create-dirs (fs/path (role-mail-dir ctx (:role row)) sub)))
+    (fs/create-dirs (fs/path (session-mail-dir ctx (:session row)) sub)))
   (doseq [sub ["outbox/tmp" "sent" "failed"]]
     (fs/create-dirs (fs/path (system-mail-dir ctx) sub))))
-
-;; ---------------------------------------------------------------- clone
-
-(defn git [dir & args]
-  (apply sh-out "git" "-C" (str dir) args))
-
-(defn git-ok? [dir & args]
-  (apply sh-ok? "git" "-C" (str dir) args))
 
 (defn source-default-branch
   "The branch the source tracks upstream: origin/HEAD's target, else main if
@@ -370,146 +572,157 @@
 
 (defn source-pin-sha
   "The source's origin/<branch> at open time — the shared upstream state, not
-   the operator's local work. Falls back to the source's own branch, then HEAD."
+   the operator's local work. Falls back to the source's own branch, then HEAD.
+
+   `^{commit}` inside resolvable is what makes that fallback real. A ref can
+   name a commit the checkout does not hold: a shallow clone's origin/main
+   points past its own boundary, and plain rev-parse answers with the sha
+   regardless. Starting a worktree there dies on a nonexistent object."
   [src branch]
-  (cond
-    (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/remotes/origin/" branch))
-    (git src "rev-parse" (str "refs/remotes/origin/" branch))
-    (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/heads/" branch))
-    (git src "rev-parse" (str "refs/heads/" branch))
-    :else (git src "rev-parse" "HEAD")))
+  (or (resolvable src (str "refs/remotes/origin/" branch))
+      (resolvable src (str "refs/heads/" branch))
+      (git src "rev-parse" "HEAD")))
 
-(defn source-origin-url [src]
-  (when (git-ok? src "remote" "get-url" "origin")
-    (git src "remote" "get-url" "origin")))
+(defn task-branch
+  "Every repo's worktree for this task sits on one branch name. The task id is
+   in it, so two tasks on the same checkout never collide."
+  [ctx]
+  (str "sk/" (:task-id ctx)))
 
-(defn clone-dir [ctx repo-path]
-  (fs/path (:repos-dir ctx) (repo-name repo-path)))
-
-(defn delete-refs!
-  "Delete refs in one `git update-ref --stdin` call instead of one spawn per ref."
-  [dir refs]
-  (when (seq refs)
-    (let [result (process/sh {:in (apply str (map #(str "delete " % "\n") refs))}
-                             "git" "-C" (str dir) "update-ref" "--stdin")]
-      (when-not (zero? (:exit result))
-        (throw (ex-info (str "update-ref --stdin failed\n" (:err result)) {}))))))
-
-(defn clone-repo!
-  "Clone the local checkout at repo-path into repos/<name>.
-
-   `git clone` of a local path hardlinks the object store, so this costs one
-   directory walk rather than a copy. Afterwards the clone owes the source
-   nothing: <branch> is pinned to the source's origin/<branch>, `origin` is
-   repointed at the source's upstream URL (or removed when the source has none,
-   so no later fetch can reach back into ~/repos), and every other ref and
-   local branch is dropped. Nothing under the source is written; nothing is
-   read from it again."
-  [ctx repo-path & [want-branch]]
-  (let [src (str (fs/canonicalize (fs/path repo-path)))
-        dest (clone-dir ctx repo-path)]
-    (fs/create-dirs (:repos-dir ctx))
-    (when (and want-branch (not (git-ok? src "rev-parse" "--verify" "--quiet" (str "refs/heads/" want-branch))))
-      (throw (ex-info (format "%s has no branch %s; the clone can only pin a branch the checkout already has (the swarm never fetches)"
-                              src want-branch) {})))
-    (if (fs/exists? (fs/path dest ".git"))
-      {:repo src :clone (str dest) :fresh false}
-      (let [branch (or want-branch (source-default-branch src))
-            sha (source-pin-sha src branch)
-            upstream (source-origin-url src)
-            remote-ref (str "refs/remotes/origin/" branch)]
-        (sh-out "git" "clone" "--quiet" "--no-checkout" "--" src (str dest))
-        ;; `git clone` transfers what the source's LOCAL branches reach. When the
-        ;; source has fetched but not merged, its origin/<branch> is ahead of its
-        ;; local one and that commit never arrives — pinning to it fails with
-        ;; "nonexistent object". Fall back to what the clone actually holds: the
-        ;; source's own branch tip, which git wrote as origin/<branch> here.
-        (let [sha (if (git-ok? dest "cat-file" "-e" (str sha "^{commit}"))
-                    sha
-                    (git dest "rev-parse" remote-ref))]
-          (git dest "update-ref" remote-ref sha)
-          (git dest "symbolic-ref" "refs/remotes/origin/HEAD" remote-ref)
-          (git dest "checkout" "--quiet" "-B" branch sha)
-          (delete-refs! dest (->> (str/split-lines (git dest "for-each-ref" "--format=%(refname)" "refs/remotes/origin/" "refs/heads/"))
-                                  (remove str/blank?)
-                                  (remove #{remote-ref "refs/remotes/origin/HEAD" (str "refs/heads/" branch)})))
-          (if upstream
-            (do (git dest "remote" "set-url" "origin" upstream)
-                (git dest "branch" "--quiet" (str "--set-upstream-to=origin/" branch) branch))
-            (git dest "remote" "remove" "origin"))
-          ;; Roles commit as the human's checkout would; the clone has no local
-          ;; identity of its own and a role must never be asked to configure one.
-          (doseq [key ["user.name" "user.email"]]
-            (when (git-ok? src "config" "--get" key)
-              (git dest "config" key (git src "config" "--get" key))))
-          {:repo src :clone (str dest) :fresh true :branch branch :sha sha :upstream upstream})))))
-
-(defn clone-repos!
-  "One clone per distinct repo named in roles. Roles sharing a repo share its
-   clone, so they must agree on the branch it is pinned to."
-  [ctx roles]
-  (let [with-repo (filter :repo roles)
-        ;; Group by the canonical path — ~/x and /abs/x are one clone, so they
-        ;; must be one group or a real disagreement hides between the spellings.
-        ;; And keep the nils: a role that names no branch is asking for the
-        ;; default, which disagrees with a sibling's branch= just as loudly as
-        ;; a second branch name would.
-        branches (->> with-repo (group-by #(str (fs/canonicalize (fs/path (:repo %)))))
-                      (map (fn [[repo rows]] [repo (distinct (map :branch rows))])))]
-    (doseq [[repo bs] branches
-            :when (> (count bs) 1)]
-      (throw (ex-info (format "roles disagree on the branch for %s: %s — one clone cannot be two branches"
-                              repo (str/join ", " (sort (map #(or % "<the repo's default>") bs)))) {})))
-    (->> branches
-         (mapv (fn [[repo bs]] (clone-repo! ctx repo (first bs)))))))
-
-;; ---------------------------------------------------------------- worktrees
-
-(defn role-branch [ctx role]
-  (str "sk/" (:task-id ctx) "/" role))
-
-(defn clone-branch
-  "The pinned branch of a clone: whatever its checked-out branch is."
-  [clone]
-  (git clone "rev-parse" "--abbrev-ref" "HEAD"))
+;; ------------------------------------------------------------------ worktrees
 
 (defn prepare-worktrees!
-  "One worktree per role that names a repo, off that repo's clone, branch sk/<task-id>/<role>."
-  [ctx roles]
+  "One worktree per repo, added from the source checkout at ~/repos.
+
+   The start ref is explicit — the source's origin/<default> at open time, the
+   shared upstream state rather than whatever the operator has checked out. A
+   bare `worktree add <path>` inherits the source's current HEAD instead: RAN
+   in a sandbox, a worktree added while the source sat on a dirty feature
+   branch started from `someone else's work in progress`, which is gobel's own
+   escalation reproduced.
+
+   Nothing is copied and nothing is cloned. The worktree shares the source's
+   object store, so a second task on the same repo costs a checkout.
+
+   Reattaching to a task branch that already exists uses it as-is. `-b` would
+   refuse and `-B` would reset it to the start ref, throwing away every commit
+   a role had made — the one case where re-running prepare could lose work."
+  [ctx repos]
   (fs/create-dirs (:worktrees-dir ctx))
-  (doseq [{:keys [role repo worktree-path]} roles
-          :when repo]
-    (let [clone (clone-dir ctx repo)]
-      (when-not (fs/exists? (fs/path worktree-path ".git"))
-        (git clone "worktree" "add" "--quiet" "-B" (role-branch ctx role) worktree-path (clone-branch clone))))))
+  (let [branch-name (task-branch ctx)]
+    (mapv (fn [{:keys [name path branch]}]
+            (let [dir (str (fs/path (:worktrees-dir ctx) name))
+                  branch (or branch (source-default-branch path))
+                  start (source-pin-sha path branch)]
+              (when-not (fs/exists? (fs/path dir ".git"))
+                ;; A task folder deleted by hand leaves its worktree registered
+                ;; in the source, and `worktree add` then refuses the same path
+                ;; as "missing but already registered". Prune first.
+                (git path "worktree" "prune")
+                (if (git-ok? path "rev-parse" "--verify" "--quiet" (str "refs/heads/" branch-name))
+                  (git path "worktree" "add" "--quiet" dir branch-name)
+                  (git path "worktree" "add" "--quiet" "-b" branch-name dir start)))
+              {:name name :source path :path dir :branch branch-name :start start}))
+          repos)))
 
 ;; ---------------------------------------------------------------- prepare
 
+(defn legacy-task?
+  "A task opened before `repos` existed: no repos file, but a roles.tsv from the
+   old shape. It is still running, and `open` is how anyone resumes it after a
+   reboot kills its tmux socket."
+  [ctx]
+  (and (not (fs/regular-file? (:repos-file ctx)))
+       (fs/regular-file? (:roles-tsv ctx))))
+
 (defn require-truth! [ctx]
-  (doseq [f [(:goal-file ctx) (:metrics-file ctx) (:roles-file ctx)]]
+  (doseq [f (cond-> [(:goal-file ctx) (:metrics-file ctx) (:roles-file ctx)]
+              ;; A legacy task predates this file. Demanding it turned "resume
+              ;; the task you already have" into a hard failure on the one
+              ;; command that resumes it.
+              (not (legacy-task? ctx)) (conj (:repos-file ctx)))]
     (when-not (fs/regular-file? f)
       (throw (ex-info (str "task is missing " (fs/file-name f) ": " f) {})))))
 
 (defn create-layout! [ctx]
-  (doseq [k [:repos-dir :worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
+  (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
              :evidence-dir :board-dir :daemon-dir :sessions-dir]]
     (fs/create-dirs (get ctx k)))
-  (doseq [k [:decision-file :gotcha-file :escalation-file]]
+  (doseq [k [:decision-file :gotcha-file :escalation-file :finding-file]]
     (when-not (fs/exists? (get ctx k))
       (spit (str (get ctx k)) ""))))
 
 (defn prepare!
-  "Build everything under the task folder that a swarm needs before any agent runs:
-   layout, roles.tsv, clones, worktrees, mail dirs. Idempotent."
+  "Build everything under the task folder that a swarm needs before any agent
+   runs: layout, worktrees, sessions.tsv, mail dirs. Idempotent."
   [ctx]
   (require-truth! ctx)
-  (let [roles (parse-roles ctx)]
-    (create-layout! ctx)
-    (let [clones (clone-repos! ctx roles)]
-      (prepare-worktrees! ctx roles)
-      (prepare-mail-dirs! ctx roles)
-      (write-roles-tsv! ctx roles)
+  (if (legacy-task? ctx)
+    ;; Migrate on read, and touch nothing else. Its worktrees exist, at paths
+    ;; its own rows record — one per ROLE, not one per repo. Rebuilding sessions
+    ;; the new way here would add fresh worktrees beside them and point the task
+    ;; at the empty ones, which is how a resume loses a day of work.
+    (let [rows (read-sessions-tsv ctx)]
+      (create-layout! ctx)
+      (prepare-mail-dirs! ctx rows)
+      (write-sessions-tsv! ctx rows)
       {:task-id (:task-id ctx)
        :task-dir (str (:task-dir ctx))
-       :roles roles
-       :clones clones})))
+       :roles (parse-roles ctx)
+       :repos (vec (for [r (distinct (keep :repo rows))] {:name r}))
+       :sessions rows
+       :legacy true})
+    (let [roles (parse-roles ctx)
+          repos (parse-repos ctx)
+          role->repos (goal-repos (slurp (str (:goal-file ctx))) roles (mapv :name repos))]
+      (create-layout! ctx)
+      (let [worktrees (prepare-worktrees! ctx repos)
+            rows (sessions ctx roles repos role->repos)]
+        (prepare-mail-dirs! ctx rows)
+        (write-sessions-tsv! ctx rows)
+        {:task-id (:task-id ctx)
+         :task-dir (str (:task-dir ctx))
+         :roles roles
+         :repos worktrees
+         :sessions rows}))))
+
+;; ---------------------------------------------------------------------------
+;; Attention cross-offs.
+;;
+;; Task state, so it lives here rather than in the portal: a role that fixes the
+;; thing it escalated has to be able to cross the item off itself, and the
+;; portal is not the only writer any more. One key function, shared — a second
+;; copy of this hash in the other writer would drift and quietly stop matching.
+
+(defn attention-key
+  "A stable id for one attention item. Escalations are append-only bullets and
+   the other kinds are derived from files, so the text is the only thing that
+   survives a re-render — there is no row id to use. Hashed because the raw text
+   is a paragraph and this goes in a form field."
+  [{:keys [kind text]}]
+  (let [d (java.security.MessageDigest/getInstance "SHA-1")
+        b (.digest d (.getBytes (str kind "\u0000" text) "UTF-8"))]
+    (apply str (map #(format "%02x" %) (take 8 b)))))
+
+(defn handled-file [ctx] (fs/path (:state-dir ctx) "attention-handled.tsv"))
+
+(defn handled
+  "key → when it was crossed off. A separate file, never escalation.md: the
+   roles own that one and append to it, and a writer that edited it would be
+   rewriting what a role said rather than recording what was done about it."
+  [ctx]
+  (into {} (for [l (str/split-lines (or (try (slurp (str (handled-file ctx))) (catch Exception _ nil)) ""))
+                 :let [[k at] (str/split l #"\t" 2)]
+                 :when (seq (str/trim (or k "")))]
+             [k (or at "")])))
+
+(defn set-handled!
+  "Cross one off, or put it back. Rewrites the file rather than appending, so
+   unticking actually removes the row instead of leaving both states in it."
+  [ctx key on?]
+  (let [now (if on?
+              (assoc (handled ctx) key (str (java.time.Instant/now)))
+              (dissoc (handled ctx) key))]
+    (fs/create-dirs (:state-dir ctx))
+    (spit (str (handled-file ctx))
+          (str/join "" (for [[k at] (sort now)] (str k "\t" at "\n"))))))
