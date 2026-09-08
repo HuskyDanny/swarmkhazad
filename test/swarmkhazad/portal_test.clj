@@ -719,6 +719,25 @@
                  (mapv #(first (str/split % #"\t"))
                        (str/split-lines (slurp (str (fs/path dir "state" "sessions.tsv"))))))
               "and a session per (role, repo), because no goal line tagged a repo")
+          (testing "the opening note goes to every session of the first role"
+            ;; One seed for the whole task left the other sessions of the first
+            ;; role with empty inboxes and nothing downstream that would ever
+            ;; address them — handoffd holds a git_handoff until every session
+            ;; of the sender's role has handed off, so that join could not
+            ;; clear unless they decided for themselves to work from the brief.
+            ;; Task gobelhygine did exactly that, twice.
+            ;;
+            ;; Outbox and sent together: delivery is a daemon tick away and
+            ;; which side of it the file is on is a race, while its existence
+            ;; and its recipient are not.
+            (let [seeds (mapcat #(when (fs/exists? %) (map fs/file-name (fs/glob % "*.handoff")))
+                                [(fs/path dir "mail" "_system" "outbox")
+                                 (fs/path dir "mail" "_system" "sent")])]
+              (is (= #{"implement_fixture" "implement_nested"}
+                     (set (keep #(second (re-matches #".*_to_(.+)\.handoff" %)) seeds)))
+                  "one per session of the first role, in every repo the task holds")
+              (is (not-any? #(str/includes? % "_to_run") seeds)
+                  "and none for a later role — nothing has handed off to it yet")))
           (testing "the card appears in the project's swimlane, in the lane its own board says"
             (is (str/includes? (:body (request env :get "/")) (str "class=\"tcard\" href=\"/tasks/" id "\""))))
           (testing "a second task with the same id is refused"

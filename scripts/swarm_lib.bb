@@ -410,8 +410,19 @@
 ;; ---------------------------------------------------------------- board + mail
 
 (defn queue-new-task-note!
-  "The task's opening mail: from (New Task) to the first role. Its created_at is
-   the wall-clock start of the task."
+  "The task's opening mail: from (New Task) to one session of the first role.
+   Its created_at is the wall-clock start of the task.
+
+   One call per session, not one per role. `handoffd` holds a git_handoff until
+   EVERY session of the sender's role has handed off, because delivering the
+   first sibling's the moment it landed started the next role on trees its
+   siblings were still writing. Seeding one session of a three-repo role leaves
+   that join unable to clear: the other two have empty inboxes and nothing
+   downstream will ever address them, so their only ways out are to sit forever
+   or to decide for themselves that the brief is their instruction. Task
+   gobelhygine took the second — two implement sessions worked with no mail and
+   wrote a decision.md line saying why, and the constitution's `NO_TASK means
+   stop and wait` was correct advice that would have stalled the task."
   [ctx first-role]
   (let [stamp (handoff-lib/stamp)
         out (fs/path (task-lib/system-mail-dir ctx) "outbox")
@@ -624,8 +635,14 @@
     (lock-truth! ctx)
     (trust-worktrees! ctx sessions)
     (when-not (board-lib/card-lane ctx task-id)
-      (board-lib/create-card! ctx task-id (:role (first sessions)))
-      (queue-new-task-note! ctx (:session (first sessions))))
+      ;; One card for the role — a lane is a stage of the work, and a role
+      ;; holding three repos is still one stage. One note per SESSION of that
+      ;; role: mail is delivered to a pane, and every pane of the first role
+      ;; has work the moment the task opens.
+      (let [lane (:role (first sessions))]
+        (board-lib/create-card! ctx task-id lane)
+        (doseq [row sessions :when (= lane (:role row))]
+          (queue-new-task-note! ctx (:session row)))))
     (start-handoffd! ctx)
     (assoc ctx :roles roles :repos repos :sessions sessions
            :commands (mapv #(launch-session! ctx sessions %) sessions))))

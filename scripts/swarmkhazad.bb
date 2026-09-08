@@ -70,7 +70,14 @@
 
 (defn new!
   "Scaffold a task folder. With --linear <KEY> the goal comes from the issue
-   instead of the template, and `roles` is one implement role."
+   instead of the template, and `roles` is one implement role.
+
+   `--repo` takes any checkout, and that is deliberate. The portal has two
+   levels — a project owns the repo scope and a task picks a subset of it, so a
+   checkout the project does not hold is a project edit — and this is below
+   both: no project, no scope, whatever paths you name. It is the door you use
+   when the portal is the thing that is broken. `check-repos!` still refuses a
+   path that is not a git checkout."
   [task-id args]
   (let [repos (flag-values args "--repo")
         issue-key (first (flag-values args "--linear"))
