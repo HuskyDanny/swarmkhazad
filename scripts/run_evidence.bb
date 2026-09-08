@@ -35,7 +35,7 @@
             [clojure.string :as str]))
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
-(load-file (str (fs/path script-dir "task_lib.bb")))
+(load-file (str (fs/path script-dir "project_lib.bb")))
 
 (def timeout-ms (parse-long (or (not-empty (System/getenv "SWARMKHAZAD_EVIDENCE_TIMEOUT_MS")) "1200000")))
 (def max-output 65536)
@@ -191,8 +191,8 @@
 (defn cloud-target
   "Everything the runner needs, or {:error <why>}. Each miss is its own line
    because each has a different fix."
-  [worktree]
-  (let [env-id (not-empty (or (System/getenv "SWARMKHAZAD_CLOUD_ENV") ""))
+  [ctx worktree]
+  (let [env-id (project-lib/cloud-env-for ctx)
         origin (some-> (git-out worktree "remote" "get-url" "origin")
                        (str/replace #"^git@github\.com:" "https://github.com/")
                        (str/replace #"\.git$" ""))
@@ -202,9 +202,10 @@
              (when (zero? (:exit r)) (not-empty (str/trim (:out r)))))]
     (cond
       (nil? env-id)
-      {:error (str "SWARMKHAZAD_CLOUD_ENV is not set. It is the self-hosted environment id\n"
-                   "(ccpool_...), read off the environment in the web UI. Without it there is\n"
-                   "nowhere to dispatch to.")}
+      {:error (str "no self-hosted environment for this task. Set it on the project — the\n"
+                   "field is on the project form, beside the checkouts — or pass\n"
+                   "SWARMKHAZAD_CLOUD_ENV to override it once. Without one there is nowhere\n"
+                   "to dispatch to.")}
 
       (nil? origin)
       {:error "this worktree has no `origin` remote, so there is no repo to name to the runner."}
@@ -228,9 +229,9 @@
 (defn dispatch-cloud!
   "Create the cloud session and record it. Exit is `pending`, never 0: the bar
    is not met by having been dispatched, and the goal judge reads this file."
-  [worktree bar]
+  [ctx worktree bar]
   (let [started (System/currentTimeMillis)
-        target (cloud-target worktree)]
+        target (cloud-target ctx worktree)]
     (if-let [why (:error target)]
       {:exit "blocked" :duration-ms 0 :started-at (str (java.time.Instant/now))
        :output (str "this bar is @cloud, and it could not be dispatched:\n\n" why "\n")}
@@ -292,7 +293,7 @@
         rows (cons repo-tests (filter #(mine? repo %) (bars ctx metrics-md)))]
     (vec (for [bar rows]
            (let [result (cond
-                          (cloud-bar? bar) (dispatch-cloud! worktree bar)
+                          (cloud-bar? bar) (dispatch-cloud! ctx worktree bar)
                           (:command bar) (run-command (:command bar) worktree)
                           :else
                           {:exit "none"
@@ -312,8 +313,8 @@
   (when (seq (System/getenv "SWARMKHAZAD_RUN_REMOTE"))
     (binding [*out* *err*]
       (println "SWARMKHAZAD_RUN_REMOTE no longer does anything — a bar opts into the runner"
-               "by starting its measure with @cloud, and SWARMKHAZAD_CLOUD_ENV names the"
-               "environment. Unset it.")))
+               "by starting its measure with @cloud, and the project names the environment"
+               "(SWARMKHAZAD_CLOUD_ENV still overrides it). Unset it.")))
   (let [ctx (task-lib/ctx-from-env)
         session (or (first args) (System/getenv "SWARMKHAZAD_SESSION"))
         _ (when (str/blank? session) (task-lib/fail! "SWARMKHAZAD_SESSION is not set"))

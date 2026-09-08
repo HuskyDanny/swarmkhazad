@@ -214,6 +214,43 @@
             (is (= "0" (get (headers (fs/path dir "evidence" "units.txt")) "exit")))
             (is (str/includes? (output (fs/path dir "evidence" "units.txt")) "local-ran"))))))))
 
+(deftest the-environment-comes-from-the-project-so-nobody-has-to-remember-it
+  ;; It lived only in SWARMKHAZAD_CLOUD_ENV, which is the worst place for the
+  ;; one setting an @cloud bar cannot run without: an unmemorable id, in a shell
+  ;; rc, invisible on the page that claims to declare how a project runs.
+  (with-task {"README.md" "one\n"} cloud-metrics
+    (fn [{:keys [dir measure]}]
+      (let [bin (stub-bin! dir {:pr "482"})
+            home (fs/parent (fs/parent dir))]
+        (git (str (fs/path dir "worktrees" "fixture")) "remote" "set-url" "origin"
+             "https://github.com/MithraAI/istari.git")
+        (write! (fs/path home "projects" "p.edn")
+                (pr-str {:repos [] :roles [] :cloud-env "ccpool_FROMPROJECT"}))
+        (write! (fs/path dir "project") "p\n")
+        ;; deliberately NO SWARMKHAZAD_CLOUD_ENV in this environment
+        (measure {"PATH" (str bin ":" (System/getenv "PATH"))})
+        (let [f (fs/path dir "evidence" "checkout-works.txt")
+              argv (str/split (slurp (str (fs/path dir "claude-argv"))) #"\u0000")]
+          (is (= "pending" (get (headers f) "exit")) "it dispatched, with no variable set")
+          (is (= "ccpool_FROMPROJECT" (nth argv 1))
+              "and at the environment the PROJECT names"))))))
+
+(deftest the-variable-still-overrides-the-project-for-a-one-off
+  (with-task {"README.md" "one\n"} cloud-metrics
+    (fn [{:keys [dir measure]}]
+      (let [bin (stub-bin! dir {:pr "482"})
+            home (fs/parent (fs/parent dir))]
+        (git (str (fs/path dir "worktrees" "fixture")) "remote" "set-url" "origin"
+             "https://github.com/MithraAI/istari.git")
+        (write! (fs/path home "projects" "p.edn")
+                (pr-str {:repos [] :roles [] :cloud-env "ccpool_FROMPROJECT"}))
+        (write! (fs/path dir "project") "p\n")
+        (measure {"SWARMKHAZAD_CLOUD_ENV" "ccpool_OVERRIDE"
+                  "PATH" (str bin ":" (System/getenv "PATH"))})
+        (let [argv (str/split (slurp (str (fs/path dir "claude-argv"))) #"\u0000")]
+          (is (= "ccpool_OVERRIDE" (nth argv 1))
+              "most specific first — a one-off dispatch elsewhere must not need a project edit"))))))
+
 (deftest a-cloud-bar-that-cannot-be-dispatched-says-which-of-the-three-reasons
   (testing "an owner the environment cannot reach"
     (with-task {"README.md" "one\n"} cloud-metrics
@@ -240,7 +277,9 @@
           (measure {"PATH" (str bin ":" (System/getenv "PATH"))})
           (let [f (fs/path dir "evidence" "checkout-works.txt")]
             (is (= "blocked" (get (headers f) "exit")))
-            (is (str/includes? (output f) "SWARMKHAZAD_CLOUD_ENV is not set"))
+            (is (str/includes? (output f) "no self-hosted environment for this task"))
+            (is (str/includes? (output f) "on the project")
+                "the fix is a field on the page, not an id to remember")
             (is (not (fs/exists? (fs/path dir "claude-argv")))))))))
   (testing "no pull request to answer on"
     (with-task {"README.md" "one\n"} cloud-metrics

@@ -347,6 +347,7 @@
    whether the name may already exist differs, and that is the caller's."
   [{:strs [name extra-repos] :as params}]
   (let [nm (str/trim (or name ""))
+        cloud-env (str/trim (get params "cloud-env" ""))
         picked (->> (keys params)
                     (keep #(second (re-matches #"repo:(.+)" %)))
                     sort)
@@ -381,7 +382,10 @@
       (not (every? task-lib/git-checkout? repos)) {:error (str "not a git checkout: "
                                                               (first (remove task-lib/git-checkout? repos)))}
       (not (every? project-lib/valid-role-spec? roles)) {:error "unknown harness or vendor in a role"}
-      :else {:name nm :repos repos :roles roles})))
+      (not (project-lib/valid-cloud-env? cloud-env))
+      {:error (str "not an environment id: " (pr-str cloud-env)
+                   " — it looks like ccpool_… and comes from the environment picker in the web UI")}
+      :else {:name nm :repos repos :roles roles :cloud-env cloud-env})))
 
 (defn create-project! [params]
   (let [p (project-from-form params)]
@@ -674,8 +678,12 @@
 (defn project-params
   "A saved project as the form's own params, so one form renders both new and
    edit and there is no second layout to drift."
-  [{:keys [name repos roles]}]
-  (into {"name" name}
+  [{:keys [name repos roles cloud-env]}]
+  (into (cond-> {"name" name}
+          ;; Same reason as the harness below: without it, opening a saved
+          ;; project and pressing Save blanks the environment, and the next
+          ;; @cloud bar reports `blocked` for a setting nobody removed.
+          (not-empty cloud-env) (assoc "cloud-env" cloud-env))
         (concat (for [r repos] [(str "repo:" r) "on"])
                 (mapcat (fn [{:keys [role harness model]}]
                           ;; The harness round-trips too, or opening a saved
@@ -720,7 +728,18 @@
              [:p.empty "no git checkouts found — type a path below"])]]
          [:label "or paths not under those roots, one per line"
           [:textarea {:name "extra-repos" :rows 2 :placeholder "/Users/you/elsewhere/thing"}
-           (get params "extra-repos")]]]
+           (get params "extra-repos")]]
+         ;; The id used to live only in a shell variable, which meant the one
+         ;; thing an @cloud bar cannot run without was invisible here and had to
+         ;; be remembered. The datalist offers what is already in use — there is
+         ;; no API that lists environments — and the field still accepts a new
+         ;; one typed in.
+         [:label "self-hosted environment for " [:code "@cloud"] " bars"
+          [:input {:type "text" :name "cloud-env" :list "cloud-envs"
+                   :placeholder "ccpool_… — leave blank if this project has no @cloud bars"
+                   :value (get params "cloud-env" "")}]
+          [:datalist {:id "cloud-envs"}
+           (for [e (project-lib/known-cloud-envs)] [:option {:value e}])]]]
         [:p.muted "roles — the swimlane's columns, in this order"]
         [:div.cards.rolepick
          (for [stage (project-lib/stage-prompts)
