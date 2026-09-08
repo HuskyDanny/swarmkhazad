@@ -960,12 +960,31 @@
             (let [body (:body (request env :get (str "/tasks/" id)))]
               (is (not (str/includes? body "Resume the swarm"))))))
 
+        (testing "resume on a task that does not exist is a 404"
+          (let [r (request env :post "/tasks/t-nope/resume")]
+            (is (= 404 (:status r)))))
+
+        ;; Last, because it starts something. The route spawns a real
+        ;; `bb swarmkhazad.bb open <id>` in the background and returns
+        ;; immediately — that is the point of it — so the test has to take that
+        ;; process down before the sandbox goes, or teardown races a live
+        ;; writer. It did: on CI `fs/delete-tree` threw from the `finally`
+        ;; while the spawned open was still creating the task's worktrees, and
+        ;; the whole test reported as an uncaught exception with nothing to say
+        ;; about resume. This machine won the race every time.
         (testing "posting resume redirects back to the task"
           (let [r (request env :post (str "/tasks/" id "/resume"))]
             (is (= 303 (:status r)))
-            (is (= (str "/tasks/" id) (get (:headers r) "Location")))))
-
-        (testing "resume on a task that does not exist is a 404"
-          (let [r (request env :post "/tasks/t-nope/resume")]
-            (is (= 404 (:status r))))))
-      (finally (fs/delete-tree sandbox)))))
+            (is (= (str "/tasks/" id) (get (:headers r) "Location"))))))
+      (finally
+        ;; Wait for the spawned open to exit, then take down whatever it got as
+        ;; far as starting. Bounded: a leaked process must not hang the suite.
+        (let [deadline (+ (System/currentTimeMillis) 30000)]
+          (while (and (zero? (:exit (process/sh {:continue true}
+                                                "pgrep" "-f" (str "swarmkhazad.bb open " id))))
+                      (< (System/currentTimeMillis) deadline))
+            (Thread/sleep 200)))
+        (process/sh {:continue true} "tmux" "-S"
+                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                    "kill-server")
+        (fs/delete-tree sandbox)))))
