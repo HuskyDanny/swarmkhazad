@@ -13,8 +13,21 @@
 ;;   <stdout and stderr, in order, clipped>
 ;;
 ;; The goal judge reads that directory at every Stop, so a bar is met when its
-;; file says so, not when a role says so. Local only: SWARMKHAZAD_RUN_REMOTE is
-;; a seam for a later remote runner and must stay unset here.
+;; file says so, not when a role says so.
+;;
+;; Two tiers, split by what the machine can honestly answer. Local is anything a
+;; script settles here — a unit suite, an API call, a component check. A bar
+;; whose measure starts with `@cloud` is the other kind: spin the service up and
+;; show the behaviour, which does not fit on a laptop shared with every other
+;; task. Those dispatch to the operator's self-hosted environment.
+;;
+;; The dispatch is one-way ON PURPOSE. There is no read-back from the CLI (RAN:
+;; `claude logs <cloud session>` answers "No job matching", and `claude agents
+;; --json --all` lists local sessions only, with no cloud filter). `--teleport`
+;; is not the missing read — it MIGRATES the session onto this machine and
+;; resumes it here, which is the one thing a cloud tier exists to prevent. So
+;; the runner reports by commenting on the PR, pr_watch polls it, and its
+;; `fixer` wakes the front of the pipeline. That loop is already built.
 
 (ns run-evidence
   (:require [babashka.fs :as fs]
@@ -140,6 +153,106 @@
      :duration-ms (- (System/currentTimeMillis) started)
      :started-at (str (java.time.Instant/ofEpochMilli started))}))
 
+(def cloud-marker "@cloud")
+
+(defn cloud-bar?
+  "A bar whose measure opens with `@cloud`. The marker sits in the measure
+   rather than in a new metrics.md section or a new field, because that is the
+   position that already answers \"how is this checked\" — and `parse-bar`
+   already returns such a bar with a nil :command, so nothing about the grammar
+   changes."
+  [bar]
+  (str/starts-with? (str/triml (str (:measure bar))) cloud-marker))
+
+(defn cloud-brief
+  "What the runner is told. Repo, branch and PR are passed explicitly: the
+   runner clones from origin into its own workspace and cuts its own branch, so
+   nothing about this worktree reaches it implicitly."
+  [{:keys [origin branch pr]} bar]
+  (str "You are the run role of a swarmkhazad task, on the self-hosted environment.\n\n"
+       "Repo:   " origin "\n"
+       "Branch: " branch "\n"
+       "PR:     #" pr "\n\n"
+       "Check out that branch and verify this ONE bar at the service level — start the\n"
+       "thing and drive it, do not settle for a green unit suite:\n\n"
+       "  bar:     " (:name bar) "\n"
+       (when (:threshold bar) (str "  passes:  " (:threshold bar) "\n"))
+       "  measure: " (str/triml (subs (str/triml (str (:measure bar))) (count cloud-marker))) "\n\n"
+       "Then post ONE comment on PR #" pr " with what you observed: what you ran, what\n"
+       "happened, and the screenshots. Say plainly whether the bar is met. That comment\n"
+       "is the only way your findings reach the task — nothing here can read your\n"
+       "session — so a run that verifies the bar and posts nothing has failed.\n\n"
+       "Do not merge. Do not push to main. Do not modify the branch."))
+
+(defn git-out [worktree & args]
+  (let [r (apply process/sh {:dir (str worktree)} "git" args)]
+    (when (zero? (:exit r)) (str/trim (:out r)))))
+
+(defn cloud-target
+  "Everything the runner needs, or {:error <why>}. Each miss is its own line
+   because each has a different fix."
+  [worktree]
+  (let [env-id (not-empty (or (System/getenv "SWARMKHAZAD_CLOUD_ENV") ""))
+        origin (some-> (git-out worktree "remote" "get-url" "origin")
+                       (str/replace #"^git@github\.com:" "https://github.com/")
+                       (str/replace #"\.git$" ""))
+        owner (some-> origin (str/split #"/") (->> (drop 3) first))
+        branch (git-out worktree "rev-parse" "--abbrev-ref" "HEAD")
+        pr (let [r (process/sh {:dir (str worktree)} "gh" "pr" "view" "--json" "number" "-q" ".number")]
+             (when (zero? (:exit r)) (not-empty (str/trim (:out r)))))]
+    (cond
+      (nil? env-id)
+      {:error (str "SWARMKHAZAD_CLOUD_ENV is not set. It is the self-hosted environment id\n"
+                   "(ccpool_...), read off the environment in the web UI. Without it there is\n"
+                   "nowhere to dispatch to.")}
+
+      (nil? origin)
+      {:error "this worktree has no `origin` remote, so there is no repo to name to the runner."}
+
+      ;; The environment is authenticated to ONE GitHub account. A dispatch
+      ;; naming any other owner clones nothing and fails in the cloud, where no
+      ;; one is watching — so it is refused here, where the message is read.
+      (not= "MithraAI" owner)
+      {:error (str "the runner can only reach MithraAI repos; this worktree's origin is\n"
+                   "  " origin "\n"
+                   "Owner `" owner "` is not baked into the environment, so the clone would fail\n"
+                   "in the cloud with nobody reading the error. Measure this bar locally instead.")}
+
+      (nil? pr)
+      {:error (str "no pull request for branch `" branch "`. The runner reports by commenting on\n"
+                   "the PR, so without one its findings have nowhere to land. Open the PR first;\n"
+                   "the run role is meant to be the step between review and merge.")}
+
+      :else {:env-id env-id :origin origin :branch branch :pr pr})))
+
+(defn dispatch-cloud!
+  "Create the cloud session and record it. Exit is `pending`, never 0: the bar
+   is not met by having been dispatched, and the goal judge reads this file."
+  [worktree bar]
+  (let [started (System/currentTimeMillis)
+        target (cloud-target worktree)]
+    (if-let [why (:error target)]
+      {:exit "blocked" :duration-ms 0 :started-at (str (java.time.Instant/now))
+       :output (str "this bar is @cloud, and it could not be dispatched:\n\n" why "\n")}
+      (let [r (process/sh {:dir (str worktree)}
+                          "claude" "--environment" (:env-id target)
+                          "-p" (cloud-brief target bar))
+            out (str (:out r) (:err r))
+            session (second (re-find #"(session_[A-Za-z0-9]+)" out))]
+        {:exit (if (and (zero? (:exit r)) session) "pending" (:exit r))
+         :duration-ms (- (System/currentTimeMillis) started)
+         :started-at (str (java.time.Instant/ofEpochMilli started))
+         :output (str "dispatched to the self-hosted environment.\n"
+                      "  repo:    " (:origin target) "\n"
+                      "  branch:  " (:branch target) "\n"
+                      "  PR:      #" (:pr target) "\n"
+                      (when session (str "  session: " session "\n"
+                                         "  view:    https://claude.ai/code/" session "\n"))
+                      "\nPENDING, not met. The runner answers by commenting on PR #" (:pr target)
+                      ";\npr_watch polls it and wakes the front of the pipeline. Nothing here can\n"
+                      "read that session directly, and --teleport would drag it onto this machine.\n"
+                      "\n--- dispatch output ---\n" (clip out))}))))
+
 (defn write-evidence! [ctx {:keys [id name command threshold]} cwd result]
   (let [file (fs/path (:evidence-dir ctx) (str id ".txt"))]
     (fs/create-dirs (:evidence-dir ctx))
@@ -178,8 +291,10 @@
                     :threshold "the repo's own test command exits 0"}
         rows (cons repo-tests (filter #(mine? repo %) (bars ctx metrics-md)))]
     (vec (for [bar rows]
-           (let [result (if (:command bar)
-                          (run-command (:command bar) worktree)
+           (let [result (cond
+                          (cloud-bar? bar) (dispatch-cloud! worktree bar)
+                          (:command bar) (run-command (:command bar) worktree)
+                          :else
                           {:exit "none"
                            :output (if (str/starts-with? (:id bar) repo-tests-bar)
                                      "no test command detected in the worktree (no package.json, bb.edn, pyproject.toml, go.mod, Cargo.toml or Makefile test target)\n"
@@ -191,10 +306,14 @@
              {:id (:id bar) :exit (:exit result) :duration-ms (:duration-ms result) :file (str file)})))))
 
 (defn -main [& args]
+  ;; The placeholder this replaces. It refused to run at all when set, to stop a
+  ;; task believing in a runner that did not exist; the runner exists now and a
+  ;; bar opts in per line, so the variable has nothing left to mean.
   (when (seq (System/getenv "SWARMKHAZAD_RUN_REMOTE"))
     (binding [*out* *err*]
-      (println "SWARMKHAZAD_RUN_REMOTE is set but there is no remote runner; evidence runs locally only. Unset it."))
-    (System/exit 2))
+      (println "SWARMKHAZAD_RUN_REMOTE no longer does anything — a bar opts into the runner"
+               "by starting its measure with @cloud, and SWARMKHAZAD_CLOUD_ENV names the"
+               "environment. Unset it.")))
   (let [ctx (task-lib/ctx-from-env)
         session (or (first args) (System/getenv "SWARMKHAZAD_SESSION"))
         _ (when (str/blank? session) (task-lib/fail! "SWARMKHAZAD_SESSION is not set"))

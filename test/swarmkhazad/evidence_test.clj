@@ -138,13 +138,123 @@
           (is (not (str/includes? (output (fs/path ev "slow.txt")) "late"))))
         (is (= "0" (get (headers (fs/path ev "quick.txt")) "exit")) "the bar after the timed-out one still ran")))))
 
-(deftest the-remote-seam-refuses-to-run-while-set
+(deftest the-old-remote-seam-is-a-notice-now-and-no-longer-stops-the-run
+  ;; It used to exit 2 so a task could not believe in a runner that did not
+  ;; exist. The runner exists, a bar opts in per line with @cloud, and the
+  ;; variable has nothing left to mean — so it says so and gets out of the way.
   (with-task {"README.md" "one\n"} "## Quantitative\n- x — bar: y — measure: `echo hi`\n"
     (fn [{:keys [dir measure]}]
       (let [r (measure {"SWARMKHAZAD_RUN_REMOTE" "1"})]
-        (is (= 2 (:exit r)))
-        (is (str/includes? (:err r) "no remote runner"))
-        (is (not (fs/exists? (fs/path dir "evidence" "x.txt"))))))))
+        (is (str/includes? (:err r) "@cloud"))
+        (is (str/includes? (:err r) "SWARMKHAZAD_CLOUD_ENV"))
+        (is (fs/exists? (fs/path dir "evidence" "x.txt"))
+            "the local bars still ran — a stale variable must not silence a measurement")))))
+
+;; ---------------------------------------------------------------- the cloud tier
+
+(def cloud-metrics
+  (str "## Quantitative\n"
+       "- checkout works — bar: the order appears — measure: @cloud drive it in a browser and screenshot each step\n"
+       "- units — bar: green — measure: `echo local-ran`\n"))
+
+(defn stub-bin!
+  "A PATH holding fake `claude` and `gh`, so the dispatch is observable without
+   creating a real cloud session. Each records its argv where the test can read
+   it."
+  [dir {:keys [pr claude-out claude-exit]}]
+  (let [bin (fs/path dir "stub-bin")]
+    (fs/create-dirs bin)
+    (write! (fs/path bin "claude")
+            (str "#!/usr/bin/env bash\n"
+                 "printf '%s\\0' \"$@\" > " (str (fs/path dir "claude-argv")) "\n"
+                 "echo " (or claude-out "'Created cloud session: x\nSession ID: session_01TEST\n'") "\n"
+                 "exit " (or claude-exit 0) "\n"))
+    (write! (fs/path bin "gh")
+            (str "#!/usr/bin/env bash\n"
+                 (if pr (str "echo " pr "\nexit 0\n") "exit 1\n")))
+    (doseq [f ["claude" "gh"]]
+      (fs/set-posix-file-permissions (fs/path bin f) "rwxr-xr-x"))
+    (str bin)))
+
+(deftest a-cloud-bar-is-dispatched-and-comes-back-pending-never-met
+  (with-task {"README.md" "one\n"} cloud-metrics
+    (fn [{:keys [dir measure]}]
+      (let [wt (fs/path dir "worktrees" "fixture")
+            bin (stub-bin! dir {:pr "482"})]
+        ;; the runner reaches exactly one GitHub account, so the origin has to
+        ;; be one of its repos for the dispatch to be allowed at all
+        (git (str wt) "remote" "set-url" "origin" "https://github.com/MithraAI/istari.git")
+        (let [r (measure {"SWARMKHAZAD_CLOUD_ENV" "ccpool_TEST"
+                          "PATH" (str bin ":" (System/getenv "PATH"))})
+              f (fs/path dir "evidence" "checkout-works.txt")
+              h (headers f)
+              argv (str/split (slurp (str (fs/path dir "claude-argv"))) #"\u0000")]
+          (testing "the bar is PENDING — dispatching is not passing, and the judge reads this file"
+            (is (= "pending" (get h "exit")))
+            (is (not= "0" (get h "exit"))
+                "exit 0 would tell the goal judge a bar was met by having been sent somewhere")
+            (is (= 1 (:exit r)) "so the run as a whole is not green either"))
+          (testing "the dispatch names the environment and carries repo, branch and PR"
+            (is (= "--environment" (nth argv 0)))
+            (is (= "ccpool_TEST" (nth argv 1)))
+            (is (= "-p" (nth argv 2)))
+            (let [brief (nth argv 3)]
+              (is (str/includes? brief "https://github.com/MithraAI/istari"))
+              (is (str/includes? brief "PR:     #482"))
+              (is (str/includes? brief "drive it in a browser and screenshot each step")
+                  "the measure reaches the runner with its @cloud marker stripped")
+              (is (not (str/includes? brief "@cloud")))
+              (is (str/includes? brief "post ONE comment on PR #482")
+                  "the comment IS the callback — pr_watch polls it")))
+          (testing "the evidence says how to read the result, since nothing here can"
+            (is (str/includes? (output f) "session_01TEST"))
+            (is (str/includes? (output f) "PENDING, not met"))
+            (is (str/includes? (output f) "teleport")))
+          (testing "and the local bar beside it still ran locally"
+            (is (= "0" (get (headers (fs/path dir "evidence" "units.txt")) "exit")))
+            (is (str/includes? (output (fs/path dir "evidence" "units.txt")) "local-ran"))))))))
+
+(deftest a-cloud-bar-that-cannot-be-dispatched-says-which-of-the-three-reasons
+  (testing "an owner the environment cannot reach"
+    (with-task {"README.md" "one\n"} cloud-metrics
+      (fn [{:keys [dir measure]}]
+        (let [bin (stub-bin! dir {:pr "482"})
+              r (measure {"SWARMKHAZAD_CLOUD_ENV" "ccpool_TEST"
+                          "PATH" (str bin ":" (System/getenv "PATH"))})
+              f (fs/path dir "evidence" "checkout-works.txt")]
+          ;; the fixture's origin is acme/fixture, and the runner is baked for
+          ;; one account only — a dispatch here would fail in the cloud, where
+          ;; no one reads the error
+          (is (= "blocked" (get (headers f) "exit")))
+          (is (str/includes? (output f) "only reach MithraAI"))
+          (is (str/includes? (output f) "acme"))
+          (is (not (fs/exists? (fs/path dir "claude-argv")))
+              "and nothing was dispatched")
+          (is (= 1 (:exit r)))))))
+  (testing "no environment id"
+    (with-task {"README.md" "one\n"} cloud-metrics
+      (fn [{:keys [dir measure]}]
+        (let [bin (stub-bin! dir {:pr "482"})]
+          (git (str (fs/path dir "worktrees" "fixture")) "remote" "set-url" "origin"
+               "https://github.com/MithraAI/istari.git")
+          (measure {"PATH" (str bin ":" (System/getenv "PATH"))})
+          (let [f (fs/path dir "evidence" "checkout-works.txt")]
+            (is (= "blocked" (get (headers f) "exit")))
+            (is (str/includes? (output f) "SWARMKHAZAD_CLOUD_ENV is not set"))
+            (is (not (fs/exists? (fs/path dir "claude-argv")))))))))
+  (testing "no pull request to answer on"
+    (with-task {"README.md" "one\n"} cloud-metrics
+      (fn [{:keys [dir measure]}]
+        (let [bin (stub-bin! dir {:pr nil})]
+          (git (str (fs/path dir "worktrees" "fixture")) "remote" "set-url" "origin"
+               "https://github.com/MithraAI/istari.git")
+          (measure {"SWARMKHAZAD_CLOUD_ENV" "ccpool_TEST"
+                    "PATH" (str bin ":" (System/getenv "PATH"))})
+          (let [f (fs/path dir "evidence" "checkout-works.txt")]
+            (is (= "blocked" (get (headers f) "exit")))
+            (is (str/includes? (output f) "no pull request"))
+            (is (not (fs/exists? (fs/path dir "claude-argv")))
+                "without a PR the findings have nowhere to land, so it is not sent")))))))
 
 (deftest test-command-detection-prefers-the-lockfile-s-package-manager
   (let [detect (fn [files]

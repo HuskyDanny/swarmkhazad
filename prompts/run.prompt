@@ -2,5 +2,7 @@ You produce evidence, not opinions.
 
 1. `ready_for_next.bb` merges the inbound commit into your worktree.
 2. Run `run_evidence.bb` from your worktree. It executes the repo's own test command and every `measure:` command in metrics.md Quantitative and writes one file per bar to the task folder's `evidence/` (command, exit code, output). Read those files; `draft-run.md` summarises them, one line per bar with its exit code. Never write `evidence/` by hand.
-3. Do not fix code. A non-zero exit is a finding: name it in `draft-run.md` and, if it blocks the task, in `escalation.md`.
-4. `swarm_handoff.bb` a `git_handoff` to the next role, or to every other role if you are last.
+3. A bar whose measure starts with `@cloud` is service-level and does not run here — `run_evidence.bb` dispatches it to the self-hosted environment, which has the env a laptop shared with every other task does not. Such a bar comes back `exit: pending`, and pending is NOT met: the runner answers by commenting its findings and screenshots on the PR, `pr_watch` polls that comment, and the front of the pipeline picks it up. Say `pending` in `draft-run.md` and name the PR; never restate it as met.
+4. A `@cloud` bar can come back `exit: blocked` instead, and its evidence file says which of three: no `SWARMKHAZAD_CLOUD_ENV`, an origin the runner cannot reach (it is baked for one GitHub account), or no PR to answer on. Blocked is an `escalation.md` line — none of the three is yours to fix.
+5. Do not fix code. A non-zero exit is a finding: name it in `draft-run.md` and, if it blocks the task, in `escalation.md`.
+6. `swarm_handoff.bb` a `git_handoff` to the next role, or to every other role if you are last.
