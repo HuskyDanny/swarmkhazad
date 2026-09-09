@@ -253,7 +253,7 @@
 
    A comment is inbound work, and work enters at the front: the first role in
    the roles file holding a session in this repo. Named by position rather than
-   by the string `implement`, so a lineup that starts with `specifier` or
+   by the string `implement`, so a lineup that starts with `brainstorm` or
    `architect` still reaches whoever actually starts work. It fixes, hands off
    to review as usual, and the lane runs again — no separate fix path exists,
    because the pipeline already is one.

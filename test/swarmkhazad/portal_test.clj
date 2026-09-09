@@ -625,7 +625,7 @@
           (is (not (str/includes? body "name=\"role:default\""))
               "and default is the fallback for a role with no prompt of its own")
           (is (apply < (map #(str/index-of body (str "name=\"role:" % "\""))
-                            ["specifier" "implement" "review" "hardener" "qa"]))
+                            ["brainstorm" "implement" "review" "hardener" "qa"]))
               "the cards run in pipeline order, because that order becomes the swimlane's columns")))
       (testing "a project is refused without a name, a checkout or a role, and nothing is written"
         (let [r (request env :post "/projects" {:body (str "name=bad%2Fid&repo%3A" src "=on&role%3Aimplement=on")})]
@@ -951,9 +951,8 @@
           (is (str/includes? body "value=\"cc_alt\""))))
       (testing "each role card opens on the model that role is meant to run"
         ;; Not one default for everyone. A quiet quality drop in a building role
-        ;; ships wrong code, so those get Opus; the specifier gets a different
-        ;; VENDOR on purpose, so a spec is read by a model that did not write it
-        ;; and cannot agree with its own reasoning.
+        ;; ships wrong code, so those get Opus; architect gets Fable for design
+        ;; work.
         (let [body (:body (request env :get "/"))
               picked (fn [stage]
                        ;; the value sitting in that stage's own two controls
@@ -966,7 +965,6 @@
           (is (= "anthropic:claude-opus-5[1m]" (picked "hardener")))
           (is (= "anthropic:claude-opus-5[1m]" (picked "qa")))
           (is (= "anthropic:claude-fable-5-1" (picked "architect")))
-          (is (= "glm" (picked "specifier")) "a vendor with no id override needs no colon")
           (is (= "anthropic:claude-opus-5[1m]" (picked "review"))
               "review reads on Opus and gets its second opinion from the panel, not from its own vendor")))
       (testing "and on a harness whose brief the role inherits rather than replaces"
@@ -989,8 +987,8 @@
           (is (= "cc_auto" (harness "review")))
           (is (= "cc_auto" (harness "implement")))
           (is (= "cc_auto" (harness "run")))
-          (is (= "cc_alt" (harness "specifier"))
-              "one vendor and no panel: cc_alt points straight at it, no router in between")))
+          (is (= "cc_auto" (harness "brainstorm"))
+              "one launcher for every role: the per-role table went with its only exception")))
       (testing "a non-claude role's vendor select is disabled, not silently ignored"
         ;; Only the claude shim reads the vendor; the others pin the binary and
         ;; nothing else. Offering a choice that does nothing is worse than
