@@ -382,6 +382,17 @@
                          ;; flag is repeatable (`--plugin-dir A --plugin-dir B`)
                          ;; rather than last-wins, so a lane's own plugins load
                          ;; alongside this one instead of losing to it.
+                         ;;
+                         ;; The task folder being the plugin root means a plugin
+                         ;; loader reads THREE more names inside it than
+                         ;; install-plugin! writes: `hooks/hooks.json`,
+                         ;; `commands/`, and `.mcp.json`. `hooks/` already
+                         ;; exists here and holds `<session>.settings.json`, so
+                         ;; the collision is one filename away — anything that
+                         ;; later writes `<task>/hooks/hooks.json` is writing
+                         ;; hooks into every role of that task, not settings for
+                         ;; one session. Roles can write into the task folder,
+                         ;; so treat those three names as load-bearing.
                          "--plugin-dir" (str (:task-dir ctx))]
                         ;; A lane already declares its own permission posture —
                         ;; cc_auto bypasses, cc_control screens — and restating
