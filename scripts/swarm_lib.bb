@@ -29,6 +29,9 @@
 ;; that no role will run. Same parser the portal and the runner use, so the
 ;; three cannot disagree about what a bar is.
 (load-file (str (fs/path script-dir "run_evidence.bb")))
+;; For `delete!` only — a task's cost outlives its folder otherwise, and the
+;; dashboard goes on charting a task_id nothing can be opened from.
+(load-file (str (fs/path script-dir "telemetry.bb")))
 
 (def prompts-src-dir (fs/path (fs/parent script-dir) "prompts"))
 (def pane-history-limit 10000)
@@ -787,3 +790,63 @@
        (println "reclaiming:")
        (doseq [line (reclaim! ctx force?)] (println line)))
      ctx)))
+
+(defn unpushed-repos
+  "The repos whose task branch still holds commits origin has never seen.
+
+   Asked BEFORE anything is torn down. reclaim! asks the same question per repo
+   and answers it by keeping that worktree, which is right for `close`: the
+   task folder survives, and the branch name is still written in it. `delete`
+   removes the folder, so the same answer there would strip the only pointer to
+   those commits. It refuses instead."
+  [ctx]
+  (let [branch (task-lib/task-branch ctx)
+        sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
+                           [(:name r) (:path r)]))]
+    (vec (distinct (for [row (task-lib/read-sessions-tsv ctx)
+                         :let [source (get sources (:repo row))]
+                         :when (and source (not (pushed? source branch)))]
+                     (:repo row))))))
+
+(defn delete!
+  "Remove the task and everything it left behind: the swarm, its worktrees and
+   branches, its telemetry, and the folder itself.
+
+   `close --reclaim` gives the disk back but deliberately keeps the folder — the
+   goal, the decisions, the mail — and it has no reach into the metrics store.
+   So a task finished months ago still sits on the board and still draws a line
+   on the spend chart, with nothing behind the name to open. That is what this
+   removes, and it is why the telemetry is part of it rather than a second step
+   someone has to remember.
+
+   Refuses while any repo holds unpushed commits, before touching anything.
+   `--force` is the same override reclaim takes, and means the same thing.
+
+   Returns a map the caller prints: {:removed bool :kept [repo] :reclaimed
+   [line] :metrics :forgotten|:refused|:unreachable}. The metrics key is a
+   report, not a promise — a server that is not running keeps its series, and
+   the operator has to be told that rather than shown a clean exit."
+  [task-id force?]
+  (let [ctx (task-lib/task-ctx task-id)]
+    (if-not (fs/directory? (:task-dir ctx))
+      ;; No folder, but the metrics store may still hold its series — a task
+      ;; closed and reclaimed before this command existed leaves exactly that,
+      ;; and it is most of what a long-running dashboard is charting. Forget it
+      ;; and say so. A name with neither folder nor series is a typo, and stays
+      ;; an error.
+      (if (telemetry/has-series? task-id)
+        {:removed true :orphan true :kept [] :reclaimed []
+         :metrics (telemetry/forget-task! task-id)}
+        (throw (ex-info (str "no such task: " task-id) {:task-id task-id})))
+      (let [kept (when-not force? (unpushed-repos ctx))]
+      (if (seq kept)
+        {:removed false :kept (vec kept)}
+        (do
+          (when (server-up? ctx) (handoff-lib/archive-all! ctx))
+          (stop-handoffd! ctx)
+          (kill-server! ctx)
+          (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
+          (let [reclaimed (reclaim! ctx force?)
+                metrics (telemetry/forget-task! task-id)]
+            (fs/delete-tree (:task-dir ctx))
+            {:removed true :kept [] :reclaimed reclaimed :metrics metrics})))))))

@@ -157,6 +157,89 @@
     "claude_code.lines_of_code.count"
     "claude_code.code_edit_tool.decision"})
 
+(defn forget
+  "Call telemetry/forget-task! in a child bb against the given endpoint."
+  [endpoint task-id]
+  (let [r (process/sh {:continue true :dir repo-root
+                       :extra-env {"SWARMKHAZAD_OTLP_ENDPOINT" endpoint}}
+                      "bb" "-e" (str "(load-file \"" scripts "/telemetry.bb\") "
+                                     "(print (pr-str (telemetry/forget-task! \"" task-id "\")))"))]
+    (when-not (zero? (:exit r)) (throw (ex-info (str "forget-task! failed: " (:err r)) r)))
+    (read-string (:out r))))
+
+(deftest forgetting-a-task-drops-its-series-and-says-so-when-it-cannot
+  ;; `delete` removes a task folder. Its series outlive it unless something
+  ;; reaches into the metrics store, and the dashboard groups by task_id — so a
+  ;; deleted task keeps drawing a line nobody can open. RAN against the live
+  ;; server: POST /api/v1/admin/tsdb/delete_series answered 204 and the id
+  ;; stopped coming back from /api/v1/label/task_id/values.
+  (let [seen (atom [])
+        stop (http/run-server (fn [req]
+                                (swap! seen conj {:uri (:uri req)
+                                                  :method (:request-method req)
+                                                  :body (some-> (:body req) slurp)})
+                                {:status 204 :body ""})
+                              {:ip "127.0.0.1" :port 0})
+        port (:local-port (meta stop))]
+    (try
+      (testing "a 2xx is the only answer that means the series are gone"
+        (is (= :forgotten (forget (str "http://127.0.0.1:" port "/opentelemetry") "t-gone"))))
+      (testing "it asks the delete endpoint, by task_id, and nothing wider"
+        (let [req (last @seen)]
+          (is (= "/api/v1/admin/tsdb/delete_series" (:uri req)))
+          (is (= :post (:method req)))
+          ;; The selector is the whole safety property: a match[] that lost its
+          ;; label would delete every series on the server.
+          (is (str/includes? (:body req) "match")
+              (str "no match[] in " (pr-str (:body req))))
+          (is (str/includes? (java.net.URLDecoder/decode (:body req) "UTF-8")
+                             "{task_id=\"t-gone\"}")
+              (str "the selector must name the task and only the task: "
+                   (pr-str (:body req))))))
+      (finally (stop))))
+  (testing "a server that answers with a failure has not deleted anything, and says so"
+    (let [stop (http/run-server (fn [_] {:status 500 :body "nope"}) {:ip "127.0.0.1" :port 0})
+          port (:local-port (meta stop))]
+      (try
+        (is (= :refused (forget (str "http://127.0.0.1:" port "/opentelemetry") "t-gone")))
+        (finally (stop)))))
+  (testing "no server at all is :unreachable, not a silent success"
+    ;; The distinction the operator acts on: :forgotten means the series are
+    ;; gone, the other two mean they are still there and the delete was partial.
+    (is (= :unreachable (forget "http://127.0.0.1:1/opentelemetry" "t-gone")))))
+
+(defn known?
+  "Call telemetry/has-series? in a child bb against the given endpoint."
+  [endpoint task-id]
+  (let [r (process/sh {:continue true :dir repo-root
+                       :extra-env {"SWARMKHAZAD_OTLP_ENDPOINT" endpoint}}
+                      "bb" "-e" (str "(load-file \"" scripts "/telemetry.bb\") "
+                                     "(print (pr-str (telemetry/has-series? \"" task-id "\")))"))]
+    (when-not (zero? (:exit r)) (throw (ex-info (str "has-series? failed: " (:err r)) r)))
+    (read-string (:out r))))
+
+(deftest a-task-the-store-still-knows-is-told-apart-from-a-typo
+  ;; `delete` on a task with no folder has two very different meanings: a task
+  ;; closed and reclaimed before this command existed, whose series are still
+  ;; being charted, and a mistyped id. One is worth forgetting; the other has to
+  ;; come back as an error.
+  (let [answer (atom {:status 200 :headers {"Content-Type" "application/json"}
+                      :body (json/generate-string {:status "success"
+                                                   :data [{:__name__ "claude_code.cost.usage"
+                                                           :task_id "t-old"}]})})
+        stop (http/run-server (fn [_] @answer) {:ip "127.0.0.1" :port 0})
+        endpoint (str "http://127.0.0.1:" (:local-port (meta stop)) "/opentelemetry")]
+    (try
+      (is (true? (known? endpoint "t-old")) "series in the store: the id is real")
+      (reset! answer {:status 200 :headers {"Content-Type" "application/json"}
+                      :body (json/generate-string {:status "success" :data []})})
+      (is (false? (known? endpoint "t-old")) "an empty answer is not a task")
+      (finally (stop))))
+  (testing "and a server that is not there does not invent one"
+    ;; The safe direction: with no server, `delete` on a folderless id reports
+    ;; no such task rather than claiming to have cleaned something up.
+    (is (false? (known? "http://127.0.0.1:1/opentelemetry" "t-old")))))
+
 (deftest the-dashboard-ships-with-the-repo-and-every-panel-queries-a-real-metric
   (let [file (fs/path repo-root "dashboards" "swarmkhazad.json")
         d (json/parse-string (slurp (str file)) true)
@@ -216,6 +299,59 @@
               :when (str/includes? (str/lower-case (:title p)) "per hour")]
         (is (every? #(str/includes? % "[1h]") (:expr p))
             (str "\"" (:title p) "\" says per hour and must query an hour"))))
+    (testing "no two panels are the same chart wearing a different title"
+      ;; A panel's signature is what it actually asks the database: which
+      ;; metrics, which labels it groups by, over what window, under what label
+      ;; filter. Two panels sharing all four are one chart shown twice, however
+      ;; differently they are worded — and a dashboard grows them quietly,
+      ;; because each one looked reasonable on the day it was added.
+      ;;
+      ;; Same metrics and grouping at a DIFFERENT window is caught too. That
+      ;; pairing is sometimes deliberate (a trend beside a total), but it is
+      ;; the shape a duplicate takes most often, so it has to be argued for
+      ;; rather than accumulated.
+      (let [sig (fn [p]
+                  (let [blob (str/join " " (:expr p))
+                        pull (fn [re] (sort (distinct (map second (re-seq re blob)))))]
+                    ;; re-seq with NO capture group yields the matched STRINGS,
+                    ;; so `map first` here took the first character of each and
+                    ;; every panel signed as (\c) — the guard reported all six
+                    ;; role panels as duplicates of each other. A test that
+                    ;; fails for the wrong reason tests nothing.
+                    {:metrics (sort (distinct (re-seq #"claude_code\.[a-z_.]+" blob)))
+                     :groups (sort (distinct (mapcat #(map str/trim (str/split % #","))
+                                                     (map second (re-seq #"by \(([^)]*)\)" blob)))))
+                     :windows (pull #"\[(\d+[smhd])\]")
+                     ;; Every label filter, not only `type`: `role=~".*-judge"`
+                     ;; is what separates the judge panel from the spend panel
+                     ;; that queries the same metric over the same window.
+                     :filters (sort (distinct (map (fn [[_ l v]] (str l "=" v))
+                                                   (re-seq #"([a-z_]+)\s*[=!~]+\s*\"([^\"]*)\"" blob))))}))
+            dupes (->> panels
+                       (group-by sig)
+                       (filter (fn [[_ ps]] (< 1 (count ps))))
+                       (map (fn [[_ ps]] (mapv :title ps))))
+            near (->> panels
+                      (group-by #(dissoc (sig %) :windows))
+                      (filter (fn [[_ ps]] (< 1 (count ps))))
+                      (map (fn [[_ ps]] (mapv :title ps))))
+            cuts (->> panels
+                      (group-by #(dissoc (sig %) :groups))
+                      (filter (fn [[_ ps]] (< 1 (count ps))))
+                      (map (fn [[_ ps]] (mapv :title ps))))]
+        (is (empty? dupes) (str "identical panels: " (pr-str dupes)))
+        (is (empty? near)
+            (str "same metrics and grouping, only the window differs: " (pr-str near)))
+        ;; The rule Allen gave, made checkable: spend by task, by repo and by
+        ;; model were three panels asking one question three ways, and the page
+        ;; made you scroll between them to compare. vmui has no dashboard
+        ;; variable to build a dropdown from, but its legend groups by query and
+        ;; each group header is an accordion, so a panel carrying one query per
+        ;; cut IS the toggle — collapse the cuts you are not asking.
+        (is (empty? cuts)
+            (str "same metric, window and filter, split across panels by their "
+                 "group-by — these are cuts of one question and belong in one "
+                 "panel, a query each: " (pr-str cuts)))))
     (testing "the cost levers are charted, not just the totals"
       ;; A total says what was spent. A ratio says what to change.
       ;; Not `includes? "cacheRead"` over the whole dashboard: there are two

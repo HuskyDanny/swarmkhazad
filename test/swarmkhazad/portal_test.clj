@@ -50,6 +50,31 @@
         [status headers & body] (str/split-lines (:out r))]
     {:status (parse-long status) :headers (read-string headers) :body (str/join "\n" body)}))
 
+(defn settle-open!
+  "Wait for the `swarmkhazad.bb open` a route spawned to exit, then take down
+   whatever it got as far as starting.
+
+   `POST /tasks/:id/resume` and `POST /projects/:p/tasks` both spawn a real open
+   in the background and return immediately — that is the point of them — so a
+   test that opens a task has to take that process down before its sandbox goes,
+   or teardown races a live writer. It did: on CI `fs/delete-tree` threw
+   `DirectoryNotEmptyException` from the `finally` while the spawned open was
+   still creating the task's worktrees, and the whole test reported as an
+   uncaught exception with nothing to say about what it was actually testing.
+   This machine won the race every time.
+
+   Bounded: a leaked process must not hang the suite."
+  [& ids]
+  (let [deadline (+ (System/currentTimeMillis) 30000)]
+    (doseq [id ids]
+      (while (and (zero? (:exit (process/sh {:continue true}
+                                            "pgrep" "-f" (str "swarmkhazad.bb open " id))))
+                  (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 200))
+      (process/sh {:continue true} "tmux" "-S"
+                  (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                  "kill-server"))))
+
 (deftest the-task-page-is-a-view-of-the-folder-and-the-index-lists-it
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal."})
         home (str (fs/path sandbox "home"))
@@ -1053,13 +1078,57 @@
             (is (= 303 (:status r)))
             (is (= (str "/tasks/" id) (get (:headers r) "Location"))))))
       (finally
-        ;; Wait for the spawned open to exit, then take down whatever it got as
-        ;; far as starting. Bounded: a leaked process must not hang the suite.
-        (let [deadline (+ (System/currentTimeMillis) 30000)]
-          (while (and (zero? (:exit (process/sh {:continue true}
-                                                "pgrep" "-f" (str "swarmkhazad.bb open " id))))
-                      (< (System/currentTimeMillis) deadline))
-            (Thread/sleep 200)))
+        (settle-open! id)
+        (fs/delete-tree sandbox)))))
+
+(deftest deleting-a-task-from-the-page-needs-the-tick-and-respects-the-refusal
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-del."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        ;; Never the operator's real metrics server from a test.
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_OTLP_ENDPOINT" "http://127.0.0.1:1/opentelemetry"}
+        id "t-del-portal"
+        dir (fs/path home "tasks" id)]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (spit (str (fs/path dir "roles")) "implement claude task\n")
+      (spit (str (fs/path dir "repos")) (str src "\n"))
+      (run {:env env} cli "prepare" id)
+
+      (testing "the page offers it, and says what goes"
+        (let [body (:body (request env :get (str "/tasks/" id)))]
+          (is (str/includes? body (str "/tasks/" id "/delete")))
+          (is (str/includes? body "name=\"sure\"") "behind a tick box, not one click")
+          (is (str/includes? body "VictoriaMetrics")
+              "and names the telemetry, which is the part nothing else removes")))
+
+      (testing "an unticked post deletes nothing"
+        ;; The box is the guard against the misclick; the CLI's refusal is the
+        ;; guard against the loss. Both, because they catch different mistakes.
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body ""})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "Tick the box")))
+        (is (fs/directory? dir)))
+
+      (testing "ticked, but the branch is not on origin: the refusal reaches the page"
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body "sure=on"})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "origin has never seen"))
+          (is (str/includes? (:body r) "Delete anyway") "with the override on the page, not in a manual"))
+        (is (fs/directory? dir) "and it is still there"))
+
+      (testing "forced, it goes, and the board no longer lists it"
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body "force=on"})]
+          (is (= 303 (:status r)))
+          (is (= "/" (get (:headers r) "Location"))))
+        (is (not (fs/exists? dir)))
+        (is (not (str/includes? (:body (request env :get "/")) (str "/tasks/" id "\"")))))
+
+      (testing "deleting what is not there is a 404, not a 500"
+        (is (= 404 (:status (request env :post "/tasks/t-nope/delete" {:body "sure=on"})))))
+      (finally
         (process/sh {:continue true} "tmux" "-S"
                     (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
                     "kill-server")
@@ -1154,4 +1223,8 @@
           (is (str/includes? (:body r) (str "not in project " project)))
           (is (not (fs/exists? (fs/path home "tasks" "t-sub")))
               "refused before the CLI is shelled, so there is nothing to clean up")))
-      (finally (fs/delete-tree sandbox)))))
+      (finally
+        ;; `t-one` is the one that opened; `t-sub` was refused before the CLI
+        ;; was shelled, so there is no process behind it.
+        (settle-open! "t-one")
+        (fs/delete-tree sandbox)))))

@@ -21,6 +21,9 @@
        "                                                 archive panes, stop the daemon, kill the tmux server;\n"
        "                                                 --reclaim also cleans and removes the worktrees and\n"
        "                                                 deletes the task branch (kept if not on origin)\n"
+       "  swarmkhazad delete <task-id> [--force]        everything close --reclaim does, then the telemetry and the\n"
+       "                                                 task folder itself. Refuses while a repo holds commits\n"
+       "                                                 origin has never seen; --force removes it anyway\n"
        "  swarmkhazad smoke <task-id>                    each role: launch via its shim, read goal.md, send one note, exit\n"
        "  swarmkhazad paths <task-id>                    print the path map\n"
        "  swarmkhazad portal [--port <n>]                serve the portal on 127.0.0.1 (default 8765)\n"
@@ -149,6 +152,26 @@
                     (boolean (some #{"--force"} args)))
   (println "swarm closed:" task-id))
 
+(defn delete! [task-id args]
+  (let [{:keys [removed kept reclaimed metrics orphan]}
+        (swarm-lib/delete! task-id (boolean (some #{"--force"} args)))]
+    (if-not removed
+      (binding [*out* *err*]
+        (println (str "refused: " (str/join ", " kept)
+                      (if (= 1 (count kept)) " still holds" " still hold")
+                      " commits origin has never seen."))
+        (println (str "  push them, or `swarmkhazad delete " task-id " --force` to lose them."))
+        (System/exit 1))
+      (do
+        (when orphan
+          (println "  no task folder — this id survived only in the metrics store"))
+        (doseq [line reclaimed] (println line))
+        (println (case metrics
+                   :forgotten "  telemetry: series dropped"
+                   :refused "  telemetry: the server refused the delete — its series are still there"
+                   :unreachable "  telemetry: no server answered — its series are still there"))
+        (println "task deleted:" task-id)))))
+
 (defn smoke! [task-id]
   (let [results (swarm-lib/smoke! task-id)]
     (doseq [{:keys [role harness vendor ok exit seconds models expected note cost turns detail]} results]
@@ -168,6 +191,7 @@
       "prepare" (if (second args) (prepare! (second args)) (usage!))
       "open" (open-cmd! (rest args))
       "close" (if (second args) (close! (second args) args) (usage!))
+      "delete" (if (second args) (delete! (second args) args) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
       "portal" (do (load-file (str (fs/path script-dir "portal.bb")))
