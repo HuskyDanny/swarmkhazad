@@ -386,25 +386,57 @@
   ;; part of the system looks for that: `close` needs a task folder to work
   ;; from, and `reap` only ever inspects git. Three were found running in one
   ;; day — t-e2e, t-kick, t-ship — one from a generation since replaced.
+  ;;
+  ;; The first version of this test passed while the check did not work. It
+  ;; built a ctx by hand, deleted the directory, and asked `orphaned?` — and
+  ;; nothing in it ever wrote to the task folder, which is the only way the bug
+  ;; appears. In the real daemon `log!` ran once a second and `fs/create-dirs`
+  ;; on <task>/state/daemon rebuilt every parent, so the deleted folder came
+  ;; back before the next tick read it. Nineteen daemons for deleted tasks were
+  ;; found still polling, the oldest over two hours old, with this test green.
+  ;; The `after log!` cases below are the ones that can see it.
   (let [d (fs/create-temp-dir {:prefix "sk-daemon-"})
-        task (fs/path d "tasks" "t-x")]
-    (fs/create-dirs task)
-    (let [ctx {:task-dir task :daemon-dir (fs/path task "state" "daemon")}]
-      (testing "a daemon whose task exists keeps running"
-        (is (false? (handoffd/orphaned? ctx)))
-        (is (false? (handoffd/should-stop? ctx))))
+        task (fs/path d "tasks" "t-x")
+        ctx {:task-dir task
+             :goal-file (fs/path task "goal.md")
+             :daemon-dir (fs/path task "state" "daemon")}
+        make-task! (fn [] (fs/create-dirs task) (spit (str (fs/path task "goal.md")) "## Goal\n"))]
+    (make-task!)
+    (testing "a daemon whose task exists keeps running"
+      (is (false? (handoffd/orphaned? ctx)))
+      (is (false? (handoffd/should-stop? ctx))))
 
-      (testing "a daemon whose task folder is gone stops itself"
-        (fs/delete-tree task)
-        (is (true? (handoffd/orphaned? ctx)))
-        (is (true? (handoffd/should-stop? ctx))))
+    (testing "a daemon whose task folder is gone stops itself"
+      (fs/delete-tree task)
+      (is (true? (handoffd/orphaned? ctx)))
+      (is (true? (handoffd/should-stop? ctx))))
 
-      (testing "an emptied state dir is NOT orphaned — close keeps the notes"
-        ;; `close` stops the daemon and leaves the folder for its bullet files.
-        ;; A daemon that quit because state/ was thin would stop serving a task
-        ;; still being worked.
-        (fs/create-dirs task)
-        (is (false? (handoffd/orphaned? ctx)))))))
+    (testing "and still stops itself after its own logging has run"
+      ;; The regression. `log!` used to create <task>/state/daemon
+      ;; unconditionally, which recreated the task directory, so a check
+      ;; reading the DIRECTORY answered "the daemon wrote recently" rather than
+      ;; "the task exists" — and that is always yes for a running daemon.
+      (handoffd/log! ctx "tick")
+      (is (true? (handoffd/orphaned? ctx))
+          "a log line must not resurrect the task the daemon serves")
+      (is (true? (handoffd/should-stop? ctx)))
+      (is (not (fs/exists? task))
+          "log! must not write into a task folder that is gone — that is where the state-only skeletons in TMPDIR came from"))
+
+    (testing "an emptied state dir is NOT orphaned — close keeps the notes"
+      ;; `close` stops the daemon and leaves the folder for its bullet files.
+      ;; A daemon that quit because state/ was thin would stop serving a task
+      ;; still being worked.
+      (make-task!)
+      (fs/delete-tree (fs/path task "state"))
+      (is (false? (handoffd/orphaned? ctx))))
+
+    (testing "a task folder with no goal.md is not a task"
+      ;; The skeleton the old log! left behind: a directory, and nothing that
+      ;; makes it a task. A daemon must read that as gone.
+      (fs/delete-tree task)
+      (fs/create-dirs (fs/path task "state" "daemon"))
+      (is (true? (handoffd/orphaned? ctx))))))
 
 (deftest a-reboot-is-visible-rather-than-silent
   ;; The tmux socket lives under /tmp (task_lib.bb: a unix socket path is

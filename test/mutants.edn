@@ -135,4 +135,19 @@
   :old "(sort (map str (fs/glob scripts \"**.bb\")))"
   :new "(sort (map str (fs/glob scripts \"**/*.bb\")))"
   :killed-by "the-check-can-see-an-offender"
-  :why "the schema gate scans zero files and passes on any repo at all"}]
+  :why "the schema gate scans zero files and passes on any repo at all"}
+
+ ;; ---------------------------------------------- the daemon's own exit
+ {:file "scripts/handoffd.bb"
+  :ns "base"
+  :old "(not (fs/regular-file? (:goal-file ctx))))"
+  :new "(not (fs/directory? (:task-dir ctx))))"
+  :killed-by "a-daemon-outlives-nothing"
+  :why "asks whether a directory exists, which the daemon's own logging keeps making true — 19 daemons for deleted tasks polled on, the oldest over two hours"}
+
+ {:file "scripts/handoffd.bb"
+  :ns "base"
+  :old "  (when (fs/directory? (:task-dir ctx))\n    (fs/create-dirs (:daemon-dir ctx))"
+  :new "  (do\n    (fs/create-dirs (:daemon-dir ctx))"
+  :killed-by "a-daemon-outlives-nothing"
+  :why "logs into a deleted task folder, rebuilding it — the state-only skeletons found in TMPDIR"}]
