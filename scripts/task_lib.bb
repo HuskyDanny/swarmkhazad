@@ -662,6 +662,74 @@
   [ctx]
   (str "sk/" (:task-id ctx)))
 
+;; ------------------------------------------------------------------ codegraph
+
+(defn exclude-codegraph!
+  "Teach the source checkout to ignore `.codegraph/`, once.
+
+   The index directory carries its own `.gitignore`, which hides the database
+   but not the directory itself: `git status --porcelain` still reports
+   `?? .codegraph/` (RAN). Three readers take that for work in progress — the
+   summary's `uncommitted:` block, the judge's git-status section, and the
+   runtime stamp's `dirty` field — so an unexcluded index makes every task look
+   dirty from the moment it opens.
+
+   `info/exclude` lives in the COMMON git dir, which every linked worktree of a
+   checkout shares (RAN: a worktree's --git-common-dir resolves to the source's
+   .git, and a `.codegraph/` written inside that worktree then reports clean).
+   So one append covers every worktree this repo will ever have, and it stays
+   local to the machine rather than becoming a diff in the repo."
+  [src]
+  (let [raw (git src "rev-parse" "--git-common-dir")
+        common (if (fs/absolute? raw) (fs/path raw) (fs/path src raw))
+        exclude (fs/path common "info" "exclude")
+        current (if (fs/regular-file? exclude) (slurp (str exclude)) "")]
+    (when-not (some #{".codegraph/"} (map str/trim (str/split-lines current)))
+      (fs/create-dirs (fs/parent exclude))
+      (spit (str exclude)
+            (str current
+                 (when-not (or (str/blank? current) (str/ends-with? current "\n")) "\n")
+                 ".codegraph/\n")))))
+
+(defn index-worktree!
+  "Build a codegraph index INSIDE the worktree, so a role's structural reads
+   answer from its own branch.
+
+   Why the worktree and not the source checkout: codegraph finds a project by
+   walking UP for a `.codegraph/`, and a task worktree lives at
+   ~/.swarmkhazad/tasks/<id>/worktrees/<repo> — outside the repo entirely. From
+   there the walk finds nothing and the tool answers `isn't indexed ... don't
+   call codegraph for it again this session` (RAN), which retires it for the
+   rest of that role's run. Pointing a role at the source's index instead would
+   answer from whatever the operator happens to have checked out: istari's was
+   80 commits behind origin/main when this was written, so the index would
+   confidently describe code the role's branch does not contain.
+
+   Cheap enough to do on every open. istari is the largest of these repos at
+   1,130 indexed files and builds in 1.8s for 34MB (RAN); the index is reaped
+   with the task folder like everything else under it.
+
+   Built unconditionally, including for a repo codegraph cannot parse. It reads
+   go, python, typescript, tsx, javascript, ruby, terraform and yaml and nothing
+   else (RAN: the language tally across 51 indexed checkouts), so this repo's
+   own `.bb` sources index to one yaml file and zero symbols. Detecting that
+   here would buy a second of open time and cost a language table to keep
+   current; `constitution.prompt` tells the role instead that zero symbols means
+   unparsed rather than absent, which is the half that could mislead.
+
+   Best-effort in both directions: a machine without the binary opens the task
+   exactly as before, and a build that fails leaves the role with the tools it
+   would have had anyway."
+  [dir]
+  (when (fs/which "codegraph")
+    ;; `init` on an already-indexed directory exits 0 without rebuilding (RAN),
+    ;; so a resume would keep serving the index as it was at the first open —
+    ;; blind to every commit the roles have made since. `sync` is the one that
+    ;; catches up, and it is 2s on istari even when there is nothing to do.
+    (if (fs/directory? (fs/path dir ".codegraph"))
+      (sh-ok? "codegraph" "sync" (str dir))
+      (sh-ok? "codegraph" "init" (str dir)))))
+
 ;; ------------------------------------------------------------------ worktrees
 
 (defn prepare-worktrees!
@@ -696,6 +764,10 @@
                 (if (git-ok? path "rev-parse" "--verify" "--quiet" (str "refs/heads/" branch-name))
                   (git path "worktree" "add" "--quiet" dir branch-name)
                   (git path "worktree" "add" "--quiet" "-b" branch-name dir start)))
+              ;; The exclude first: an index built before the checkout ignores
+              ;; it shows up as `?? .codegraph/` in the very next status read.
+              (exclude-codegraph! path)
+              (index-worktree! dir)
                 {:name name :source path :path dir :branch branch-name :start start}))
               repos)]
     ;; The sha the branch started from IS the task's base. Keep it, so no later

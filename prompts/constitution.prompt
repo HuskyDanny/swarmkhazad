@@ -10,6 +10,8 @@
 - When you clear an escalation yourself, say so: `note.bb resolved '<any text from the bullet>' '<what you did>'`. It crosses the item off the portal's Attention list and records the how as a finding. `escalation.md` is never edited — what you said stays said.
 - Write your full write-up to `draft-<your role>.md` in the task folder before you hand off — the name above is already yours, use it exactly. The handoff names it in `artifacts:`, and the goal judge reads it.
 - Scratch and handoff drafts go under the task folder's `tmp/`. Never write under the human's `~/repos`; your worktree is the only repo you touch.
+- Your worktree carries its own codegraph index, built before you start. For a structural question — who calls this, where does X live, what else moves if I change it — call `codegraph_explore` with your worktree's absolute path as `projectPath`, and one call returns the relevant symbols' source plus the call paths between them: the read a grep-then-open loop spends five calls approximating. It knows your branch as of the last open, so use it to FIND code and read the file itself for anything you or a sibling just wrote.
+- codegraph parses go, python, typescript, tsx, javascript, ruby, terraform and yaml, and nothing else. On a repo written in anything else — Clojure, shell — it returns zero symbols, and zero means UNPARSED, not absent: grep before you conclude a symbol does not exist.
 - Do not ask questions in this pane. Nobody is reading it live. Decide, record the assumption in `decision.md`, and continue; if you truly cannot proceed, write the block to `escalation.md` and hand off what you have.
 
 ## How to write

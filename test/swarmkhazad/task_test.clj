@@ -187,6 +187,90 @@
         (is (str/includes? out "session: implement_fixture claude task model=kimi"))
         (is (str/includes? out "repo: fixture "))))))
 
+(deftest prepare-indexes-each-worktree-for-codegraph
+  ;; The swarm loaded the codegraph MCP server for every role and no role could
+  ;; ever use it: a task worktree lives outside its repo, codegraph resolves a
+  ;; project by walking UP for a `.codegraph/`, so the walk found nothing and
+  ;; the tool answered `isn't indexed ... don't call codegraph for it again this
+  ;; session` — retiring itself for the rest of that role's run (RAN).
+  ;;
+  ;; `codegraph` is stubbed rather than required. The real binary is an npm
+  ;; global that a fresh runner does not have, and stubbing also pins the one
+  ;; thing worth asserting: WHICH subcommand prepare picks. `init` on an
+  ;; already-indexed directory exits 0 without rebuilding, so a resume that ran
+  ;; `init` would keep serving the index as it stood at the first open, blind to
+  ;; every commit the roles had made since.
+  (with-home
+    (fn [{:keys [env src sandbox] :as h}]
+      (let [second-src (str (fs/path sandbox "src" "other"))
+            _ (make-source-repo! second-src)
+            stubdir (str (fs/path sandbox "stubbin"))
+            calls (str (fs/path sandbox "codegraph-calls.log"))
+            _ (fs/create-dirs stubdir)
+            _ (spit (str (fs/path stubdir "codegraph"))
+                    (str "#!/usr/bin/env bash\n"
+                         "echo \"$1 $2\" >> " calls "\n"
+                         ;; init leaves the marker the second prepare branches on
+                         "[ \"$1\" = init ] && mkdir -p \"$2/.codegraph\" && echo db > \"$2/.codegraph/codegraph.db\"\n"
+                         "exit 0\n"))
+            _ (fs/set-posix-file-permissions (fs/path stubdir "codegraph") "rwxr-xr-x")
+            ;; Prepended to the REAL PATH, never a hardcoded prefix: a literal
+            ;; "/opt/homebrew/bin" here passed on this machine and failed on CI.
+            env (assoc env "PATH" (str stubdir ":" (System/getenv "PATH")))
+            dir (scaffold-task! h "t-cg" "implement claude\n" (str src "\n" second-src "\n"))
+            wt (fs/path dir "worktrees" "fixture")]
+        (run {:env env} cli "prepare" "t-cg")
+        (testing "every worktree is indexed, and with init because none had an index"
+          (is (= #{(str "init " wt)
+                   (str "init " (fs/path dir "worktrees" "other"))}
+                 (set (str/split-lines (slurp calls))))))
+        (testing "the index does not make the worktree look dirty"
+          ;; `.codegraph/` carries its own .gitignore, which hides the database
+          ;; but not the directory: without the exclude, `status --porcelain`
+          ;; reports `?? .codegraph/` and three readers take that for work in
+          ;; progress — the summary's `uncommitted:` block, the judge's
+          ;; git-status section, and the runtime stamp's `dirty` field.
+          (is (fs/directory? (fs/path wt ".codegraph")))
+          (is (= "" (git wt "status" "--porcelain"))))
+        (testing "the exclude is written to the shared common dir, once, and the source stays clean"
+          ;; info/exclude lives in the COMMON git dir, so one append covers every
+          ;; worktree this checkout will ever have.
+          (let [lines (str/split-lines (slurp (str (fs/path src ".git" "info" "exclude"))))]
+            (is (= 1 (count (filter #(= ".codegraph/" (str/trim %)) lines)))))
+          (is (= "" (git src "status" "--porcelain"))))
+        (testing "a re-prepare syncs the existing index instead of leaving it as it was"
+          (spit calls "")
+          (run {:env env} cli "prepare" "t-cg")
+          (is (= #{(str "sync " wt)
+                   (str "sync " (fs/path dir "worktrees" "other"))}
+                 (set (str/split-lines (slurp calls)))))
+          (let [lines (str/split-lines (slurp (str (fs/path src ".git" "info" "exclude"))))]
+            (is (= 1 (count (filter #(= ".codegraph/" (str/trim %)) lines)))
+                "the exclude is appended once, not once per prepare")))))))
+
+(deftest prepare-without-codegraph-installed-is-unchanged
+  ;; The index is an enhancement, never a dependency: a machine without the
+  ;; binary must open a task exactly as it did before this existed.
+  (with-home
+    (fn [{:keys [env src] :as h}]
+      (let [onlybin (fs/create-temp-dir {:prefix "sk-nobin-"})
+            ;; The tools prepare genuinely needs, SYMLINKED into a bin of their
+            ;; own rather than putting their real directories on PATH — bb and
+            ;; codegraph are both npm globals in the same directory here, so
+            ;; adding that directory would smuggle back the very binary this
+            ;; case removes. Asserted absent below, because a PATH that also
+            ;; lost `bb` fails with 127 and reads exactly like a working case.
+            _ (doseq [tool ["bb" "git"]]
+                (fs/create-sym-link (fs/path onlybin tool) (fs/which tool)))
+            env (assoc env "PATH" (str onlybin))
+            dir (scaffold-task! h "t-nocg" "implement claude\n")]
+        (is (not (zero? (:exit (run {:env env :ok? false} "sh" "-c" "command -v codegraph"))))
+            "this PATH must not reach a codegraph, or the case proves nothing")
+        (let [r (run {:env env :ok? false} cli "prepare" "t-nocg")]
+          (is (zero? (:exit r)) (str "prepare must not need codegraph: " (:err r)))
+          (is (not (fs/exists? (fs/path dir "worktrees" "fixture" ".codegraph"))))
+          (is (= "sk/t-nocg" (git (fs/path dir "worktrees" "fixture") "branch" "--show-current"))))))))
+
 (deftest prepare-handles-unusual-sources
   (with-home
     (fn [{:keys [env src sandbox shas] :as h}]
