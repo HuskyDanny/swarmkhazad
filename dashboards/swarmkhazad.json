@@ -3,7 +3,7 @@
   "filename": "swarmkhazad.json",
   "rows": [
     {
-      "title": "Spend",
+      "title": "Where the money goes",
       "panels": [
         {
           "title": "Cost per task (USD, cumulative)",
@@ -16,9 +16,73 @@
           "expr": ["sum by (task_id, role) (sum_over_time(claude_code.cost.usage[7d]))"]
         },
         {
+          "title": "Cost per repo (USD, cumulative)",
+          "unit": "$",
+          "expr": ["sum by (repo) (sum_over_time(claude_code.cost.usage[7d]))"]
+        },
+        {
+          "title": "Cost per model — which tier is spending it",
+          "unit": "$",
+          "expr": ["sum by (model) (sum_over_time(claude_code.cost.usage[7d]))"]
+        },
+        {
+          "title": "Judge overhead — grading vs working",
+          "unit": "$",
+          "expr": [
+            "sum(sum_over_time(claude_code.cost.usage{role=~\".*-judge\"}[7d]))",
+            "sum(sum_over_time(claude_code.cost.usage{role!~\".*-judge\"}[7d]))"
+          ]
+        },
+        {
           "title": "Spend rate per role (USD/hour)",
           "unit": "$/h",
           "expr": ["sum by (task_id, role) (rate(claude_code.cost.usage[5m])) * 3600"]
+        }
+      ]
+    },
+    {
+      "title": "Optimisation — the levers worth pulling",
+      "panels": [
+        {
+          "title": "Cache hit ratio per role (cacheRead / read total) — the largest cost lever there is",
+          "unit": "%",
+          "expr": [
+            "100 * sum by (role) (sum_over_time(claude_code.token.usage{type=\"cacheRead\"}[7d])) / sum by (role) (sum_over_time(claude_code.token.usage{type=~\"cacheRead|input\"}[7d]))"
+          ]
+        },
+        {
+          "title": "Cache hit ratio per model",
+          "unit": "%",
+          "expr": [
+            "100 * sum by (model) (sum_over_time(claude_code.token.usage{type=\"cacheRead\"}[7d])) / sum by (model) (sum_over_time(claude_code.token.usage{type=~\"cacheRead|input\"}[7d]))"
+          ]
+        },
+        {
+          "title": "USD per commit, per role — what a landed change costs",
+          "unit": "$",
+          "expr": [
+            "sum by (role) (sum_over_time(claude_code.cost.usage[7d])) / sum by (role) (sum_over_time(claude_code.commit.count[7d]))"
+          ]
+        },
+        {
+          "title": "USD per 100 lines changed",
+          "unit": "$",
+          "expr": [
+            "100 * sum by (role) (sum_over_time(claude_code.cost.usage[7d])) / sum by (role) (sum_over_time(claude_code.lines_of_code.count[7d]))"
+          ]
+        },
+        {
+          "title": "Tokens per line changed — how much reading each edit costs",
+          "expr": [
+            "sum by (role) (sum_over_time(claude_code.token.usage[7d])) / sum by (role) (sum_over_time(claude_code.lines_of_code.count[7d]))"
+          ]
+        },
+        {
+          "title": "Output share of tokens (%) — a low number is a session that reads far more than it writes",
+          "unit": "%",
+          "expr": [
+            "100 * sum by (role) (sum_over_time(claude_code.token.usage{type=\"output\"}[7d])) / sum by (role) (sum_over_time(claude_code.token.usage[7d]))"
+          ]
         }
       ]
     },
@@ -34,17 +98,33 @@
           "expr": ["sum by (role, type) (sum_over_time(claude_code.token.usage[7d]))"]
         },
         {
+          "title": "Tokens per model by kind",
+          "expr": ["sum by (model, type) (sum_over_time(claude_code.token.usage[7d]))"]
+        },
+        {
           "title": "Token rate per role (per minute)",
           "expr": ["sum by (task_id, role) (rate(claude_code.token.usage[5m])) * 60"]
         }
       ]
     },
     {
-      "title": "Turns and time",
+      "title": "Throughput",
       "panels": [
         {
           "title": "Sessions started per role",
           "expr": ["sum by (task_id, role) (sum_over_time(claude_code.session.count[7d]))"]
+        },
+        {
+          "title": "Commits per role",
+          "expr": ["sum by (task_id, role) (sum_over_time(claude_code.commit.count[7d]))"]
+        },
+        {
+          "title": "Lines changed by language",
+          "expr": ["sum by (language, type) (sum_over_time(claude_code.lines_of_code.count[7d]))"]
+        },
+        {
+          "title": "Edit-tool decisions — a reject is work paid for and thrown away",
+          "expr": ["sum by (role, decision) (sum_over_time(claude_code.code_edit_tool.decision[7d]))"]
         },
         {
           "title": "Active time per role (seconds)",
@@ -52,8 +132,30 @@
           "expr": ["sum by (task_id, role) (sum_over_time(claude_code.active_time.total[7d]))"]
         },
         {
-          "title": "Model in use per role",
-          "expr": ["sum by (role, model) (sum_over_time(claude_code.cost.usage[7d]))"]
+          "title": "Active time share (%) — the rest of the wall clock is a pane waiting on someone",
+          "unit": "%",
+          "expr": [
+            "100 * sum by (role) (rate(claude_code.active_time.total[30m]))"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "By project",
+      "panels": [
+        {
+          "title": "Cost per project (USD, cumulative)",
+          "unit": "$",
+          "expr": ["sum by (project) (sum_over_time(claude_code.cost.usage[30d]))"]
+        },
+        {
+          "title": "Cost per project and repo",
+          "unit": "$",
+          "expr": ["sum by (project, repo) (sum_over_time(claude_code.cost.usage[30d]))"]
+        },
+        {
+          "title": "Tokens per project and role",
+          "expr": ["sum by (project, role) (sum_over_time(claude_code.token.usage[30d]))"]
         }
       ]
     }

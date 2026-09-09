@@ -135,6 +135,49 @@
       (finally
         (fs/delete-tree sandbox)))))
 
+(deftest a-task-in-a-project-labels-its-metrics-with-it
+  ;; The dimensions a dashboard can group by are exactly the ones the shim
+  ;; writes, so a missing one is a question nobody can ask afterwards — and it
+  ;; cannot be backfilled, because the series are already stored without it.
+  ;; `project` was the gap: task, role, repo and session were all written and
+  ;; project was not, so "what did this project cost" had no answer at all.
+  (with-sandbox
+    (fn [{:keys [env src home]}]
+      (let [id "t-proj"
+            _ (run {:env env} cli "new" id "--repo" src)
+            dir (fs/path home "tasks" id)]
+        (spit (str (fs/path dir "roles")) "plain claude task\n")
+        (spit (str (fs/path dir "repos")) (str src "\n"))
+        ;; the link a task has to its project is a FILE, which is why the shim
+        ;; reads the task folder rather than an environment variable
+        (spit (str (fs/path dir "project")) "lothlorien-analytics\n")
+        (run {:env env} cli "smoke" id)
+        (let [attrs (get (env-map (fs/path dir "tmp" "launch-plain.env"))
+                         "OTEL_RESOURCE_ATTRIBUTES")]
+          ;; Equality, not `includes?`: the file ends in a newline, and
+          ;; `includes? "project=lothlorien-analytics"` passes just as happily
+          ;; on `project=lothlorien-analytics\n`, which is a different label
+          ;; value and a different series. Mutation caught that — swapping the
+          ;; `tr` for a `cat` killed no case.
+          (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture"
+                      ",project=lothlorien-analytics")
+                 attrs)
+              "every attribute, in order, with nothing trailing")
+          ;; No exported value may carry a newline: env-map splits the dump on
+          ;; lines, so one that does is silently truncated and reads exactly
+          ;; like a clean value. The dump still shows it, as a blank line.
+          ;;
+          ;; This does NOT pin the shim's `tr -d '[:space:]'`. Swapping it for a
+          ;; `cat` kills no case, and mutation said so — but the mutant is
+          ;; equivalent, not the test blind. RAN: `$(cat f)` and
+          ;; `$(tr -d '[:space:]' < f)` are byte-identical on a file ending in a
+          ;; newline, because command substitution strips trailing newlines
+          ;; itself. The `tr` earns its place only against INTERNAL whitespace,
+          ;; which valid-project-name? already forbids.
+          (is (not-any? str/blank?
+                        (str/split-lines (slurp (str (fs/path dir "tmp" "launch-plain.env")))))
+              "a blank line means an exported value carried a newline into it"))))))
+
 (deftest smoke-runs-every-role-through-its-shim-with-its-own-model-env
   (with-sandbox
     (fn [{:keys [env src home claude-json]}]
@@ -174,7 +217,11 @@
               (is (= "otlp" (get e "OTEL_METRICS_EXPORTER")))
               (is (= "http/protobuf" (get e "OTEL_EXPORTER_OTLP_PROTOCOL")))
               (is (= "http://127.0.0.1:8428/opentelemetry" (get e "OTEL_EXPORTER_OTLP_ENDPOINT")))
-              (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
+              ;; Omitted, not blank: a `project=` with nothing after it either
+              ;; becomes an empty label or is dropped, and both turn a dashboard
+              ;; "grouped by project" into "grouped by nothing" without saying so.
+              (is (= (str "task_id=" id ",role=plain,session=plain,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES"))
+                  "this task belongs to no project, so no project attribute is sent")
               (is (not (some #{"--model"} (str/split-lines (slurp (str (fs/path dir "tmp" "launch-plain.argv")))))) "no --model pin for anthropic")))
           (testing "an exact model on the operator's own login: pinned, and still no vendor routing"
             (let [e (env-map (fs/path dir "tmp" "launch-exact.env"))
