@@ -75,14 +75,21 @@
         changed (set (remove str/blank? (str/split-lines (or (:out r) ""))))]
     ;; Hard, not a warning. This printed to stderr and carried on with an
     ;; empty set, which selected no mutants, which reported "nothing to check"
-    ;; and exited 0 — the gate went green in eleven seconds having checked
-    ;; nothing. Seen in CI on the first run of this job: `actions/checkout`
-    ;; configures a narrow fetch refspec for a pull_request, so `git fetch
-    ;; origin main` lands in FETCH_HEAD without writing refs/remotes/origin/main,
-    ;; and the ref the runner was told to diff against did not exist.
+    ;; and exited 0. RAN against a ref that does not resolve: the warning
+    ;; printed and zero mutants were selected, exit 0. Unknown scope reported
+    ;; as empty scope, and empty scope reported as success.
     ;;
     ;; A gate that cannot work out its own scope has not passed. It has failed
     ;; to run, and those are different answers.
+    ;;
+    ;; This is a latent bug, not one CI hit. It was written up as a CI failure
+    ;; on the strength of an eleven-second green job, which was wrong: the job
+    ;; had resolved origin/main, selected the three mutants the diff implied,
+    ;; and killed all three. Eleven seconds is simply what that costs —
+    ;; `bb test schema` is 0.09s because it globs and slurps and spawns
+    ;; nothing, where `bb test contract` is 36s because it starts processes.
+    ;; Reasoning "too fast to be real" from the timing of a different suite is
+    ;; the same shape of error as the vacuous gates this file exists to find.
     (when-not (zero? (:exit r))
       (println (str "cannot diff against " ref " — so which mutants this branch"
                     " affects is unknown, and unknown is not empty:"))

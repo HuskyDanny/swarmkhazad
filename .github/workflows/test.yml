@@ -149,15 +149,16 @@ jobs:
         # ceremony: a mutant left on disk would make every later step lie.
         run: |
           if [ -n "${{ github.base_ref }}" ]; then
-            # The refspec is explicit because `git fetch origin main` is not
-            # enough here. `actions/checkout` configures a narrow
-            # remote.origin.fetch for a pull_request, so a bare fetch lands in
-            # FETCH_HEAD and never writes refs/remotes/origin/main — and the
-            # first run of this job diffed against a ref that did not exist,
-            # selected no mutants, and went green in eleven seconds having
-            # checked nothing. The runner now exits 1 on that, and this makes
-            # sure it does not happen; both halves, because either alone leaves
-            # the failure silent or the job permanently red.
+            # An explicit refspec, and then a check that the ref is really
+            # there. A bare `git fetch origin main` lands in FETCH_HEAD, and
+            # whether it also writes refs/remotes/origin/main depends on the
+            # narrow remote.origin.fetch that `actions/checkout` configures for
+            # a pull_request. It DID resolve on the first run of this job —
+            # `fetch-depth: 0` had already written the ref — so this is
+            # belt-and-braces rather than a fix for an observed failure. It
+            # stays because the runner now exits 1 when the ref does not
+            # resolve, and a checkout-behaviour change would otherwise turn
+            # that into a permanently red job with a confusing message.
             git fetch --no-tags --force origin               "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
             git rev-parse --verify "origin/${{ github.base_ref }}" >/dev/null
             bb mutate --changed "origin/${{ github.base_ref }}"
