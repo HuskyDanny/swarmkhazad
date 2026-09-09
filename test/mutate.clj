@@ -47,11 +47,24 @@
 (defn deftest-file
   "The test file holding a deftest, found by name. Derived rather than a field
    in the table: one more column to keep in sync is one more thing to get
-   wrong, and the deftest name is already there."
+   wrong, and the deftest name is already there.
+
+   Read in-process rather than shelled to `rg`. ripgrep is not guaranteed on a
+   GitHub macOS runner, and a missing binary here would fail SILENTLY —
+   `deftest-file` returns nil, `--changed` quietly stops noticing that a test
+   was weakened, and the job goes green having checked fewer mutants than it
+   reported. That is the failure mode this runner exists to catch, so it does
+   not get to live inside it.
+
+   Repo-relative, because that is what `git diff --name-only` emits and the two
+   are compared directly."
   [killed-by]
-  (let [r (process/sh {:continue true} "rg" "-l" "--fixed-strings"
-                      (str "(deftest " killed-by) "test")]
-    (some-> (:out r) str/split-lines first not-empty)))
+  (let [needle (str "(deftest " killed-by)
+        root (fs/cwd)]
+    (->> (fs/glob (fs/path root "test") "**.clj")
+         sort
+         (some #(when (str/includes? (slurp (str %)) needle)
+                  (str (fs/relativize root %)))))))
 
 (defn changed-mutants
   "The mutants a diff against `ref` could affect: the ones whose script
@@ -63,6 +76,15 @@
     (when-not (zero? (:exit r))
       (binding [*out* *err*]
         (println (str "git diff against " ref " failed: " (:err r)))))
+    ;; A :killed-by that names no deftest is a table error, and a silent one:
+    ;; it would just narrow the selection. Say it and stop.
+    (when-let [orphans (seq (remove #(deftest-file (:killed-by %)) rows))]
+      (println "these entries name a deftest that does not exist:")
+      (doseq [{:keys [file killed-by]} orphans]
+        (println (str "  " killed-by "  (" file ")")))
+      (println "Rename the entry's :killed-by to the test that actually guards it,"
+               "or delete the entry.")
+      (System/exit 1))
     (filter (fn [{:keys [file killed-by]}]
               (or (contains? changed file)
                   (when-let [tf (deftest-file killed-by)] (contains? changed tf))))
