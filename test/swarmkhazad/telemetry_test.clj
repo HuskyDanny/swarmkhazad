@@ -177,6 +177,45 @@
       (doseq [dim ["role" "repo" "project" "model" "task_id"]]
         (is (str/includes? all (str "by (" dim))
             (str "nothing groups by " dim))))
+    (testing "no panel can render a nameless line"
+      ;; The bug Allen spotted on the page: `sum by (repo)` returns a series for
+      ;; everything with no repo — this session, the judge, any Claude Code
+      ;; outside a task — and it was BOTH unlabelled and the largest line on the
+      ;; chart ($85.93 against $31.36 for the biggest real repo). It renders as a
+      ;; blank legend entry, so the reader cannot tell what it is or that it is
+      ;; not a repo at all.
+      ;;
+      ;; Filtering it out would be worse: the spend is real. It gets a name.
+      (doseq [dim ["repo" "project" "language"]]
+        (let [grouping (filter #(str/includes? % (str "by (" dim)) exprs)]
+          (when (seq grouping)
+            (is (every? #(str/includes? % "label_replace") grouping)
+                (str "a panel grouped by " dim " can return a series with no " dim
+                     ", and it must be named rather than left blank"))))))
+    (testing "no panel is an unreadable pile of lines"
+      ;; Measured on the live server before this: `sum by (task_id, role)` gave
+      ;; 39 series on one chart and `by (role, type)` gave 52. Grouping by
+      ;; task_id across every task that ever ran is what did it.
+      (doseq [e exprs]
+        (when (and (str/includes? e "by (task_id")
+                   (str/includes? e ","))
+          (is (str/includes? e "topk")
+              (str "grouping by task_id and another label needs a topk: " e)))))
+    (testing "a trend panel uses a window short enough to move"
+      ;; sum_over_time(m[7d]) is the same number at every point inside a window
+      ;; shorter than 7d, so it draws a flat line and shows no trend at all --
+      ;; which is what the whole dashboard did. RAN: at [1h] the same expression
+      ;; varies (implement: 16.99 then 10.2).
+      ;; NOT `some panel uses [1h]`: five of them do, so changing any one back
+      ;; to [7d] leaves the others to satisfy that and the mutant lives. The
+      ;; invariant is per panel — a title promising "per hour" that queries
+      ;; seven days is a lie, and a flat line.
+      (is (seq (filter #(str/includes? (str/lower-case (:title %)) "per hour") panels))
+          "the page needs at least one per-hour panel or nothing on it moves")
+      (doseq [p panels
+              :when (str/includes? (str/lower-case (:title p)) "per hour")]
+        (is (every? #(str/includes? % "[1h]") (:expr p))
+            (str "\"" (:title p) "\" says per hour and must query an hour"))))
     (testing "the cost levers are charted, not just the totals"
       ;; A total says what was spent. A ratio says what to change.
       ;; Not `includes? "cacheRead"` over the whole dashboard: there are two
