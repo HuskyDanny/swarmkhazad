@@ -141,16 +141,53 @@
       (is (= 1 (:exit r)))
       (is (str/includes? (:err r) "usage: swarmkhazad telemetry")))))
 
+(def exported-metrics
+  "Every metric Claude Code's OTLP exporter actually emits.
+
+   RAN against the live VictoriaMetrics — /api/v1/label/__name__/values over the
+   window the data spans. The set used to name four of these and call itself
+   \"the four metrics Claude Code actually exports\", which was wrong in the
+   direction that hurts: a panel querying commits, lines of code or edit-tool
+   decisions is perfectly real and this test rejected it."
+  #{"claude_code.cost.usage"
+    "claude_code.token.usage"
+    "claude_code.session.count"
+    "claude_code.active_time.total"
+    "claude_code.commit.count"
+    "claude_code.lines_of_code.count"
+    "claude_code.code_edit_tool.decision"})
+
 (deftest the-dashboard-ships-with-the-repo-and-every-panel-queries-a-real-metric
   (let [file (fs/path repo-root "dashboards" "swarmkhazad.json")
         d (json/parse-string (slurp (str file)) true)
         panels (mapcat :panels (:rows d))
         exprs (mapcat :expr panels)
-        metrics #{"claude_code.cost.usage" "claude_code.token.usage"
-                  "claude_code.session.count" "claude_code.active_time.total"}]
+        all (str/join " " exprs)]
     (is (= "swarmkhazad" (:title d)))
     (is (= "swarmkhazad.json" (:filename d)) "vmui matches the file by this field")
     (is (<= 3 (count panels)))
-    (is (every? (fn [e] (some #(str/includes? e %) metrics)) exprs)
-        "every panel queries one of the four metrics Claude Code actually exports")
-    (is (some #(str/includes? % "role") exprs) "at least one panel breaks down per role")))
+    (is (every? (fn [e] (some #(str/includes? e %) exported-metrics)) exprs)
+        "every panel queries a metric that is actually exported")
+    (testing "every exported metric is charted — an unused one is a question nobody can ask"
+      (doseq [m exported-metrics]
+        (is (str/includes? all m) (str m " appears in no panel"))))
+    (testing "the dimensions the shim writes are the dimensions something groups by"
+      ;; A label written and never grouped by is dead weight; a label grouped by
+      ;; and never written is a permanently empty chart. Both are silent.
+      (doseq [dim ["role" "repo" "project" "model" "task_id"]]
+        (is (str/includes? all (str "by (" dim))
+            (str "nothing groups by " dim))))
+    (testing "the cost levers are charted, not just the totals"
+      ;; A total says what was spent. A ratio says what to change.
+      ;; Not `includes? "cacheRead"` over the whole dashboard: there are two
+      ;; cache panels, so deleting either one leaves the other to satisfy that
+      ;; check and the mutant lives. Each dimension is asserted on its own.
+      (is (some #(and (str/includes? % "cacheRead") (str/includes? % "by (role)")) exprs)
+          "cache hit ratio per role — the largest single cost lever")
+      (is (some #(and (str/includes? % "cacheRead") (str/includes? % "by (model)")) exprs)
+          "and per model, which is how you tell a cheap tier from a cheap prompt")
+      (is (some #(and (str/includes? % "claude_code.cost.usage")
+                      (str/includes? % "claude_code.commit.count")) exprs)
+          "cost per commit — what a landed change actually costs")
+      (is (some #(str/includes? % "-judge") exprs)
+          "the goal judge runs as its own session and spends its own money"))))

@@ -101,7 +101,29 @@ if [ -n "$lane" ] || [ "$harness" = "claude" ]; then
   export OTEL_EXPORTER_OTLP_PROTOCOL="${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}"
   export OTEL_EXPORTER_OTLP_ENDPOINT="${SWARMKHAZAD_OTLP_ENDPOINT:-http://127.0.0.1:8428/opentelemetry}"
   export OTEL_METRIC_EXPORT_INTERVAL="${OTEL_METRIC_EXPORT_INTERVAL:-10000}"
-  export OTEL_RESOURCE_ATTRIBUTES="task_id=${task_id},role=${role},session=${session},repo=${SWARMKHAZAD_REPO:-}${OTEL_RESOURCE_ATTRIBUTES:+,$OTEL_RESOURCE_ATTRIBUTES}"
+
+  # The dimensions a dashboard can group by are exactly the ones written here,
+  # so a missing one is a question nobody can ask later. `project` is read from
+  # the task folder rather than the environment because that is where the link
+  # lives -- a task belongs to a project by a file, not by a variable.
+  #
+  # An attribute is omitted when its value is empty rather than sent blank: a
+  # blank one either becomes an empty label or is dropped, and both make
+  # "grouped by repo" quietly mean "grouped by nothing" on those series.
+  otel_attrs=""
+  # `return 0` is load-bearing under `set -e`: without it the function's exit
+  # status is the `[ -n ]` test, so skipping an empty attribute returns 1 and
+  # kills the shim before it ever execs claude.
+  otel_add() { [ -n "$2" ] && otel_attrs="${otel_attrs:+$otel_attrs,}$1=$2"; return 0; }
+  otel_add task_id "$task_id"
+  otel_add role "$role"
+  otel_add session "$session"
+  otel_add repo "${SWARMKHAZAD_REPO:-}"
+  # `tr … < file 2>/dev/null` does NOT survive a missing file: the redirect is
+  # the SHELL's, it fails before tr runs, and the 2>/dev/null belongs to tr. With
+  # `set -e` that killed the shim outright for every task not in a project.
+  otel_add project "$([ -f "$task_dir/project" ] && tr -d '[:space:]' < "$task_dir/project")"
+  export OTEL_RESOURCE_ATTRIBUTES="${otel_attrs}${OTEL_RESOURCE_ATTRIBUTES:+,$OTEL_RESOURCE_ATTRIBUTES}"
 fi
 
 exec "$real" "${extra[@]+"${extra[@]}"}" "$@"
