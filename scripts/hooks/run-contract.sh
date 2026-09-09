@@ -236,6 +236,19 @@ pre_tool_use() {
       # the command with its quotes removed, because that is the name the shell
       # will open — `go""al.md` passed this untouched.
       bare=${cmd//\"/}; bare=${bare//\'/}
+      # And a second reduction, for a different question. `bare` keeps quoted
+      # CONTENT because it answers "which file does this name" — `go""al.md` is
+      # goal.md. `scan` DROPS the quoted spans entirely, because it answers
+      # "which commands does this run", and text inside quotes is an argument,
+      # never a command. Splitting `bare` on `;` split inside the quotes too, so
+      # `note.bb finding '... says 13; whoever removes them ...'` produced a
+      # segment whose first word was `whoever` — refused for not being a known
+      # reader, and the tool refused was note.bb, the one this hook tells roles
+      # to use. Two live denials, same cause. Alternation, not two passes: it
+      # matches leftmost-first, so `"it's"` and `'say "hi"'` both close on the
+      # quote they opened with.
+      scan=$(printf '%s' "$cmd" | sed -E "s/'[^']*'|\"[^\"]*\"//g")
+      scan=${scan//\"/}; scan=${scan//\'/}
       # Standing in the task folder, every bare filename is a candidate and the
       # names below prove nothing — `printf x > hard.md` is goal.md when
       # hard.md is a link to it. Roles work in a worktree, so this is the rare
@@ -322,8 +335,14 @@ pre_tool_use() {
         esac
       fi
       [ "$matched" -eq 1 ] || exit 0
-      if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)([^[:alnum:]_]|$)'; then
+      # `scan`, not `cmd`: a verb inside quoted prose is a word, not a call.
+      # `note.bb finding '... `RUN uv pip install --system` at Dockerfile:18'`
+      # matched `install` in its own claim text and was denied — a live denial,
+      # and the message then blamed `tail` (see mut_verb below).
+      mut_verb=""
+      if printf '%s' "$scan" | grep -qE '(^|[^[:alnum:]_])(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)([^[:alnum:]_]|$)'; then
         mutating=1
+        mut_verb=$(printf '%s' "$scan" | grep -oE '(^|[^[:alnum:]_])(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)([^[:alnum:]_]|$)' | head -1 | grep -oE '(chmod|chown|chflags|mv|rm|cp|tee|truncate|install|ln|dd|python3?|perl|ruby|node)')
       fi
       # And anything else. The list above is a denylist, so every tool nobody
       # thought of walked past it: `patch goal.md < p.diff` and
@@ -355,10 +374,46 @@ pre_tool_use() {
             # the mail loop every role runs constantly. Found in a live run.
             [0-9]|[0-9][0-9]) continue ;;
             "<"*|">"*|"&"*) continue ;;
+            # Shell keywords that stand BEFORE a command: the command is the
+            # next word, so advance rather than judge the keyword. `if grep -q
+            # x f` must be judged on `grep`.
+            do|then|else|elif|if|while|until|"{"|"!") continue ;;
             *) head_word=$(basename "$hw"); break ;;
           esac
         done
         [ -n "$head_word" ] || continue
+        # And the keywords that head a segment containing no command: `for f in
+        # a b c`, `case $x in`, and the bare closers. Advancing past `for`
+        # would judge `f`, the loop VARIABLE, which is on no allowlist — four
+        # live denials of `for f in decision.md ...; do cat "$f"; done`, a pure
+        # read. Ignoring the segment checks nothing less: the split is on `;`,
+        # so the body arrives as its own segment and `rm` in it still denies.
+        case "$head_word" in
+          for|case|in|done|fi|esac|"}"|"]]"|"]") continue ;;
+        esac
+        # git is not on the allowlist below and must not be: `git checkout --
+        # goal.md` restores the truth from the index. But `git log`, `git
+        # status` and `git diff` write nothing, and roles run them constantly —
+        # three live denials, all of compound reads. So the SUBCOMMAND decides.
+        if [ "$head_word" = "git" ]; then
+          git_sub=""; skip_next=0
+          for gw in "${segw[@]}"; do
+            if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+            case "$gw" in
+              git|*/git) continue ;;
+              # These take a VALUE, and `git -C worktrees/cirdan log` read that
+              # value as the subcommand until the flag was consumed with it.
+              -C|-c|--git-dir|--work-tree|--namespace|--exec-path) skip_next=1; continue ;;
+              *=*|-*) continue ;;
+              *) git_sub="$gw"; break ;;
+            esac
+          done
+          case "$git_sub" in
+            log|status|diff|show|rev-parse|rev-list|ls-files|ls-tree|ls-remote|\
+            blame|describe|shortlog|cat-file|show-ref|symbolic-ref|\
+            count-objects|branch|remote|grep) continue ;;
+          esac
+        fi
         # Read-only inspectors only. `find`, `du`, `tree`, `dig`, `host`,
         # `nslookup` and `date` were added after a live run: a role reading the
         # task folder with `find` was refused, and the refusal talked about
@@ -371,13 +426,13 @@ pre_tool_use() {
         case "$head_word" in
           cat|head|tail|grep|egrep|fgrep|rg|less|more|wc|diff|ls|stat|file|\
           awk|sed|cut|sort|uniq|tr|jq|echo|printf|test|basename|dirname|realpath|\
-          readlink|md5|shasum|true|false|nl|column|cd|pushd|popd|\
+          readlink|md5|shasum|true|false|nl|column|cd|pushd|popd|read|\
           find|du|tree|dig|host|nslookup|date|\
           note.bb|ready_for_next.bb|done_with_current.bb|swarm_handoff.bb|\
           run_evidence.bb|goal_judge.bb) ;;
           *) mutating=1; break ;;
         esac
-      done < <(printf '%s' "$bare" | tr '|;&\n' '\n\n\n\n')
+      done < <(printf '%s' "$scan" | tr '|;&\n' '\n\n\n\n')
       if printf '%s' "$cmd" | grep -qE '(^|[^[:alnum:]_])(sed|perl)[[:space:]]+(-[[:alnum:]]*i|--in-place)'; then
         mutating=1
       fi
@@ -392,6 +447,14 @@ pre_tool_use() {
       # then wrote the confusion into append-only escalation.md. The command
       # is refused for not being a KNOWN READER of a locked file, which is a
       # different sentence.
+      # Two rules can set mutating, and the message used to describe the second
+      # whichever one fired. A command denied for its VERB was told a word from
+      # its last pipeline segment was not a known reader — one live denial named
+      # `tail` when the trigger was `install`, so the role went looking for a
+      # reader problem it did not have.
+      if [ -n "$mut_verb" ]; then
+        deny "goal.md and metrics.md are the task's truth (chmod 444), and this command names one together with '$mut_verb', which writes. To read one, use Read, or cat/head/grep/sed. A bar you cannot meet is an escalation.md line, never an edit to the bar." "Bash" "$cmd"
+      fi
       deny "goal.md and metrics.md are the task's truth (chmod 444), and '${head_word:-that command}' is not a reader this hook knows, so a command naming them is refused rather than assumed safe. To read one, use Read, or cat/head/grep/sed. A bar you cannot meet is an escalation.md line, never an edit to the bar." "Bash" "$cmd"
       ;;
     Read|Grep|Glob|LS|NotebookRead)

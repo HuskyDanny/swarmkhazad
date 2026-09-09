@@ -437,9 +437,66 @@
         (is (denied? (bash task task (str "env FOO=1 perl -pi -e 's/a/b/' " task "/goal.md")))))
 
       (testing "the refusal names the rule that fired, not an edit nobody attempted"
+        ;; Two rules can refuse, and the message now says which. `perl` is a
+        ;; mutating VERB, so it is refused for writing; `patch` is a tool this
+        ;; hook has never heard of, so it is refused for not being a reader.
+        ;; The two used to share one sentence, and a command denied for its
+        ;; verb was told a word from its last pipeline segment was not a
+        ;; reader — one live denial named `tail` when the trigger was
+        ;; `install`, and the role went looking for a problem it did not have.
         (let [r (bash task task (str "cd " task " && perl -pi -e 's/a/b/' goal.md"))
               why (get-in (:json r) ["hookSpecificOutput" "permissionDecisionReason"])]
           (is (denied? r))
           (is (str/includes? why "perl")
+              "the reason must name the verb that was refused")
+          (is (str/includes? why "which writes")))
+        (let [r (bash task task (str "cd " task " && patch goal.md < p.diff"))
+              why (get-in (:json r) ["hookSpecificOutput" "permissionDecisionReason"])]
+          (is (denied? r))
+          (is (str/includes? why "patch")
               "the reason must name the command that was not recognised")
-          (is (str/includes? why "not a reader this hook knows"))))))) 
+          (is (str/includes? why "not a reader this hook knows")))))))
+
+(deftest a-command-is-parsed-as-commands-not-as-words
+  ;; Every case here was denied in one live run of task gobelhygine: 13
+  ;; denials in state/denials.jsonl, all false positives, not one of them a
+  ;; write. The head-word scan splits on `|;&` and reads each segment's first
+  ;; word as a command name, and three kinds of word are not command names.
+  (with-task
+    (fn [task _sandbox]
+      (session-start task)
+
+      (testing "a shell keyword is not a command"
+        ;; `for f in ...; do cat "$f"; done` splits into three segments whose
+        ;; first words are `for`, `do` and `done`. Denied four times.
+        (is (allowed? (bash task task (str "cd " task " && for f in goal.md metrics.md; do echo \"--- $f\"; cat \"$f\"; done"))))
+        (is (allowed? (bash task task (str "cd " task " && if grep -q x goal.md; then echo hit; fi"))))
+        (is (allowed? (bash task task (str "cd " task " && while IFS= read -r l; do echo \"$l\"; done < goal.md"))))
+        (testing "and the body of the loop is still judged"
+          ;; The split is on `;`, so ignoring the `for` segment checks nothing
+          ;; less — `chmod` arrives as its own segment.
+          (is (denied? (bash task task (str "cd " task " && for f in goal.md; do chmod 644 \"$f\"; done"))))))
+
+      (testing "text inside quotes is an argument, never a command"
+        ;; note.bb is the tool this hook TELLS roles to use, and a semicolon in
+        ;; the claim text refused it: two live denials, head words `whoever`
+        ;; and `waiting`, both words of prose.
+        (is (allowed? (bash task task (str "cd " task " && note.bb finding 'goal line 2 says 13; whoever removes them should delete all 14' 'a count-driven pass leaves one behind'"))))
+        (is (allowed? (bash task task (str "cd " task " && note.bb gotcha 'a claim with a | pipe & an ampersand' 'the scan split on both'"))))
+        (testing "including a word that would be a mutating verb outside them"
+          ;; A claim quoting `RUN uv pip install --system` matched `install`.
+          (is (allowed? (bash task task (str "cd " task " && note.bb finding 'RUN uv pip install --system --no-cache . at Dockerfile:18' 'gobel is not in the repos list' 2>&1 | tail -3")))))
+        (testing "but a quoted path is still the file it names"
+          (is (denied? (bash task task (str "cd " task " && chmod 644 'goal.md'"))))
+          (is (denied? (bash task task (str "cd " task " && python3 -c \"open('goal.md','w')\""))))))
+
+      (testing "git is judged on its subcommand, because only some of them write"
+        (is (allowed? (bash task task (str "cd " task " && ls -la 2>/dev/null; echo === ; git log --oneline -5 && git status --short"))))
+        (is (allowed? (bash task task (str "cd " task " && git -C worktrees/cirdan log --oneline -5"))))
+        (is (allowed? (bash task task (str "cd " task " && git diff --stat && git rev-parse --abbrev-ref HEAD"))))
+        (testing "and the writing ones still are not"
+          ;; `-C` takes a VALUE: reading it as the subcommand would have made
+          ;; every `git -C x checkout` look like a subcommand named `x`.
+          (is (denied? (bash task task (str "cd " task " && git checkout -- goal.md"))))
+          (is (denied? (bash task task (str "cd " task " && git -C . restore goal.md"))))
+          (is (denied? (bash task task (str "cd " task " && git -C . checkout HEAD -- metrics.md")))))))))
