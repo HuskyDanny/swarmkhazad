@@ -367,33 +367,31 @@
                         (when (= mode :smoke) claude-print-flags)
                         ["--append-system-prompt-file" (str prompt)
                          "--settings" (str (write-hook-settings! ctx row))
-                         ;; The task folder IS the plugin root — its manifest is
-                         ;; at <task>/.claude-plugin/plugin.json and its
-                         ;; components at <task>/agents and <task>/skills (see
-                         ;; task-lib's install-plugin!). Naming the path here is
-                         ;; what replaced copying the skill and the subagent
-                         ;; into every worktree, which meant writing into repos
-                         ;; the swarm does not own.
+                         ;; `<task>/plugin/` is the plugin root that carries the
+                         ;; generated skill and subagent (see task-lib's
+                         ;; install-plugin!). Naming the path here is what
+                         ;; replaced copying them into every worktree, which
+                         ;; meant writing into repos the swarm does not own.
+                         ;;
+                         ;; Its OWN directory rather than the task folder,
+                         ;; because a plugin root is also read for
+                         ;; `hooks/hooks.json`, `.mcp.json` and `commands/` —
+                         ;; and `<task>/hooks/` is already where this file
+                         ;; writes each session's settings. Pointing the flag at
+                         ;; the task folder would have put a loader that runs
+                         ;; shell commands on tool events one filename away from
+                         ;; a directory the swarm itself writes into.
                          ;;
                          ;; Two argv slots, built here rather than declared on a
                          ;; `roles` line: that line is whitespace-split twice, so
                          ;; a path with a space in it would arrive as two flags
                          ;; and a quoted one would arrive with its quotes. The
-                         ;; flag is repeatable (`--plugin-dir A --plugin-dir B`)
-                         ;; rather than last-wins, so a lane's own plugins load
-                         ;; alongside this one instead of losing to it.
-                         ;;
-                         ;; The task folder being the plugin root means a plugin
-                         ;; loader reads THREE more names inside it than
-                         ;; install-plugin! writes: `hooks/hooks.json`,
-                         ;; `commands/`, and `.mcp.json`. `hooks/` already
-                         ;; exists here and holds `<session>.settings.json`, so
-                         ;; the collision is one filename away — anything that
-                         ;; later writes `<task>/hooks/hooks.json` is writing
-                         ;; hooks into every role of that task, not settings for
-                         ;; one session. Roles can write into the task folder,
-                         ;; so treat those three names as load-bearing.
-                         "--plugin-dir" (str (:task-dir ctx))]
+                         ;; flag is repeatable rather than last-wins — READ, the
+                         ;; 2.1.266 binary parses it as `pluginDir.push(path)` —
+                         ;; so a lane's own plugins load alongside this one
+                         ;; instead of losing to it, unlike
+                         ;; `--append-system-prompt-file` above.
+                         "--plugin-dir" (str (:plugin-dir ctx))]
                         ;; A lane already declares its own permission posture —
                         ;; cc_auto bypasses, cc_control screens — and restating
                         ;; ours would collapse the two into one choice.

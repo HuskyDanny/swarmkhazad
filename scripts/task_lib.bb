@@ -186,6 +186,14 @@
      :bin-dir (fs/path task-dir "bin")
      :prompts-dir (fs/path task-dir "prompts")
      :hooks-dir (fs/path task-dir "hooks")
+     ;; The plugin root a role's `--plugin-dir` names. Its OWN directory, not
+     ;; the task folder, because a plugin root is read by convention at names
+     ;; the task folder already uses or will: `hooks/hooks.json` (and a
+     ;; manifest's own hooks field is documented as being read IN ADDITION to
+     ;; that path, so it cannot be suppressed), `.mcp.json`, and `commands/`.
+     ;; `:hooks-dir` above is already `<task>/hooks`. One subdirectory keeps the
+     ;; two namespaces from ever having to be told apart by memory.
+     :plugin-dir (fs/path task-dir "plugin")
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
      :sessions-tsv (fs/path state-dir "sessions.tsv")
@@ -868,9 +876,9 @@
   (fs/path (fs/parent (fs/parent (fs/absolutize *file*))) "plugin"))
 
 (defn install-plugin!
-  "Copy the repo's plugin into the task folder, which becomes its plugin root:
-   the manifest lands at `<task>/.claude-plugin/plugin.json` and its components
-   beside prompts/ and hooks/, as `<task>/agents/` and `<task>/skills/`.
+  "Copy the repo's plugin into `<task>/plugin/`, the root a role's
+   `--plugin-dir` names: the manifest at `<task>/plugin/.claude-plugin/plugin.json`
+   and its components at `<task>/plugin/agents/` and `<task>/plugin/skills/`.
 
    Copied per task rather than named in the repo, because a task must be able
    to carry a different skill from the one beside it — the path is per-session
@@ -881,19 +889,37 @@
    to go there made swarmkhazad write into lothlorien, minas-tirith and istari
    — and then add `info/exclude` entries in those repos so a role running
    `git add -A` could not commit the scaffolding. Naming the load path on each
-   role's argv (`--plugin-dir <task-dir>`, see swarm_lib's harness-argv) writes
-   nothing into them at all.
+   role's argv (see swarm_lib's harness-argv) writes nothing into them at all.
 
    RAN, and this is what makes naming sufficient where a parent directory's
    `.claude/` was not: from a cwd holding no `.claude`, with this layout copied
-   into a task-shaped folder, `claude -p --plugin-dir <task-dir>` listed both
+   out of the task folder, `claude -p --plugin-dir <dir>` listed both
    `swarmkhazad:investigation-hypothesis-tester` and `swarmkhazad:investigate`.
+
+   **The tree is REPLACED, not merged into.** A plugin root is executable
+   surface — a `hooks/hooks.json` under it runs shell commands on every tool
+   event, an `.mcp.json` registers servers under a name the role's
+   `--disallowedTools` patterns do not match — and roles can write anywhere
+   under the task folder. Deleting first means this directory holds exactly
+   what the repo ships, checked at every prepare, rather than whatever has
+   accumulated in it. Safe because nothing else writes here: an operator's
+   per-task edit to a shipped file was already overwritten by the copy.
+
+   Throws rather than no-ops on a checkout with no `plugin/`. The failure it
+   replaces is silent and total: `--plugin-dir` at a path with no manifest is
+   read as a FOLDER of plugins and loads each child, so the flag succeeds, the
+   skill never loads, and the investigate role launches with no protocol and
+   improvises (RAN: exit 0, empty stderr, nothing loaded).
 
    Idempotent."
   [ctx]
-  (when (fs/directory? plugin-src)
-    (fs/copy-tree plugin-src (:task-dir ctx) {:replace-existing true})
-    true))
+  (when-not (fs/directory? plugin-src)
+    (throw (ex-info (str "swarmkhazad's own plugin is missing: " plugin-src
+                         " — a role would launch with no skill and no subagent")
+                    {:plugin-src (str plugin-src)})))
+  (fs/delete-tree (:plugin-dir ctx))
+  (fs/copy-tree plugin-src (:plugin-dir ctx) {:replace-existing true})
+  true)
 
 (defn create-layout! [ctx]
   (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir

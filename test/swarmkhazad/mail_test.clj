@@ -348,26 +348,29 @@
         prompt (fs/path scratch "r.md")
         _ (spit (str prompt) "PROMPT-TEXT")
         ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"
-             :hooks-dir (fs/path scratch "hooks") :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"}
+             :hooks-dir (fs/path scratch "hooks") :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"
+             :plugin-dir "/tmp/t/plugin"}
         row (fn [h] {:session "r" :role "r" :repo "fixture" :harness h
                      :worktree-path "/tmp/t/worktrees/fixture" :extra-args "--flag va'lue"})
         argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
         start-with #(str/starts-with? % "You are role r working in fixture (session r) of task t.")]
     (try
       (testing "claude: system prompt file, hook settings, the task folder as a plugin, bypass, name in the pane, extra args, then the message after --"
-        ;; `--plugin-dir <task-dir>` is what makes the generated skill and
+        ;; `--plugin-dir <task>/plugin` is what makes the generated skill and
         ;; subagent LOADABLE, and it is why nothing is copied into a worktree
-        ;; any more. Two argv slots, unquoted: a `roles` line is whitespace-split
+        ;; any more. Its own directory, not the task folder: a plugin root is
+        ;; also read for `hooks/hooks.json`, and `<task>/hooks/` is where the
+        ;; `--settings` file one slot to the left was just written. Two argv slots, unquoted: a `roles` line is whitespace-split
         ;; twice, so a quoted path would reach the CLI with its quotes and load
         ;; nothing — which is why this is built here and not declared there.
         (let [a (argv "claude" :interactive)]
           (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude" "--append-system-prompt-file" (str prompt)
                   "--settings" (str (fs/path scratch "hooks" "r.settings.json"))
-                  "--plugin-dir" "/tmp/t"
+                  "--plugin-dir" "/tmp/t/plugin"
                   "--permission-mode" "bypassPermissions" "-n" "sk r" "--flag" "va'lue" "--"] (butlast a)))
           (is (start-with (last a))))
         (testing "and the plugin is named in print mode too — the smoke run loads the same session shape"
-          (is (= "/tmp/t" (second (drop-while #(not= "--plugin-dir" %) (argv "claude" :smoke))))))
+          (is (= "/tmp/t/plugin" (second (drop-while #(not= "--plugin-dir" %) (argv "claude" :smoke))))))
         (let [a (argv "claude" :smoke)]
           (is (some #{"-p"} a))
           (is (= "json" (second (drop-while #(not= "--output-format" %) a))))

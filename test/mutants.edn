@@ -204,24 +204,45 @@
  ;; ------------------------------------- the plugin, named rather than copied
  {:file "scripts/swarm_lib.bb"
   :ns "mail"
-  :old "                         \"--plugin-dir\" (str (:task-dir ctx))]"
+  :old "                         \"--plugin-dir\" (str (:plugin-dir ctx))]"
   :new "                         ]"
   :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
   :why "the generated skill and subagent are on disk and nothing names them, so every investigate role launches with no protocol and improvises — the exact failure the copy shape existed to prevent"}
 
  {:file "scripts/swarm_lib.bb"
   :ns "mail"
-  :old "                         \"--plugin-dir\" (str (:task-dir ctx))]"
-  :new "                         \"--plugin-dir\" (str \"\\\"\" (:task-dir ctx) \"\\\"\")]"
+  :old "                         \"--plugin-dir\" (str (:plugin-dir ctx))]"
+  :new "                         \"--plugin-dir\" (str \"\\\"\" (:plugin-dir ctx) \"\\\"\")]"
   :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
   :why "the path reaches the CLI with its quotes, naming a directory that does not exist — the same shape that made a quoted --disallowedTools list deny nothing"}
 
  {:file "scripts/task_lib.bb"
   :ns "investigation"
-  :old "    (fs/copy-tree plugin-src (:task-dir ctx) {:replace-existing true})"
-  :new "    (fs/copy-tree plugin-src (fs/path (:task-dir ctx) \"tmp\") {:replace-existing true})"
+  :old "  (fs/copy-tree plugin-src (:plugin-dir ctx) {:replace-existing true})"
+  :new "  (fs/copy-tree plugin-src (fs/path (:task-dir ctx) \"tmp\") {:replace-existing true})"
   :killed-by "the-plugin-is-generated-into-the-task-folder-and-nothing-is-written-into-the-target-repo"
   :why "the plugin lands where --plugin-dir does not name it, so the manifest and both components exist and no session loads either"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "                            (exclude-paths! source [\".codegraph/\"])"
+  :new "                            (identity source)"
+  :killed-by "a-re-prepare-adds-no-second-exclude-line"
+  :why "the codegraph index shows as `?? .codegraph/` in the target checkout, so every task reads dirty from the moment it opens — and this is the one exclude the swarm still needs, its sibling caller having been deleted with the worktree copy"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "task"
+  :old "      (install-plugin! ctx)\n      (prepare-mail-dirs! ctx rows)"
+  :new "      (prepare-mail-dirs! ctx rows)"
+  :killed-by "a-task-opened-before-the-repos-file-can-still-be-reopened"
+  :why "a RESUMED task gets no plugin — `open` is the resume path, so an investigation reopened after a reboot comes back with no skill and no subagent and improvises"}
+
+ {:file "plugin/skills/investigate/SKILL.md"
+  :ns "investigation"
+  :old "name: investigate"
+  :new "name: investigate-renamed"
+  :killed-by "the-plugin-is-generated-into-the-task-folder-and-nothing-is-written-into-the-target-repo"
+  :why "the `:X` half of `swarmkhazad:investigate` drifts from what the prompts spell, so the id resolves to nothing while the file sits at the right path — presence is not a name"}
 
   {:file "scripts/task_lib.bb"
   :ns "investigation"

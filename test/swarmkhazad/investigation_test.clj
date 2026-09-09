@@ -337,12 +337,13 @@
 
 ;; --------------------------------------------------- the generated plugin
 
-;; The task folder IS the plugin root: `--plugin-dir <task-dir>` is on every
-;; claude role's argv, so the manifest is at `<task>/.claude-plugin/plugin.json`
-;; and its components sit beside prompts/ and hooks/.
-(def manifest-rel ".claude-plugin/plugin.json")
-(def skill-rel "skills/investigate/SKILL.md")
-(def agent-rel "agents/investigation-hypothesis-tester.md")
+;; `<task>/plugin/` is the plugin root, named on every claude role's argv. Its
+;; own directory rather than the task folder, because a plugin root is also read
+;; for `hooks/hooks.json`, `.mcp.json` and `commands/`, and `<task>/hooks/` is
+;; already the swarm's per-session settings dir.
+(def manifest-rel "plugin/.claude-plugin/plugin.json")
+(def skill-rel "plugin/skills/investigate/SKILL.md")
+(def agent-rel "plugin/agents/investigation-hypothesis-tester.md")
 
 (deftest the-plugin-is-generated-into-the-task-folder-and-nothing-is-written-into-the-target-repo
   ;; The point of the shape, and the reason it replaced copying into each
@@ -363,6 +364,17 @@
           ;; a role that improvises rather than an error anybody sees.
           (let [name (get (json/parse-string (slurp (str (fs/path dir manifest-rel))) true) :name)]
             (is (= "swarmkhazad" name))
+            ;; A `swarmkhazad:investigate` id has TWO halves, and pinning only
+            ;; the manifest's leaves the other free to drift: rename `name:` in
+            ;; the component's own frontmatter and every test here still passes
+            ;; while the id resolves to nothing — the role launches with no
+            ;; protocol and improvises. Presence at a path is not a name, which
+            ;; is the same confusion this whole change is about, one level down.
+            (doseq [[f want] [[skill-rel "investigate"]
+                              [agent-rel "investigation-hypothesis-tester"]]]
+              (is (= want (second (re-find #"(?m)^name:\s*(\S+)$"
+                                           (slurp (str (fs/path dir f))))))
+                  (str f " declares the name the manifest namespaces")))
             (doseq [f ["investigate.prompt"]]
               (let [text (slurp (str (fs/path repo-root "prompts" f)))]
                 (is (str/includes? text (str name ":investigate")))
@@ -371,7 +383,7 @@
                                (str name ":investigation-hypothesis-tester"))
                 "including the SKILL body, which is what tells the parent what to dispatch")))
         (testing "and NOTHING is written into the target repo"
-          (doseq [p [".claude" "agents" "skills" ".claude-plugin"]]
+          (doseq [p [".claude" "plugin" "agents" "skills" ".claude-plugin"]]
             (is (not (fs/exists? (fs/path wt p)))
                 (str "the worktree must not carry " p " — it is a working tree of a repo we do not own")))
           (is (= "" (git wt "status" "--porcelain"))
@@ -413,6 +425,11 @@
     (fn [{:keys [src env]}]
       (let [excl (fs/path src ".git" "info" "exclude")
             before (slurp (str excl))]
+        ;; Without this, the equality below is equally true when the write path
+        ;; never ran at all — a test that passes for a reason other than the one
+        ;; its name claims.
+        (is (str/includes? before ".codegraph/")
+            "there is a first line for a second one to duplicate")
         (run {:env env} cli "prepare" "t-inv")
         (is (= before (slurp (str excl))))))))
 

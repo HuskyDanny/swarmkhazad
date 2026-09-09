@@ -164,11 +164,11 @@
         (testing "the four bullet files exist and are empty; nothing clones into the task folder"
           (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
-          (is (= #{".claude-plugin" "agents" "skills"
+          (is (= #{"plugin"
                    "decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md"
                    "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
                  (set (map fs/file-name (fs/list-dir dir))))
-              "the plugin's three entries make the task folder its own plugin root, which is what --plugin-dir names"))
+              "one entry, not three — a plugin root is read for hooks/, commands/ and .mcp.json, so it gets its own directory rather than sharing the task folder's namespace"))
         (testing "prepare is idempotent, and a re-prepare keeps a commit the role made"
           (spit (str (fs/path wt "probe.txt")) "x\n")
           (run {:dir (str wt)} "git" "add" "probe.txt")
@@ -573,9 +573,9 @@
             ;; folder has no plugin comes back with no skill and no subagent —
             ;; the investigate role's entire method lives in that skill, so the
             ;; pane would launch and improvise.
-            (doseq [p [".claude-plugin/plugin.json"
-                       "skills/investigate/SKILL.md"
-                       "agents/investigation-hypothesis-tester.md"]]
+            (doseq [p ["plugin/.claude-plugin/plugin.json"
+                       "plugin/skills/investigate/SKILL.md"
+                       "plugin/agents/investigation-hypothesis-tester.md"]]
               (is (fs/regular-file? (fs/path dir p)) (str "task folder: " p))
               (is (not (fs/exists? (fs/path wt p)))
                   (str "legacy worktree must stay untouched: " p))))))))
