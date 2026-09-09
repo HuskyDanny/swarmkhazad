@@ -50,6 +50,31 @@
         [status headers & body] (str/split-lines (:out r))]
     {:status (parse-long status) :headers (read-string headers) :body (str/join "\n" body)}))
 
+(defn settle-open!
+  "Wait for the `swarmkhazad.bb open` a route spawned to exit, then take down
+   whatever it got as far as starting.
+
+   `POST /tasks/:id/resume` and `POST /projects/:p/tasks` both spawn a real open
+   in the background and return immediately — that is the point of them — so a
+   test that opens a task has to take that process down before its sandbox goes,
+   or teardown races a live writer. It did: on CI `fs/delete-tree` threw
+   `DirectoryNotEmptyException` from the `finally` while the spawned open was
+   still creating the task's worktrees, and the whole test reported as an
+   uncaught exception with nothing to say about what it was actually testing.
+   This machine won the race every time.
+
+   Bounded: a leaked process must not hang the suite."
+  [& ids]
+  (let [deadline (+ (System/currentTimeMillis) 30000)]
+    (doseq [id ids]
+      (while (and (zero? (:exit (process/sh {:continue true}
+                                            "pgrep" "-f" (str "swarmkhazad.bb open " id))))
+                  (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 200))
+      (process/sh {:continue true} "tmux" "-S"
+                  (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                  "kill-server"))))
+
 (deftest the-task-page-is-a-view-of-the-folder-and-the-index-lists-it
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal."})
         home (str (fs/path sandbox "home"))
@@ -1034,16 +1059,7 @@
             (is (= 303 (:status r)))
             (is (= (str "/tasks/" id) (get (:headers r) "Location"))))))
       (finally
-        ;; Wait for the spawned open to exit, then take down whatever it got as
-        ;; far as starting. Bounded: a leaked process must not hang the suite.
-        (let [deadline (+ (System/currentTimeMillis) 30000)]
-          (while (and (zero? (:exit (process/sh {:continue true}
-                                                "pgrep" "-f" (str "swarmkhazad.bb open " id))))
-                      (< (System/currentTimeMillis) deadline))
-            (Thread/sleep 200)))
-        (process/sh {:continue true} "tmux" "-S"
-                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
-                    "kill-server")
+        (settle-open! id)
         (fs/delete-tree sandbox)))))
 
 (defn eval-in-portal
@@ -1135,4 +1151,8 @@
           (is (str/includes? (:body r) (str "not in project " project)))
           (is (not (fs/exists? (fs/path home "tasks" "t-sub")))
               "refused before the CLI is shelled, so there is nothing to clean up")))
-      (finally (fs/delete-tree sandbox)))))
+      (finally
+        ;; `t-one` is the one that opened; `t-sub` was refused before the CLI
+        ;; was shelled, so there is no process behind it.
+        (settle-open! "t-one")
+        (fs/delete-tree sandbox)))))
