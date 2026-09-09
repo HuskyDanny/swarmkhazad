@@ -38,6 +38,19 @@
 (defn timestamp []
   (.format java.time.format.DateTimeFormatter/ISO_INSTANT (java.time.Instant/now)))
 
+(def tasks-tsv-columns
+  "The card row's columns, in file order — one definition, read by `rows` and
+   written by `write-rows!`.
+
+   It was the same five keys spelled out twice, six lines apart: a literal
+   vector in the reader's `zipmap` and a second literal in the writer's
+   `str/join`. Nothing tied them, and the way that fails is silent — `zipmap`
+   drops a column the writer added and pads a column it dropped with nil, so a
+   card reads with the wrong lane and no error anywhere. `sessions.tsv` has had
+   `sessions-tsv-columns` since it was written; this file is the one that did
+   not."
+  [:name :lane :created-at :updated-at :handed])
+
 (defn rows
   "The cards, as maps."
   [ctx]
@@ -46,15 +59,14 @@
       (->> (str/split-lines (slurp (str file)))
            (remove str/blank?)
            (mapv (fn [line]
-                   (zipmap [:name :lane :created-at :updated-at :handed] (str/split line #"\t" -1)))))
+                   (zipmap tasks-tsv-columns (str/split line #"\t" -1)))))
       [])))
 
 (defn write-rows! [ctx rows]
   (let [file (tasks-file ctx)
         tmp (fs/create-temp-file {:dir (fs/parent file) :prefix ".tasks."})]
     (spit (str tmp) (apply str (for [r rows]
-                                (str (str/join "\t" [(:name r) (:lane r) (:created-at r) (:updated-at r)
-                                                     (or (:handed r) "")])
+                                (str (str/join "\t" (map #(str (or (get r %) "")) tasks-tsv-columns))
                                      "\n"))))
     (fs/move tmp file {:replace-existing true :atomic-move true})))
 

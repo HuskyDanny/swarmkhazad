@@ -6,7 +6,8 @@
             [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]))
+            [clojure.test :refer [deftest is testing]]
+            [org.httpkit.server :as http]))
 
 (def repo-root (str (fs/cwd)))
 (def cli (str (fs/path repo-root "scripts" "swarmkhazad.bb")))
@@ -132,9 +133,18 @@
                 (is (= (get h "commit") (subs (git (fs/path dir "worktrees" "fixture") "rev-parse" (str (get h "commit") "^{commit}")) 0 10))
                     "roles in one repo share its worktree, so the merge is a no-op and the commit is simply there")))
             (testing "the daemon typed a wake-up into each recipient's pane"
+              ;; The daemon types this asynchronously, so a bare capture races
+              ;; it: under load the pane still held nothing but the launch line
+              ;; and the suite failed on a wake-up that landed a moment later.
+              ;; Wait for it, bounded, then assert — a timeout still fails, and
+              ;; fails saying which pane never woke.
               (doseq [role ["a" "b"]]
-                (let [pane (:out (process/sh {:continue true} "tmux" "-S" socket "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-"))]
-                  (is (str/includes? pane "You have new handoff mail") (str "wake-up in sk-" role)))))
+                (let [woke? (fn [] (str/includes?
+                                    (:out (process/sh {:continue true} "tmux" "-S" socket
+                                                      "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-"))
+                                    "You have new handoff mail"))]
+                  (wait-until (str "wake-up in sk-" role) 15000 woke?)
+                  (is (woke?) (str "wake-up in sk-" role)))))
             (testing "b's terminal broadcast is non-forwarding and landed in a's inbox/new"
               (let [sent (headers (first (handoffs (fs/path dir "mail" "b" "sent"))))
                     arrived (handoffs (fs/path dir "mail" "a" "inbox" "new"))]
@@ -181,6 +191,107 @@
               (is (fs/regular-file? (fs/path dir "state" "sessions" role "pane.txt")) (str role " pane archived"))))))
       (finally
         (process/sh {:continue true} "tmux" "-S" (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock") "kill-server")
+        (fs/delete-tree sandbox)))))
+
+(deftest delete-removes-the-task-and-everything-it-left-behind
+  ;; `close --reclaim` gives the disk back and deliberately keeps the folder.
+  ;; Nothing removed the folder, and nothing at all removed the task's series,
+  ;; so the board and the spend chart both accumulated names with nothing behind
+  ;; them — eleven of them on the operator's machine when this was written.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-delete."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        ;; Never the operator's real server: a test must not issue a delete
+        ;; against a live metrics store. Port 1 answers nothing, which is the
+        ;; :unreachable path — and the task folder must still go.
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_OTLP_ENDPOINT" "http://127.0.0.1:1/opentelemetry"}
+        id "t-del"
+        dir (fs/path home "tasks" id)]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (spit (str (fs/path dir "roles")) "implement claude task\n")
+      (spit (str (fs/path dir "repos")) (str src "\n"))
+      (run {:env env} cli "prepare" id)
+      (let [worktree (fs/path dir "worktrees" "fixture")
+            branch (str "sk/" id)]
+        (is (fs/directory? worktree) "prepare made the worktree this test is about to delete")
+
+        (testing "it refuses while the branch is not on origin, and touches nothing"
+          ;; The whole point of the refusal: the branch name is written in the
+          ;; task folder, so removing the folder is what makes local-only
+          ;; commits unfindable. Same rule and same override as reclaim.
+          (let [r (run {:env env :ok? false} cli "delete" id)]
+            (is (not= 0 (:exit r)))
+            (is (str/includes? (str (:err r) (:out r)) "origin has never seen") (:err r))
+            (is (str/includes? (str (:err r) (:out r)) "--force") "and says how to override"))
+          (is (fs/directory? dir) "the task folder is still there")
+          (is (fs/directory? worktree) "and so is the worktree — a refusal is not a partial delete"))
+
+        (testing "on origin, it takes the worktree, the branch and the folder"
+          (git src "update-ref" (str "refs/remotes/origin/" branch) (git src "rev-parse" branch))
+          (let [r (run {:env env} cli "delete" id)]
+            (is (str/includes? (:out r) "task deleted:"))
+            (is (str/includes? (:out r) "still there")
+                "an unreachable metrics server is reported, not implied away"))
+          (is (not (fs/exists? dir)) "the task folder is gone")
+          (is (not (fs/exists? worktree)) "the worktree is gone")
+          (is (not (str/includes? (git src "branch" "--list" branch) branch))
+              "and the branch is gone from the source checkout"))
+
+        (testing "deleting what is not there is an error, not a silent success"
+          (let [r (run {:env env :ok? false} cli "delete" id)]
+            (is (not= 0 (:exit r)))
+            (is (str/includes? (str (:err r) (:out r)) id))))
+
+        (testing "unless the store still has it: the folder is gone but the chart is not"
+          ;; Every task closed before this command existed is in this state, and
+          ;; it is most of what a long-running dashboard is charting — six of
+          ;; the twelve ids on the operator's server had no folder left.
+          (let [stop (http/run-server
+                      (fn [req]
+                        (if (str/includes? (str (:uri req)) "delete_series")
+                          {:status 204 :body ""}
+                          {:status 200 :headers {"Content-Type" "application/json"}
+                           :body (json/generate-string
+                                  {:status "success"
+                                   :data [{:__name__ "claude_code.cost.usage" :task_id id}]})}))
+                      {:ip "127.0.0.1" :port 0})
+                live (assoc env "SWARMKHAZAD_OTLP_ENDPOINT"
+                            (str "http://127.0.0.1:" (:local-port (meta stop)) "/opentelemetry"))]
+            (try
+              (let [r (run {:env live} cli "delete" id)]
+                (is (str/includes? (:out r) "only in the metrics store"))
+                (is (str/includes? (:out r) "series dropped")))
+              (finally (stop))))))
+      (finally
+        (process/sh {:continue true} "tmux" "-S"
+                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                    "kill-server")
+        (fs/delete-tree sandbox)))))
+
+(deftest delete-force-removes-a-task-whose-work-is-only-local
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-delete-force."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_OTLP_ENDPOINT" "http://127.0.0.1:1/opentelemetry"}
+        id "t-del-force"
+        dir (fs/path home "tasks" id)]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (spit (str (fs/path dir "roles")) "implement claude task\n")
+      (spit (str (fs/path dir "repos")) (str src "\n"))
+      (run {:env env} cli "prepare" id)
+      (is (fs/directory? (fs/path dir "worktrees" "fixture")))
+      (run {:env env} cli "delete" id "--force")
+      (is (not (fs/exists? dir)) "--force means the operator has said they accept losing those commits")
+      (finally
+        (process/sh {:continue true} "tmux" "-S"
+                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                    "kill-server")
         (fs/delete-tree sandbox)))))
 
 (deftest open-refuses-a-missing-harness

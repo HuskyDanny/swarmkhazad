@@ -1,0 +1,138 @@
+;; The mutation table. One entry per guard that must not silently stop
+;; guarding, each recording the exact code that carries it and the test that
+;; noticed when it was taken away.
+;;
+;; Every entry here was RUN as a mutant during the change that introduced it,
+;; and :killed-by is the test that actually failed — not a guess. That field is
+;; the point of the table: "3/3 killed" hides the mutant nobody wrote, and a
+;; mutant killed by no named test is a hole rather than a score.
+;;
+;;   :file       the script the guard lives in
+;;   :ns         the test namespace substring to run — `bb test <ns>`
+;;   :old        the exact current text. MUST match once; a table entry whose
+;;               anchor is gone is a signal that the guard moved, and the
+;;               runner fails on it rather than skipping it.
+;;   :new        what to replace it with — the guard, removed or inverted
+;;   :killed-by  the deftest name that must appear among the failures
+;;   :why        what the mutant restores, in one line
+;;
+;; Deliberately not generated. A generator finds mutants nobody thought of and
+;; produces noise nobody triages; this list is short, every line of it earned
+;; its place, and an anchor that stops matching is information.
+
+[;; ---------------------------------------------- the contract hook's parser
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "printf '%s' \"$scan\" | tr"
+  :new "printf '%s' \"$bare\" | tr"
+  :killed-by "a-command-is-parsed-as-commands-not-as-words"
+  :why "splits the command inside quoted spans, so prose in a note.bb claim reads as a command"}
+
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "          for|case|in|done|fi|esac|\"}\"|\"]]\"|\"]\") continue ;;"
+  :new "          zzznever) continue ;;"
+  :killed-by "a-command-is-parsed-as-commands-not-as-words"
+  :why "judges `for` as a command name, so a for-loop read is refused"}
+
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "        if [ \"$head_word\" = \"git\" ]; then"
+  :new "        if [ \"$head_word\" = \"zzznever\" ]; then"
+  :killed-by "a-command-is-parsed-as-commands-not-as-words"
+  :why "refuses every git subcommand, including `git log` and `git status`"}
+
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "count-objects|branch|remote|grep) continue ;;"
+  :new "count-objects|branch|remote|grep|checkout|restore) continue ;;"
+  :killed-by "a-command-is-parsed-as-commands-not-as-words"
+  :why "treats `git checkout -- goal.md` as a read, which restores the truth from the index"}
+
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "            do|then|else|elif|if|while|until|\"{\"|\"!\") continue ;;"
+  :new "            zzznever) continue ;;"
+  :killed-by "a-command-is-parsed-as-commands-not-as-words"
+  :why "judges `do` and `if` as command names instead of advancing to the real one"}
+
+ ;; ---------------------------------------------- the truth and scope locks
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "  if scope_path \"$1\" \"$2\"; then hit_kind=\"scope\"; return 0; fi"
+  :new "  if false; then hit_kind=\"scope\"; return 0; fi"
+  :killed-by "repos-is-the-scope-and-the-scope-is-fixed-when-the-swarm-opens"
+  :why "stops recognising `repos`, so the chmod that unlocks the scope is allowed"}
+
+ {:file "scripts/hooks/run-contract.sh"
+  :ns "contract"
+  :old "for f in \"${TRUTH[@]}\" \"${SCOPE[@]}\"; do [ -e"
+  :new "for f in \"${TRUTH[@]}\"; do [ -e"
+  :killed-by "repos-is-the-scope-and-the-scope-is-fixed-when-the-swarm-opens"
+  :why "SessionStart stops re-locking `repos` per role"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "swarm-test"
+  :old "(doseq [f [(:goal-file ctx) (:metrics-file ctx) (:repos-file ctx)]]"
+  :new "(doseq [f [(:goal-file ctx) (:metrics-file ctx)]]"
+  :killed-by "open-runs-a-two-role-pipeline-to-done-and-close-tears-it-down"
+  :why "open stops locking `repos`, which ship reads hours later to pick branches to push"}
+
+ ;; ---------------------------------------------- the task's repo scope
+ {:file "scripts/portal.bb"
+  :ns "portal-test"
+  :old "      :else {:repos picked})))"
+  :new "      :else {:repos (vec (:repos project))})))"
+  :killed-by "a-task-picks-a-subset-of-its-projects-checkouts"
+  :why "ignores the pick and runs every checkout the project holds"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal-test"
+  :old "      (seq outside)\n      {:error (str \"not in project \""
+  :new "      (and false (seq outside))\n      {:error (str \"not in project \""
+  :killed-by "a-task-picks-a-subset-of-its-projects-checkouts"
+  :why "silently accepts a checkout the project does not hold"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal-test"
+  :old ":checked (or (not any?) (contains? params (str \"repo:\" r)))"
+  :new ":checked (contains? params (str \"repo:\" r))"
+  :killed-by "a-task-picks-a-subset-of-its-projects-checkouts"
+  :why "renders every box clear on a first visit, so the default silently becomes no repos"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal-test"
+  :old "(spit (str (:repos-file ctx)) (task-lib/repos-text picked))"
+  :new "(spit (str (:repos-file ctx)) (project-lib/repos-text project))"
+  :killed-by "a-task-picks-a-subset-of-its-projects-checkouts"
+  :why "the bug itself: computes the subset and writes the project's whole set anyway"}
+
+ ;; ---------------------------------------------- the opening mail
+ {:file "scripts/swarm_lib.bb"
+  :ns "portal-test"
+  :old "        (doseq [row sessions :when (= lane (:role row))]\n          (queue-new-task-note! ctx (:session row)))))"
+  :new "        (queue-new-task-note! ctx (:session (first sessions)))))"
+  :killed-by "a-project-supplies-the-repos-and-the-roles-so-a-task-only-brings-a-goal"
+  :why "seeds one session, leaving the first role's siblings with a join that cannot clear"}
+
+ ;; ---------------------------------------------- the schema gate itself
+ {:file "scripts/board_lib.bb"
+  :ns "schema"
+  :old "(zipmap tasks-tsv-columns (str/split line #\"\\t\" -1))"
+  :new "(zipmap [:name :lane :created-at :updated-at :handed] (str/split line #\"\\t\" -1))"
+  :killed-by "a-file-format-is-defined-once"
+  :why "the board reader spells its columns inline again, free to drift from the writer"}
+
+ {:file "scripts/board_lib.bb"
+  :ns "schema"
+  :old "(str/join \"\\t\" (map #(str (or (get r %) \"\")) tasks-tsv-columns))"
+  :new "(str/join \"\\t\" [(:name r) (:lane r) (:created-at r) (:updated-at r) (or (:handed r) \"\")])"
+  :killed-by "a-file-format-is-defined-once"
+  :why "the board writer spells its columns inline again"}
+
+ {:file "test/swarmkhazad/schema_test.clj"
+  :ns "schema"
+  :old "(sort (map str (fs/glob scripts \"**.bb\")))"
+  :new "(sort (map str (fs/glob scripts \"**/*.bb\")))"
+  :killed-by "the-check-can-see-an-offender"
+  :why "the schema gate scans zero files and passes on any repo at all"}]

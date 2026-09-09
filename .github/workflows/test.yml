@@ -96,3 +96,91 @@ jobs:
           echo "bb test prints each failure with its file and line; the log above"
           echo "is the whole record. Locally, one namespace at a time:"
           echo "  bb test <substring>      # e.g. bb test base"
+
+  mutation:
+    # A separate job, not a step in `test`. The suite says the tests pass; this
+    # says they would FAIL if the code were wrong, which is a different claim
+    # and worth its own red X. It runs beside the suite rather than after it,
+    # because a mutant that survives is interesting even when everything is
+    # green — that combination is exactly the vacuous test this exists to find.
+    #
+    # Scoped to the diff. Every mutant needs a full run of its namespace, and
+    # portal-test alone is ~2 minutes, so running all sixteen on every PR would
+    # cost ~15. `bb mutate --changed` runs only the mutants whose script or
+    # whose watching TEST the branch touched — a PR that edits one file usually
+    # checks two or three mutants and finishes in under a minute.
+    #
+    # On a push to main it has no PR base to diff, so it runs the whole table:
+    # that is the backstop for a mutant whose guard was never touched by any
+    # single PR but drifted anyway.
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The runner diffs against the base ref, so it needs both sides.
+          fetch-depth: 0
+
+      - name: tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || brew install tmux
+          tmux -V
+
+      - name: babashka
+        env:
+          BB_VERSION: 1.13.220
+        run: |
+          d=$(mktemp -d)
+          curl -sSL -o "$d/install" https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x "$d/install"
+          sudo "$d/install" --version "$BB_VERSION"
+          bb --version
+
+      - name: Identify git to itself
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "swarmkhazad CI"
+          git config --global init.defaultBranch main
+
+      - name: Mutants
+        # The runner edits tracked files while it works and restores each from
+        # an in-memory copy in a `finally`. The tree check after is not
+        # ceremony: a mutant left on disk would make every later step lie.
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            # An explicit refspec, and then a check that the ref is really
+            # there. A bare `git fetch origin main` lands in FETCH_HEAD, and
+            # whether it also writes refs/remotes/origin/main depends on the
+            # narrow remote.origin.fetch that `actions/checkout` configures for
+            # a pull_request. It DID resolve on the first run of this job —
+            # `fetch-depth: 0` had already written the ref — so this is
+            # belt-and-braces rather than a fix for an observed failure. It
+            # stays because the runner now exits 1 when the ref does not
+            # resolve, and a checkout-behaviour change would otherwise turn
+            # that into a permanently red job with a confusing message.
+            git fetch --no-tags --force origin               "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+            git rev-parse --verify "origin/${{ github.base_ref }}" >/dev/null
+            bb mutate --changed "origin/${{ github.base_ref }}"
+          else
+            bb mutate
+          fi
+          git status --porcelain   # expected: empty
+
+      - name: What a surviving mutant means
+        if: failure()
+        run: |
+          echo "Each line above is one guard removed and the test that was supposed"
+          echo "to notice. Three ways to fail, and they mean different things:"
+          echo
+          echo "  survived        the guard can be deleted and the suite stays green."
+          echo "                  The test does not test it. Fix the test."
+          echo "  wrong-test      something failed, but not the named test. The named"
+          echo "                  test proves nothing about this guard; another one"
+          echo "                  happens to cover it. Say which, or fix the named one."
+          echo "  anchor-gone     the guard moved and test/mutants.edn still describes"
+          echo "                  where it used to be. Re-read the code, update :old."
+          echo
+          echo "Locally:  bb mutate --list        the table"
+          echo "          bb mutate <ns>          one namespace, e.g. bb mutate contract"
+          echo "          bb mutate --changed origin/main"

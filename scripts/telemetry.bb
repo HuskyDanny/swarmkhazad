@@ -39,6 +39,44 @@
                    {:labels (:metric row) :value (parse-double (str (second (:value row))))}))))))
     (catch Exception _ nil)))
 
+(defn has-series?
+  "Whether the metrics store still holds anything tagged with this task.
+
+   The question `delete` asks when there is no task folder: series outlive the
+   folder, so a task closed and reclaimed months ago still draws a line on the
+   spend chart. Distinguishing that from a typo is the whole point — one is
+   worth forgetting, the other is a mistake worth reporting."
+  [task-id]
+  (try
+    (let [r (http/get (str (base-url) "/api/v1/series")
+                      {:query-params {"match[]" (str "{task_id=\"" task-id "\"}")
+                                      "start" "-30d"}
+                       :throw false :timeout 5000})]
+      (boolean (and (= 200 (:status r))
+                    (seq (get (json/parse-string (:body r) true) :data)))))
+    (catch Exception _ false)))
+
+(defn forget-task!
+  "Drop every series tagged with this task from VictoriaMetrics.
+
+   `delete` has to reach in here, because the dashboard groups by task_id: a
+   task whose folder is gone but whose series are not keeps appearing on the
+   spend chart as a name with nothing behind it to open. Measured against the
+   live server: POST /api/v1/admin/tsdb/delete_series answers 204 and the id
+   stops coming back from /api/v1/label/task_id/values.
+
+   Returns :forgotten, :refused (the server answered, but not with success) or
+   :unreachable. Never throws: telemetry that cannot be reached must not stop a
+   delete, but the caller has to be able to SAY which of the three happened
+   rather than imply the series are gone."
+  [task-id]
+  (try
+    (let [r (http/post (str (base-url) "/api/v1/admin/tsdb/delete_series")
+                       {:form-params {"match[]" (str "{task_id=\"" task-id "\"}")}
+                        :throw false :timeout 5000})]
+      (if (<= 200 (:status r) 299) :forgotten :refused))
+    (catch Exception _ :unreachable)))
+
 (def lookback
   "How far back a task's counters are looked up. Long enough that a task read
    back the next day still reports; SWARMKHAZAD_TELEMETRY_LOOKBACK overrides."
