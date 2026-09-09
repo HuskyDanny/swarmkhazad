@@ -1230,7 +1230,25 @@
            (let [drafts (sort (map fs/file-name (fs/glob (:task-dir ctx) "draft-*.md")))]
              (if (seq drafts)
                (for [d drafts] [:a.row {:href (str "/tasks/" id "/doc?path=" d)} [:span.grow.name d] [:span.chev "›"]])
-               [:p.empty "none yet"]))])))
+               [:p.empty "none yet"]))]
+          ;; Last on the page, and behind a tick box. `close` is the reversible
+          ;; one — the folder survives it, and Resume brings the panes back.
+          ;; This is the other one: the worktrees, the branches, the goal, the
+          ;; decisions and the task's telemetry all go, and none of it is on
+          ;; origin unless the work shipped. The CLI refuses while any repo
+          ;; holds unpushed commits, so the box guards against the misclick and
+          ;; the refusal guards against the loss.
+          [:section.danger [:h2 "Delete"]
+           [:form {:method "post" :action (str "/tasks/" id "/delete")}
+            [:label [:input {:type "checkbox" :name "sure" :value "on"}]
+             " yes, remove this task"]
+            " "
+            [:button {:type "submit"} "Delete task and everything it left behind"]
+            [:p.muted "the tmux server, the worktrees, the sk/ branches, this "
+             "folder — goal, decisions, mail, drafts — and the task's series in "
+             "VictoriaMetrics, so the dashboard stops charting a name with "
+             "nothing behind it. Refused while a repo holds commits origin has "
+             "never seen."]]])))
 
 (defn role-page [ctx role]
   (let [id (:task-id ctx)]
@@ -1363,6 +1381,32 @@
              (process/process ["bb" cli "open" id] {:out log :err log}))
            {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
          (not-found)))
+     ;; Synchronous, unlike resume's spawn-and-redirect: the whole point is the
+     ;; answer. `git clean -xdf` across a worktree takes a moment, and a delete
+     ;; that redirected first would show the task still on the board with no way
+     ;; to tell whether it refused.
+     (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/delete" uri))]
+       (let [params (parse-form (if (string? body) body (some-> body slurp)))
+             force? (= "on" (get params "force"))]
+         (cond
+           (not (ctx-for id)) (not-found)
+           (and (not force?) (not= "on" (get params "sure")))
+           (html 400 (page {:title (str id " · delete")}
+                           [:section [:h2 "Not deleted"]
+                            [:p "Tick the box to confirm."]
+                            [:p [:a {:href (str "/tasks/" id)} "back to the task"]]]))
+           :else
+           (let [r (apply process/sh {:continue true}
+                          (concat ["bb" cli "delete" id] (when force? ["--force"])))]
+             (if (zero? (:exit r))
+               {:status 303 :headers {"Location" "/"} :body ""}
+               (html 400 (page {:title (str id " · delete")}
+                               [:section [:h2 "Refused"]
+                                [:pre (str (:err r) (:out r))]
+                                [:form.danger {:method "post" :action (str "/tasks/" id "/delete")}
+                                 [:input {:type "hidden" :name "force" :value "on"}]
+                                 [:button.linky {:type "submit"} "Delete anyway, losing those commits"]]
+                                [:p [:a {:href (str "/tasks/" id)} "back to the task"]]])))))))
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]
          (if (and ctx (some #{role} (map :session (sessions ctx))))

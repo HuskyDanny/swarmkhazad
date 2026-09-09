@@ -1062,6 +1062,59 @@
         (settle-open! id)
         (fs/delete-tree sandbox)))))
 
+(deftest deleting-a-task-from-the-page-needs-the-tick-and-respects-the-refusal
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-del."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        ;; Never the operator's real metrics server from a test.
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_OTLP_ENDPOINT" "http://127.0.0.1:1/opentelemetry"}
+        id "t-del-portal"
+        dir (fs/path home "tasks" id)]
+    (try
+      (make-source-repo! src)
+      (run {:env env} cli "new" id "--repo" src)
+      (spit (str (fs/path dir "roles")) "implement claude task\n")
+      (spit (str (fs/path dir "repos")) (str src "\n"))
+      (run {:env env} cli "prepare" id)
+
+      (testing "the page offers it, and says what goes"
+        (let [body (:body (request env :get (str "/tasks/" id)))]
+          (is (str/includes? body (str "/tasks/" id "/delete")))
+          (is (str/includes? body "name=\"sure\"") "behind a tick box, not one click")
+          (is (str/includes? body "VictoriaMetrics")
+              "and names the telemetry, which is the part nothing else removes")))
+
+      (testing "an unticked post deletes nothing"
+        ;; The box is the guard against the misclick; the CLI's refusal is the
+        ;; guard against the loss. Both, because they catch different mistakes.
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body ""})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "Tick the box")))
+        (is (fs/directory? dir)))
+
+      (testing "ticked, but the branch is not on origin: the refusal reaches the page"
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body "sure=on"})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "origin has never seen"))
+          (is (str/includes? (:body r) "Delete anyway") "with the override on the page, not in a manual"))
+        (is (fs/directory? dir) "and it is still there"))
+
+      (testing "forced, it goes, and the board no longer lists it"
+        (let [r (request env :post (str "/tasks/" id "/delete") {:body "force=on"})]
+          (is (= 303 (:status r)))
+          (is (= "/" (get (:headers r) "Location"))))
+        (is (not (fs/exists? dir)))
+        (is (not (str/includes? (:body (request env :get "/")) (str "/tasks/" id "\"")))))
+
+      (testing "deleting what is not there is a 404, not a 500"
+        (is (= 404 (:status (request env :post "/tasks/t-nope/delete" {:body "sure=on"})))))
+      (finally
+        (process/sh {:continue true} "tmux" "-S"
+                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                    "kill-server")
+        (fs/delete-tree sandbox)))))
+
 (defn eval-in-portal
   "Evaluate one form against portal.bb in a child bb and read back its value."
   [env form]

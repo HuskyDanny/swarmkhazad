@@ -81,6 +81,7 @@ Then run it:
 ./swarmkhazad telemetry my-task   # cost, tokens and sessions per role
 ./swarmkhazad close my-task       # archive the panes, stop the daemon
 ./swarmkhazad close my-task --reclaim   # ...and give the disk back
+./swarmkhazad delete my-task      # ...and the folder, the branches and its telemetry
 ```
 
 Attach to any role directly: `tmux -S /tmp/swarmkhazad-$USER/my-task.sock attach -t sk-implement`.
@@ -147,6 +148,8 @@ Nothing else may resolve a base by guessing. Where the pin is absent (a task ope
 
 `close --reclaim` clears both: it cleans each worktree (`git clean -xdf`), removes it, and deletes `sk/<task-id>` from the source. That is where the space is — a worktree that has built anything is mostly untracked output, 6.4G across three of them in the task this design came from, none of it in git. A repo whose branch is not on `origin` is kept and said so, because that is also what an unpushed day of work looks like; `--force` takes it anyway. Plain `close` removes nothing: it has always meant *stop the swarm*, and the task folder — notes, evidence, PR records — outlives its checkouts either way.
 
+`swarmkhazad delete <task-id>` is the end of the line, and the only command that leaves nothing behind. It does what `close --reclaim` does, then drops the task's series from VictoriaMetrics and removes the task folder. The telemetry is part of it rather than a step to remember, because the dashboard groups by `task_id`: a task whose folder is gone but whose series are not keeps drawing a line with nothing behind it to open — six of the twelve ids on the first machine this ran against had no folder left at all, and `delete` on one of those forgets the series and says so. It refuses, before touching anything, while any repo holds commits `origin` has never seen: `close` can keep the branch because the task folder still names it, and removing the folder is exactly what makes those commits unfindable. `--force` is reclaim's override and means the same thing. The portal has the same button on a task page, behind a tick box, and shows the refusal with the override beside it.
+
 `swarmkhazad reap` is for the tasks whose close never ran — it prunes stale registrations and deletes every `sk/<task-id>` branch whose task folder is gone, across the checkouts under `SWARMKHAZAD_REPO_ROOTS` (default `~/repos`). A branch holding commits is listed with what deleting it would lose and left alone until `--force`, because an orphaned branch is also what an unmerged, unpushed day of work looks like. Live tasks, and any branch a worktree still holds — this checkout's or another's, which git reports directly rather than being inferred from the source's own HEAD — are never candidates.
 
 ## Commands
@@ -162,6 +165,9 @@ swarmkhazad close <task-id> [--reclaim] [--force]
                                                archive panes, stop the daemon, kill the tmux server;
                                                --reclaim also cleans and removes the worktrees and
                                                deletes the task branch (kept if not on origin)
+swarmkhazad delete <task-id> [--force]         everything close --reclaim does, then the task's series in
+                                               VictoriaMetrics and the task folder itself. Refuses while a
+                                               repo holds commits origin has never seen
 swarmkhazad summary <task-id>                  ask whether the work is ready to merge, for its goals
 swarmkhazad ship <task-id> [--yes]             push each repo's branch and open a draft PR, in the summary's merge order
 swarmkhazad reap [--force]                     prune stale worktrees, delete orphaned sk/* branches from your checkouts
