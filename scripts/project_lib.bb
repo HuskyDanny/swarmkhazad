@@ -199,11 +199,17 @@
    cc_auto for everyone but specifier. Not for its permission mode — the swarm
    already states `bypassPermissions` for a bare `claude` role, so that part is
    a wash. What the lane adds is everything a role would otherwise have to be
-   taught twice: `--effort xhigh`, an MCP set narrowed to the three servers a
+   taught twice: `--effort xhigh`, an MCP set narrowed to the four servers a
    role actually uses (codegraph for a blast-radius read, chrome-devtools for a
    browser check) instead of the operator's whole `~/.claude.json`, the SSO wrap
    its Bash calls need, and its own brief — which `write-prompt!` now carries
    ahead of this task's rather than replacing it.
+
+   The codegraph half of that was aspirational until `index-worktree!` existed:
+   the server was loaded and reachable, but a task worktree sits outside its
+   repo, so the index walk-up found nothing and the tool told the role to stop
+   calling it. `prepare-worktrees!` now builds an index in each worktree and
+   `constitution.prompt` names the tool, which is what makes this line true.
 
    The lane also starts the local model router (`lane_router_env`), which is the
    only way a `<vendor>/<model>` slug resolves at all. That matters for any role
