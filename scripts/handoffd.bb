@@ -33,8 +33,26 @@
 (defn now [] (handoff-lib/timestamp))
 
 (defn log! [ctx & parts]
-  (fs/create-dirs (:daemon-dir ctx))
-  (spit (str (fs/path (:daemon-dir ctx) "handoffd.log")) (str (now) " " (str/join " " parts) "\n") :append true))
+  ;; Only into a task folder that still exists. `fs/create-dirs` on
+  ;; <task>/state/daemon creates every parent, so an unconditional one here
+  ;; REBUILT the deleted task folder that `orphaned?` reads.
+  ;;
+  ;; It takes one write, not a stream of them. RAN, off a leaked daemon's own
+  ;; log: three lines in the same millisecond — `error`, `failed`,
+  ;; `failed-to-archive`, all for the handoff that vanished mid-delivery — and
+  ;; then nineteen minutes of silence until the process was killed. The folder
+  ;; came back inside that millisecond, the next tick saw a directory, and the
+  ;; outbox was empty from then on so nothing logged again.
+  ;;
+  ;; Reproducing it needs the delete to land DURING a delivery: two probes that
+  ;; deleted the folder while the daemon was idle had both versions exiting in
+  ;; 1s, because an idle daemon never writes. With 400 undeliverable handoffs in
+  ;; the outbox the pre-fix daemon was still polling 20s later with 652 log
+  ;; lines, and `rm -rf` itself failed four times with `Directory not empty` —
+  ;; it was recreating directories as fast as they were removed (RAN).
+  (when (fs/directory? (:task-dir ctx))
+    (fs/create-dirs (:daemon-dir ctx))
+    (spit (str (fs/path (:daemon-dir ctx) "handoffd.log")) (str (now) " " (str/join " " parts) "\n") :append true)))
 
 (defn stop-file [ctx] (fs/path (:daemon-dir ctx) "stop"))
 (defn pid-file [ctx] (fs/path (:daemon-dir ctx) "handoffd.pid"))
@@ -50,11 +68,25 @@
    swarmkhazad generation that had since been replaced.
 
    Checked on the tick rather than cleaned up afterwards, because a process
-   that ends itself cannot become a class of litter. The task DIR, not the
-   state dir: `close` empties state but keeps the folder for its notes, and a
-   daemon that quit on that would stop serving a task still being worked."
+   that ends itself cannot become a class of litter.
+
+   `goal.md`, not the task directory. A directory is not evidence of a task:
+   the daemon itself creates directories under the task folder, so testing one
+   asked whether the daemon had recently written rather than whether the task
+   existed — and one write, at the instant of deletion, was enough to make the
+   answer yes for good. Nineteen daemons for deleted tasks were found still
+   polling, the oldest over two hours old, and this check ran every second of
+   that and said the task was fine (RAN). `log!` no longer rebuilds the folder
+   either, but that fix alone would leave the check resting on whatever the
+   next writer happens to create.
+
+   Not the state dir, which was the earlier reading of this: `close` empties
+   state but keeps the folder for its notes, and a daemon that quit on that
+   would stop serving a task still being worked. goal.md is read-only truth
+   that `new` writes before anything else and `close` never touches, so it is
+   present for exactly as long as the task is."
   [ctx]
-  (not (fs/directory? (:task-dir ctx))))
+  (not (fs/regular-file? (:goal-file ctx))))
 
 (defn should-stop? [ctx]
   (or @stopping (fs/exists? (stop-file ctx)) (orphaned? ctx)))
