@@ -2,4 +2,7 @@
  :tasks
  {test {:doc "Run the swarmkhazad test suite (bb test [ns-substring])"
         :requires ([run-tests])
-        :task (run-tests/-main *command-line-args*)}}}
+        :task (run-tests/-main *command-line-args*)}
+  mutate {:doc "Break one guard at a time and require the named test to notice (bb mutate [ns...] | --list)"
+          :requires ([mutate])
+          :task (mutate/-main *command-line-args*)}}}
