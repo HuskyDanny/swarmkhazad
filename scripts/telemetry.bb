@@ -47,14 +47,15 @@
    spend chart. Distinguishing that from a typo is the whole point — one is
    worth forgetting, the other is a mistake worth reporting."
   [task-id]
-  (try
-    (let [r (http/get (str (base-url) "/api/v1/series")
-                      {:query-params {"match[]" (str "{task_id=\"" task-id "\"}")
-                                      "start" "-30d"}
-                       :throw false :timeout 5000})]
-      (boolean (and (= 200 (:status r))
-                    (seq (get (json/parse-string (:body r) true) :data)))))
-    (catch Exception _ false)))
+  ;; `last_over_time` and not a plain instant read: a task closed months ago is
+  ;; far past the 5-minute staleness window an instant query stops at, and that
+  ;; is the only case this function exists for. RAN against the live server:
+  ;; gobel -> 116, a deleted id -> empty, 21ms.
+  ;;
+  ;; Both failure directions land on false through `query`, which is what the
+  ;; caller wants: no server means `delete` reports "no such task" rather than
+  ;; claiming to have cleaned something up.
+  (boolean (seq (query (str "count(last_over_time({task_id=\"" task-id "\"}[30d]))")))))
 
 (defn forget-task!
   "Drop every series tagged with this task from VictoriaMetrics.

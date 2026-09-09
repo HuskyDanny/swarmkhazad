@@ -153,7 +153,7 @@
   (println "swarm closed:" task-id))
 
 (defn delete! [task-id args]
-  (let [{:keys [removed kept reclaimed metrics orphan]}
+  (let [{:keys [removed kept metrics orphan]}
         (swarm-lib/delete! task-id (boolean (some #{"--force"} args)))]
     (if-not removed
       (binding [*out* *err*]
@@ -165,7 +165,6 @@
       (do
         (when orphan
           (println "  no task folder — this id survived only in the metrics store"))
-        (doseq [line reclaimed] (println line))
         (println (case metrics
                    :forgotten "  telemetry: series dropped"
                    :refused "  telemetry: the server refused the delete — its series are still there"
