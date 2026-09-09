@@ -73,9 +73,23 @@
   [rows ref]
   (let [r (process/sh {:continue true} "git" "diff" "--name-only" (str ref "...HEAD"))
         changed (set (remove str/blank? (str/split-lines (or (:out r) ""))))]
+    ;; Hard, not a warning. This printed to stderr and carried on with an
+    ;; empty set, which selected no mutants, which reported "nothing to check"
+    ;; and exited 0 — the gate went green in eleven seconds having checked
+    ;; nothing. Seen in CI on the first run of this job: `actions/checkout`
+    ;; configures a narrow fetch refspec for a pull_request, so `git fetch
+    ;; origin main` lands in FETCH_HEAD without writing refs/remotes/origin/main,
+    ;; and the ref the runner was told to diff against did not exist.
+    ;;
+    ;; A gate that cannot work out its own scope has not passed. It has failed
+    ;; to run, and those are different answers.
     (when-not (zero? (:exit r))
-      (binding [*out* *err*]
-        (println (str "git diff against " ref " failed: " (:err r)))))
+      (println (str "cannot diff against " ref " — so which mutants this branch"
+                    " affects is unknown, and unknown is not empty:"))
+      (println (str "  " (str/trim (str (:err r)))))
+      (println "Fetch the ref first, e.g.")
+      (println (str "  git fetch --no-tags --force origin +refs/heads/<base>:refs/remotes/origin/<base>"))
+      (System/exit 1))
     ;; A :killed-by that names no deftest is a table error, and a silent one:
     ;; it would just narrow the selection. Say it and stop.
     (when-let [orphans (seq (remove #(deftest-file (:killed-by %)) rows))]
