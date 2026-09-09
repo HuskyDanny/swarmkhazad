@@ -552,6 +552,11 @@
                 (str "implement\tclaude\t" (:src h) "\t" wt "\ttask\tkimi\tnone\t--flag\n"
                      "review\tclaude\t" (:src h) "\t" wt "\tbatch\tanthropic\tnone\t\n"))
           (fs/delete (fs/path dir "repos"))
+          ;; Deleted so the assertion below pins the LEGACY branch's own call.
+          ;; The fixture's first `prepare` took the fresh path and already wrote
+          ;; the plugin, so without this the file is on disk either way and the
+          ;; test passes with the legacy call removed — RAN, the mutant survived.
+          (fs/delete-tree (fs/path dir "plugin"))
           (let [r (run {:env env :ok? false} cli "prepare" "t-old")]
             (is (zero? (:exit r)) (str "an old task must reopen, not fail: " (:err r))))
           (testing "the old rows become the session table, unchanged in what they say"

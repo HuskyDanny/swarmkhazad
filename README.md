@@ -108,7 +108,7 @@ Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is
   mail/<session>/              outbox/ sent/ failed/ inbox/{new,in_process,completed}
   bin/                         per-role harness shims (claude, codex, grok)
   prompts/ hooks/              generated per launch
-  .claude-plugin/ agents/ skills/   the task folder IS a Claude Code plugin; every role's argv names it with --plugin-dir
+  plugin/                      a Claude Code plugin — .claude-plugin/ agents/ skills/; every role's argv names it with --plugin-dir
   state/                       sessions.tsv (the (role, repo) table), tmux socket, board/, daemon/, sessions/, judge/
   tmp/                         scratch; handoff drafts live here, never in the repo
 ```
@@ -330,7 +330,9 @@ The model goes on the argv because `model=` names a VENDOR — a base URL and a 
 
 Denying the parent its telemetry is deliberate and is stronger than khazad, which grants the parent everything. The investigator then cannot gather confirming evidence for its own favourite story — it has to dispatch the `swarmkhazad:investigation-hypothesis-tester` subagent, which holds `logfire`/`datadog`/`argocd` and was instructed to refute. Partial, and knowingly so: `gh` is a CLI, so `Bash` routes around any MCP denial. The tester has no write tools at all, so the parent calling `note.bb` per returned verdict is the only route by which a clue reaches `finding.md`.
 
-**The skill and the subagent are generated per task as a plugin, and NAMED rather than copied.** `plugin/` in this repo is a Claude Code plugin — a `.claude-plugin/plugin.json` manifest beside `agents/` and `skills/` — and `prepare` copies it into the task folder, which becomes its plugin root: `<task>/.claude-plugin/plugin.json`, `<task>/agents/`, `<task>/skills/`. Every claude role's argv then carries `--plugin-dir <task-dir>`, and the two load under the plugin's name: `swarmkhazad:investigate` and `swarmkhazad:investigation-hypothesis-tester`.
+**The skill and the subagent are generated per task as a plugin, and NAMED rather than copied.** `plugin/` in this repo is a Claude Code plugin — a `.claude-plugin/plugin.json` manifest beside `agents/` and `skills/` — and `prepare` copies it to `<task>/plugin/`. Every claude role's argv then carries `--plugin-dir <task>/plugin`, and the two load under the plugin's name: `swarmkhazad:investigate` and `swarmkhazad:investigation-hypothesis-tester`.
+
+It gets its own directory rather than sharing the task folder's, because a plugin root is executable surface read at names the task folder already uses: `hooks/hooks.json` runs shell commands on every tool event (and a manifest's own hooks field is read *in addition to* that path, so declaring one cannot suppress it), `.mcp.json` registers servers under a name a role's `--disallowedTools` patterns do not match, and `commands/` is a third. `<task>/hooks/` is already where each session's `--settings` file is written. For the same reason `install-plugin!` DELETES the directory before copying, so it holds exactly what the repo ships rather than whatever has accumulated in it — roles can write anywhere under the task folder.
 
 Naming rather than copying is the whole point. A worktree lives inside the target repo, so the copy that used to go there wrote into lothlorien, minas-tirith and istari — and then needed `info/exclude` entries in those repos so a role running `git add -A` could not commit the scaffolding. Now swarmkhazad writes nothing into them: the only path it still excludes in a checkout it does not own is the codegraph index. Per task, not centralised — `--plugin-dir` is per-session and repeatable, so one task can carry a different skill from the one beside it.
 
