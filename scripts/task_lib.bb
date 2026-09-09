@@ -32,8 +32,18 @@
 
    `cc_auto` resolves to `<claude-config-dir>/scripts/cc-auto.sh`. By convention
    rather than a table: the path is derivable, and a table of one operator's
-   absolute paths in a shared repo is stale on any other machine."
-  #{"cc_full" "cc_auto" "cc_control" "cc_alt"})
+   absolute paths in a shared repo is stale on any other machine.
+
+   `cc_alt` is deliberately NOT here. It is the one launcher that takes its
+   vendor as an ARGUMENT — `--model <vendor>` in argv position 1 — and starts
+   no router, so the model id a role declares arrives where a vendor name is
+   expected (RAN: `cc-alt.sh --model 'claude-opus-5[1m]'` prints
+   `cc-alt: unknown vendor 'claude-opus-5[1m]'` and exits 2, which is what
+   every portal-created cc_alt role sent it). A role that wants a third-party
+   model names the MODEL on a router-backed lane, or names a `vendors.tsv`
+   vendor on the bare `claude` harness. Both keep the driving model an
+   explicit choice instead of a launcher default."
+  #{"cc_full" "cc_auto" "cc_control"})
 
 (def known-agents (into cli-agents lane-agents))
 
@@ -80,9 +90,19 @@
 
 (def receive-modes #{"task" "batch"})
 
-;; scripts/vendors.tsv — the cc_alt vendor table, the single source both the
-;; bash shim (a copy under <task>/state/) and the smoke's model check read:
+;; scripts/vendors.tsv — the vendor table, the single source both the bash shim
+;; (a copy under <task>/state/) and the smoke's model check read:
 ;;   vendor  base_url  keychain_service  model_main  model_small  ctx_tokens
+;;
+;; The OpenRouter rows carry `@preset/cc-tools`, and it is not decoration: the
+;; preset pins `provider.ignore: [Z.AI, Novita]`, and without it those two
+;; providers answer a request carrying more than ~90 tools with a syntactically
+;; valid EMPTY 200 — a turn that renders as complete with no text (measured
+;; 2026-09-02; a bare session already sends ~77 tools). Claude Code cannot send
+;; OpenRouter's `provider` field itself, so the slug is the only in-band place
+;; to say it. A role's own `<vendor>:<model-id>` override replaces the row's
+;; slug and drops the preset with it; that is the caller's choice, not a
+;; default.
 (def vendors-file (fs/path (fs/parent (fs/absolutize *file*)) "vendors.tsv"))
 (def vendor-columns [:vendor :base-url :keychain-service :model-main :model-small :ctx-tokens])
 
@@ -107,6 +127,19 @@
     (if i
       [(subs s 0 i) (not-empty (subs s (inc i)))]
       [(or s "") nil])))
+
+(defn base-model
+  "A model id with any `@preset/<slug>` routing directive removed.
+
+   The preset is an OpenRouter ROUTING instruction, not part of the model's
+   identity, and the wire proves it: a request for
+   `z-ai/glm-5.3-flash@preset/cc-tools` comes back labelled
+   `z-ai/glm-5.3-flash` (RAN 2026-09-09, all five vendor slugs). So the
+   `modelUsage` key the smoke reads never carries the preset, and comparing it
+   against the row verbatim would report every vendor role as answering with
+   the wrong model."
+  [s]
+  (str/replace (or s "") #"@preset/\S*" ""))
 
 (def sessions-tsv-columns
   "state/sessions.tsv: the (role, repo) pairs this task runs, and where each

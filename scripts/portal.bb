@@ -793,7 +793,16 @@
                    :placeholder "ccpool_… — leave blank if this project has no @cloud bars"
                    :value (get params "cloud-env" "")}]
           [:datalist {:id "cloud-envs"}
-           (for [e (project-lib/known-cloud-envs)] [:option {:value e}])]]]
+           (for [e (project-lib/known-cloud-envs)] [:option {:value e}])]]
+         ;; A lane resolves a model by NAME, so the exact slug is the whole
+         ;; choice — and it lives in vendors.tsv, not in anyone's head. A
+         ;; datalist rather than a select: the id after the colon is the
+         ;; vendor's own namespace, so these are the rows this install knows,
+         ;; never the set of models that exist.
+         [:datalist {:id "model-ids"}
+          (for [m (sort (distinct (mapcat (juxt :model-main :model-small)
+                                          (vals (task-lib/read-vendors)))))]
+            [:option {:value m}])]]
         [:p.muted "roles — the swimlane's columns, in this order"]
         [:div.cards.rolepick
          (for [stage (project-lib/stage-prompts)
@@ -832,8 +841,20 @@
                   [:input (cond-> {:type "text" :name (str "modelid:" stage)
                                    :value (or model-id "")
                                    :autocomplete "off"
+                                   :list "model-ids"
                                    :placeholder "exact model (optional)"
                                    :title "overrides the harness's default, e.g. claude-opus-5[1m]"}
+                            ;; On a lane this is not an override, it is the
+                            ;; whole choice: the router reads the NAME, so a
+                            ;; full slug picks the vendor and a bare vendor
+                            ;; name does nothing at all.
+                            (task-lib/lane-agents h)
+                            (assoc :placeholder "full slug — the lane's router reads this name"
+                                   :title (str h " routes on the model NAME: a full slug like"
+                                               " moonshotai/kimi-k3:exacto@preset/cc-tools."
+                                               " A bare vendor name does nothing here — leave it"
+                                               " blank to keep the lane's own model, or use the"
+                                               " claude harness to pick a vendor by name."))
                             ;; live for a lane: the model name is the only thing
                             ;; its router reads, so this is the whole choice
                             (and off? (not (task-lib/lane-agents h))) (assoc :disabled true))]))))
@@ -845,7 +866,17 @@
          [:span.muted (count available)
           " checkouts found · a cc_ harness is that launcher, inherited whole —"
           " its SSO wrap, effort, MCP set and model router — with this task's prompt,"
-          " settings and permission mode layered over it"]]]
+          " settings and permission mode layered over it"]]
+        ;; Whether the vendor select is live is the SERVER's answer to "is this
+        ;; harness the bare claude?". Rather than restate that rule in a second
+        ;; language and let the two drift, changing a harness re-asks the
+        ;; server: the picker's own fields become the query string and the page
+        ;; renders again from them. Empty fields are dropped so a blank name or
+        ;; model box cannot look like a deliberate "".
+        [:script (h/raw (str "document.addEventListener('change',function(e){"
+                             "if(!e.target.name||e.target.name.indexOf('harness:')!==0)return;"
+                             "var d=[...new FormData(e.target.closest('form'))].filter(function(p){return p[1]!==''});"
+                             "location.search=new URLSearchParams(d);});"))]]
        ;; Its own form, so Enter in the name field can never reach it.
        (when project
          [:form.danger {:method "post" :action (str "/projects/" (:name project) "/delete")}
@@ -1282,7 +1313,14 @@
 (defn handle-request [{:keys [request-method uri query-string body]}]
   (let [method (or request-method :get)]
     (or
-     (when (and (= :get method) (= "/" uri)) (html 200 (index-page nil nil)))
+     (when (and (= :get method) (= "/" uri))
+       ;; The picker renders FROM the params: which harness a role card is
+       ;; showing decides whether its vendor select is live. Discarding the
+       ;; query string here left that control with no reachable enabled state —
+       ;; the default harness is a lane, so the page loaded it disabled and
+       ;; nothing short of a failed POST could re-render it. A bare GET parses
+       ;; to `{}`, which is still the first-run case, so the defaults survive.
+       (html 200 (index-page nil (parse-form query-string))))
      (when (and (= :post method) (= "/projects" uri))
        (let [params (parse-form (if (string? body) body (some-> body slurp)))
              result (create-project! params)]

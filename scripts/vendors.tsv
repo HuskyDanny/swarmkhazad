@@ -1,4 +1,4 @@
-glm	https://openrouter.ai/api	openrouter-token	z-ai/glm-5.3-flash	z-ai/glm-5.3-flash	1310720
-kimi	https://openrouter.ai/api	openrouter-token	moonshotai/kimi-k3:exacto	moonshotai/kimi-k2.5	1048576
-deepseek	https://openrouter.ai/api	openrouter-token	deepseek/deepseek-v4-flash-vision-exp	deepseek/deepseek-v4-flash	1048576
+glm	https://openrouter.ai/api	openrouter-token	z-ai/glm-5.3-flash@preset/cc-tools	z-ai/glm-5.3-flash@preset/cc-tools	1310720
+kimi	https://openrouter.ai/api	openrouter-token	moonshotai/kimi-k3:exacto@preset/cc-tools	moonshotai/kimi-k2.5@preset/cc-tools	1048576
+deepseek	https://openrouter.ai/api	openrouter-token	deepseek/deepseek-v4-flash-vision-exp@preset/cc-tools	deepseek/deepseek-v4-flash@preset/cc-tools	1048576
 qwen	https://llm-pv0w09ljfndd953v.ap-southeast-1.maas.aliyuncs.com/apps/anthropic	claude-qwen-token	qwen3.7-max[1m]	qwen3.7-plus

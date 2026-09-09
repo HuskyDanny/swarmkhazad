@@ -921,6 +921,37 @@
         (is (nil? (:cloud-env (read-string (slurp (str (fs/path home "projects" "p2.edn"))))))))
       (finally (fs/delete-tree sandbox)))))
 
+(deftest the-vendor-select-has-a-reachable-live-state
+  ;; The control the page offers has to have a state the page can reach. Which
+  ;; harness a role card is SHOWING decides whether its vendor select is live,
+  ;; the default harness is a lane, and `GET /` used to render with nil params —
+  ;; so the select loaded disabled and no amount of setting the dropdown could
+  ;; open it. Only a POST that failed validation ever re-rendered with the
+  ;; operator's own selections, which is not a route anyone would find.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-v."})
+        home (str (fs/path sandbox "home"))
+        env {"SWARMKHAZAD_HOME" home "HOME" home}
+        tag (fn [body] (re-find #"<select[^>]*vendor:brainstorm[^>]*>" body))]
+    (try
+      (fs/create-dirs home)
+      (testing "a bare GET is still the first run: the default lane, its vendor not its question"
+        (let [t (tag (:body (request env :get "/")))]
+          (is (some? t))
+          (is (str/includes? t "disabled") t)))
+      (testing "and a GET carrying the picker's own fields re-renders from them"
+        ;; This is what the change handler produces: the form serialised into
+        ;; the query string. `claude` is the one harness that reads a vendor,
+        ;; so this is the only way the select becomes usable.
+        (let [t (tag (:body (request env :get "/" {:query "role%3Abrainstorm=on&harness%3Abrainstorm=claude"})))]
+          (is (some? t))
+          (is (not (str/includes? t "disabled")) t)))
+      (testing "the handler that re-asks the server is on the page"
+        ;; Not duplicated logic: it only resubmits, the disabled rule stays server-side.
+        (let [body (:body (request env :get "/"))]
+          (is (str/includes? body "location.search=new URLSearchParams"))
+          (is (str/includes? body "indexOf('harness:')"))))
+      (finally (fs/delete-tree sandbox)))))
+
 (deftest the-role-picker-declares-the-harness-and-not-only-the-vendor
   ;; Two axes: the harness is which CLI runs the role, the vendor is which model
   ;; that CLI talks to. Every layer already carried both — the form reader
@@ -948,7 +979,19 @@
           (is (str/includes? body "value=\"cc_auto\"") "the operator's own lanes are harnesses")
           (is (str/includes? body "value=\"cc_control\""))
           (is (str/includes? body "value=\"cc_full\""))
-          (is (str/includes? body "value=\"cc_alt\""))))
+          ;; cc_alt is NOT offered: it reads its vendor from argv position 1
+          ;; and starts no router, so a role's model id reaches it as a vendor
+          ;; name and it exits 2. A third-party model is a model NAME on one of
+          ;; the lanes above, or a vendors.tsv vendor on bare `claude`.
+          (is (not (str/includes? body "value=\"cc_alt\"")) "the one launcher whose vendor is an argument")
+          ;; On a lane the model box is not an override but the whole choice,
+          ;; so the slugs it accepts are offered rather than remembered.
+          (is (str/includes? body "id=\"model-ids\"") "the vendor rows are offered as a datalist")
+          (is (str/includes? body "value=\"moonshotai/kimi-k3:exacto@preset/cc-tools\"")
+              "carrying the row's slug, preset and all — that suffix is what pins provider.ignore")
+          (is (str/includes? body "list=\"model-ids\"") "and every role's model box reads it")
+          (is (str/includes? body "full slug — the lane&apos;s router reads this name")
+              "a lane says so in the box itself, since a bare vendor name does nothing there")))
       (testing "each role card opens on the model that role is meant to run"
         ;; Not one default for everyone. A quiet quality drop in a building role
         ;; ships wrong code, so those get Opus; architect gets Fable for design
