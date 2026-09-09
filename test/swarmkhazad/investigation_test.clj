@@ -47,6 +47,14 @@
   (git dir "config" "user.name" "T")
   (write! (fs/path dir "README.md") "one\n")
   (write! (fs/path dir "bb.edn") "{:tasks {test {:task (println \"fixture tests ran\")}}}\n")
+  ;; `.claude/` is the target repo's, and these repos really do track it: RAN,
+  ;; lothlorien lists 80+ files under it and minas-tirith tracks
+  ;; `.claude/agents/*.md`. Committed here so every case below runs against a
+  ;; checkout that OWNS the directory the swarm used to copy into — the
+  ;; collision the old shape needed a per-file tracked-destination skip to
+  ;; survive, and that this shape has to make impossible rather than guard.
+  (write! (fs/path dir ".claude" "skills" "investigate" "SKILL.md") "THE REPO'S OWN SKILL\n")
+  (write! (fs/path dir ".claude" "settings.json") "{\"tracked\":\"by the repo\"}\n")
   (git dir "add" ".")
   (git dir "commit" "-q" "-m" "one")
   (git dir "remote" "add" "origin" "https://github.com/MithraAI/istari.git")
@@ -383,9 +391,18 @@
                                (str name ":investigation-hypothesis-tester"))
                 "including the SKILL body, which is what tells the parent what to dispatch")))
         (testing "and NOTHING is written into the target repo"
-          (doseq [p [".claude" "plugin" "agents" "skills" ".claude-plugin"]]
+          (doseq [p ["plugin" "agents" "skills" ".claude-plugin"]]
             (is (not (fs/exists? (fs/path wt p)))
                 (str "the worktree must not carry " p " — it is a working tree of a repo we do not own")))
+          ;; `.claude/` is the one the repo owns, so absence is the wrong
+          ;; assertion — it is there, and it must come back byte-identical. The
+          ;; old shape copied into it and needed a per-file skip to avoid
+          ;; overwriting a checked-in file; this shape never opens it.
+          (is (= "THE REPO'S OWN SKILL\n"
+                 (slurp (str (fs/path wt ".claude" "skills" "investigate" "SKILL.md"))))
+              "a name collision is no longer a collision — we write nothing there")
+          (is (= "{\"tracked\":\"by the repo\"}\n"
+                 (slurp (str (fs/path wt ".claude" "settings.json")))))
           (is (= "" (git wt "status" "--porcelain"))
               "so the checkout reads clean without anything having to hide our files from it")
           (let [excl (slurp (str (fs/path src ".git" "info" "exclude")))]
@@ -432,34 +449,6 @@
             "there is a first line for a second one to duplicate")
         (run {:env env} cli "prepare" "t-inv")
         (is (= before (slurp (str excl))))))))
-
-(deftest a-claude-directory-the-target-repo-owns-is-never-touched
-  ;; `.claude/` is not ours: RAN, lothlorien tracks 80+ files under it and
-  ;; minas-tirith tracks `.claude/agents/*.md`. The copy shape had to skip a
-  ;; tracked destination file by file to avoid overwriting one. Naming the
-  ;; plugin removes the hazard rather than guarding it — so the assertion is
-  ;; that the repo's own `.claude/` comes back byte-identical.
-  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-owned."})
-        home (str (fs/path sandbox "home"))
-        src (str (fs/path sandbox "src" "istari"))
-        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" "t-own"}
-        owned ".claude/skills/investigate/SKILL.md"]
-    (try
-      (make-source-repo! src)
-      (write! (fs/path src owned) "THE REPO'S OWN SKILL\n")
-      (write! (fs/path src ".claude" "settings.json") "{\"tracked\":\"by the repo\"}\n")
-      (git src "add" ".")
-      (git src "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "own claude dir")
-      (git src "update-ref" "refs/remotes/origin/main" (git src "rev-parse" "HEAD"))
-      (run {:env env} cli "new" "t-own" "--repo" src "--investigate")
-      (run {:env env} cli "prepare" "t-own")
-      (let [wt (fs/path home "tasks" "t-own" "worktrees" "istari")]
-        (is (= "THE REPO'S OWN SKILL\n" (slurp (str (fs/path wt owned))))
-            "a name collision is no longer a collision — we write nothing there")
-        (is (= "{\"tracked\":\"by the repo\"}\n" (slurp (str (fs/path wt ".claude" "settings.json")))))
-        (is (= "" (git wt "status" "--porcelain"))
-            "and the checkout reads clean, with no modification to surface in somebody's PR"))
-      (finally (fs/delete-tree sandbox)))))
 
 ;; ------------------------------------------------------------ the lineup
 

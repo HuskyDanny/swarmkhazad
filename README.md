@@ -108,7 +108,7 @@ Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is
   mail/<session>/              outbox/ sent/ failed/ inbox/{new,in_process,completed}
   bin/                         per-role harness shims (claude, codex, grok)
   prompts/ hooks/              generated per launch
-  plugin/                      a Claude Code plugin — .claude-plugin/ agents/ skills/; every role's argv names it with --plugin-dir
+  plugin/                      a Claude Code plugin — .claude-plugin/ agents/ skills/; every CLAUDE role's argv names it with --plugin-dir
   state/                       sessions.tsv (the (role, repo) table), tmux socket, board/, daemon/, sessions/, judge/
   tmp/                         scratch; handoff drafts live here, never in the repo
 ```
@@ -332,7 +332,9 @@ Denying the parent its telemetry is deliberate and is stronger than khazad, whic
 
 **The skill and the subagent are generated per task as a plugin, and NAMED rather than copied.** `plugin/` in this repo is a Claude Code plugin — a `.claude-plugin/plugin.json` manifest beside `agents/` and `skills/` — and `prepare` copies it to `<task>/plugin/`. Every claude role's argv then carries `--plugin-dir <task>/plugin`, and the two load under the plugin's name: `swarmkhazad:investigate` and `swarmkhazad:investigation-hypothesis-tester`.
 
-It gets its own directory rather than sharing the task folder's, because a plugin root is executable surface read at names the task folder already uses: `hooks/hooks.json` runs shell commands on every tool event (and a manifest's own hooks field is read *in addition to* that path, so declaring one cannot suppress it), `.mcp.json` registers servers under a name a role's `--disallowedTools` patterns do not match, and `commands/` is a third. `<task>/hooks/` is already where each session's `--settings` file is written. For the same reason `install-plugin!` DELETES the directory before copying, so it holds exactly what the repo ships rather than whatever has accumulated in it — roles can write anywhere under the task folder.
+Only the `claude` harness and the lanes get the flag. codex, copilot and grok have no equivalent — and lose nothing, because `.claude/agents/` and `.claude/skills/` were never load paths they read either.
+
+It gets its own directory rather than sharing the task folder's, because a plugin root is executable surface read at names the task folder already uses: `hooks/hooks.json` runs shell commands on every tool event (and a manifest's own hooks field is read *in addition to* that path, so declaring one cannot suppress it), `.mcp.json` registers servers under a `plugin:<name>:<server>` id that a role's `--disallowedTools` patterns do not match, and `commands/` is a third. `<task>/hooks/` is already where each session's `--settings` file is written. No collision was reachable through the generated files — that suffix is appended literally, so a session settings file can never be named `hooks.json`, and the loader takes that path by name rather than scanning — but a generated directory and a reserved plugin directory being the same directory is the problem, not the filename. For the same reason `install-plugin!` DELETES the directory before copying: `copy-tree` overwrites what it ships and removes nothing, so re-preparing restored a tampered `SKILL.md` while leaving anything else added beside it untouched.
 
 Naming rather than copying is the whole point. A worktree lives inside the target repo, so the copy that used to go there wrote into lothlorien, minas-tirith and istari — and then needed `info/exclude` entries in those repos so a role running `git add -A` could not commit the scaffolding. Now swarmkhazad writes nothing into them: the only path it still excludes in a checkout it does not own is the codegraph index. Per task, not centralised — `--plugin-dir` is per-session and repeatable, so one task can carry a different skill from the one beside it.
 

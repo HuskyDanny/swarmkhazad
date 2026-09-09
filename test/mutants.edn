@@ -209,13 +209,6 @@
   :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
   :why "the generated skill and subagent are on disk and nothing names them, so every investigate role launches with no protocol and improvises — the exact failure the copy shape existed to prevent"}
 
- {:file "scripts/swarm_lib.bb"
-  :ns "mail"
-  :old "                         \"--plugin-dir\" (str (:plugin-dir ctx))]"
-  :new "                         \"--plugin-dir\" (str \"\\\"\" (:plugin-dir ctx) \"\\\"\")]"
-  :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
-  :why "the path reaches the CLI with its quotes, naming a directory that does not exist — the same shape that made a quoted --disallowedTools list deny nothing"}
-
  {:file "scripts/task_lib.bb"
   :ns "investigation"
   :old "  (fs/copy-tree plugin-src (:plugin-dir ctx) {:replace-existing true})"

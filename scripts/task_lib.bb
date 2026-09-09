@@ -880,9 +880,15 @@
    `--plugin-dir` names: the manifest at `<task>/plugin/.claude-plugin/plugin.json`
    and its components at `<task>/plugin/agents/` and `<task>/plugin/skills/`.
 
-   Copied per task rather than named in the repo, because a task must be able
-   to carry a different skill from the one beside it — the path is per-session
-   and repeatable, so this is not centralisation.
+   Copied per task rather than named in the repo because per-task generation is
+   the contract this lane was built to, and `--plugin-dir` being per-session and
+   repeatable is what lets it stay that way.
+
+   Note what this does NOT currently buy, so nobody defends it on a benefit it
+   does not deliver: `plugin-src` is one `def` with no override, and `prepare!`
+   re-runs this on every resume, so a hand-edited per-task skill is replaced on
+   the next `open`. A task carrying a genuinely different skill needs a source
+   selector and a resume that does not clobber; neither exists yet.
 
    Nothing is written into a WORKTREE, and that is the whole point of the
    shape. A worktree lives inside somebody else's repo, so the copy that used
