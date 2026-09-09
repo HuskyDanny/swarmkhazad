@@ -13,32 +13,21 @@
           ]
         },
         {
-          "title": "Total spend by task, last 7 days — the ten dearest",
+          "title": "Total spend, last 7 days — one question, four cuts. Collapse the ones you are not asking",
           "unit": "$",
           "expr": [
-            "topk(10, sum by (task_id) (sum_over_time(claude_code.cost.usage[7d])))"
-          ]
-        },
-        {
-          "title": "Total spend by repo, last 7 days — \"outside a swarm worktree\" is this session, the judge, and any Claude Code not in a task",
-          "unit": "$",
-          "expr": [
-            "label_replace(sum by (repo) (sum_over_time(claude_code.cost.usage[7d])), \"repo\", \"(outside a swarm worktree)\", \"repo\", \"^$\")"
-          ]
-        },
-        {
-          "title": "Total spend by model — which tier is actually spending it",
-          "unit": "$",
-          "expr": [
-            "sum by (model) (sum_over_time(claude_code.cost.usage[7d]))"
+            "topk(10, sum by (task_id) (sum_over_time(claude_code.cost.usage[7d])))",
+            "label_replace(sum by (repo) (sum_over_time(claude_code.cost.usage[7d])), \"repo\", \"(outside a swarm worktree)\", \"repo\", \"^$\")",
+            "sum by (model) (sum_over_time(claude_code.cost.usage[7d]))",
+            "label_replace(sum by (project) (sum_over_time(claude_code.cost.usage[7d])), \"project\", \"(no project)\", \"project\", \"^$\")"
           ]
         },
         {
           "title": "Grading vs working — what the goal judge costs on top of the work",
           "unit": "$",
           "expr": [
-            "sum(sum_over_time(claude_code.cost.usage{role=~\".*-judge\"}[7d]))",
-            "sum(sum_over_time(claude_code.cost.usage{role!~\".*-judge\"}[7d]))"
+            "label_replace(sum(sum_over_time(claude_code.cost.usage{role=~\".*-judge\"}[7d])), \"what\", \"grading the goal\", \"what\", \".*\")",
+            "label_replace(sum(sum_over_time(claude_code.cost.usage{role!~\".*-judge\"}[7d])), \"what\", \"doing the work\", \"what\", \".*\")"
           ]
         }
       ]
@@ -47,16 +36,10 @@
       "title": "Is it spending it well?",
       "panels": [
         {
-          "title": "Cache hit rate by role — higher is cheaper. A cached token costs a tenth of a fresh one",
+          "title": "Cache hit rate — higher is cheaper. A cached token costs a tenth of a fresh one",
           "unit": "%",
           "expr": [
-            "topk(8, 100 * sum by (role) (sum_over_time(claude_code.token.usage{type=\"cacheRead\"}[7d])) / sum by (role) (sum_over_time(claude_code.token.usage{type=~\"cacheRead|input\"}[7d])))"
-          ]
-        },
-        {
-          "title": "Cache hit rate by model — a low number here means prompts are churning, not that the model is dear",
-          "unit": "%",
-          "expr": [
+            "topk(8, 100 * sum by (role) (sum_over_time(claude_code.token.usage{type=\"cacheRead\"}[7d])) / sum by (role) (sum_over_time(claude_code.token.usage{type=~\"cacheRead|input\"}[7d])))",
             "100 * sum by (model) (sum_over_time(claude_code.token.usage{type=\"cacheRead\"}[7d])) / sum by (model) (sum_over_time(claude_code.token.usage{type=~\"cacheRead|input\"}[7d]))"
           ]
         },
@@ -114,31 +97,15 @@
           "title": "Time actually working (seconds per hour) — the rest of the wall clock is a pane waiting on someone",
           "unit": "s",
           "expr": [
-            "topk(8, sum by (role) (sum_over_time(claude_code.active_time.total[1h])))"
+            "topk(8, sum by (role) (sum_over_time(claude_code.active_time.total[1h])))",
+            "label_replace(sum by (repo) (sum_over_time(claude_code.active_time.total[1h])), \"repo\", \"(outside a swarm worktree)\", \"repo\", \"^$\")",
+            "label_replace(sum by (project) (sum_over_time(claude_code.active_time.total[1h])), \"project\", \"(no project)\", \"project\", \"^$\")"
           ]
         },
         {
           "title": "Tokens per hour, by kind",
           "expr": [
             "sum by (type) (sum_over_time(claude_code.token.usage[1h]))"
-          ]
-        }
-      ]
-    },
-    {
-      "title": "By project — blank until a task runs with a project set on it",
-      "panels": [
-        {
-          "title": "Total spend by project",
-          "unit": "$",
-          "expr": [
-            "label_replace(sum by (project) (sum_over_time(claude_code.cost.usage[30d])), \"project\", \"(no project)\", \"project\", \"^$\")"
-          ]
-        },
-        {
-          "title": "Tokens by project and role",
-          "expr": [
-            "topk(10, label_replace(sum by (project, role) (sum_over_time(claude_code.token.usage[30d])), \"project\", \"(no project)\", \"project\", \"^$\"))"
           ]
         }
       ]

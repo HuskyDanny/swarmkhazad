@@ -239,7 +239,11 @@
                      :groups (sort (distinct (mapcat #(map str/trim (str/split % #","))
                                                      (map second (re-seq #"by \(([^)]*)\)" blob)))))
                      :windows (pull #"\[(\d+[smhd])\]")
-                     :filters (pull #"type[=~!]+\"([^\"]+)\"")}))
+                     ;; Every label filter, not only `type`: `role=~".*-judge"`
+                     ;; is what separates the judge panel from the spend panel
+                     ;; that queries the same metric over the same window.
+                     :filters (sort (distinct (map (fn [[_ l v]] (str l "=" v))
+                                                   (re-seq #"([a-z_]+)\s*[=!~]+\s*\"([^\"]*)\"" blob))))}))
             dupes (->> panels
                        (group-by sig)
                        (filter (fn [[_ ps]] (< 1 (count ps))))
@@ -247,10 +251,24 @@
             near (->> panels
                       (group-by #(dissoc (sig %) :windows))
                       (filter (fn [[_ ps]] (< 1 (count ps))))
+                      (map (fn [[_ ps]] (mapv :title ps))))
+            cuts (->> panels
+                      (group-by #(dissoc (sig %) :groups))
+                      (filter (fn [[_ ps]] (< 1 (count ps))))
                       (map (fn [[_ ps]] (mapv :title ps))))]
         (is (empty? dupes) (str "identical panels: " (pr-str dupes)))
         (is (empty? near)
-            (str "same metrics and grouping, only the window differs: " (pr-str near)))))
+            (str "same metrics and grouping, only the window differs: " (pr-str near)))
+        ;; The rule Allen gave, made checkable: spend by task, by repo and by
+        ;; model were three panels asking one question three ways, and the page
+        ;; made you scroll between them to compare. vmui has no dashboard
+        ;; variable to build a dropdown from, but its legend groups by query and
+        ;; each group header is an accordion, so a panel carrying one query per
+        ;; cut IS the toggle — collapse the cuts you are not asking.
+        (is (empty? cuts)
+            (str "same metric, window and filter, split across panels by their "
+                 "group-by — these are cuts of one question and belong in one "
+                 "panel, a query each: " (pr-str cuts)))))
     (testing "the cost levers are charted, not just the totals"
       ;; A total says what was spent. A ratio says what to change.
       ;; Not `includes? "cacheRead"` over the whole dashboard: there are two
