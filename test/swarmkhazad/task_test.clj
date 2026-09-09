@@ -187,6 +187,14 @@
         (is (str/includes? out "session: implement_fixture claude task model=kimi"))
         (is (str/includes? out "repo: fixture "))))))
 
+(defn logged-calls
+  "The set of lines the stub recorded. Read straight after prepare with no
+   waiting, deliberately: `await-indexes!` means a returned prepare has already
+   joined every build, and a read that needed a poll here would be reporting
+   that it had not."
+  [path]
+  (->> (slurp (str path)) str/split-lines (remove str/blank?) set))
+
 (deftest prepare-indexes-each-worktree-for-codegraph
   ;; The swarm loaded the codegraph MCP server for every role and no role could
   ;; ever use it: a task worktree lives outside its repo, codegraph resolves a
@@ -209,9 +217,12 @@
             _ (fs/create-dirs stubdir)
             _ (spit (str (fs/path stubdir "codegraph"))
                     (str "#!/usr/bin/env bash\n"
-                         "echo \"$1 $2\" >> " calls "\n"
-                         ;; init leaves the marker the second prepare branches on
+                         ;; init leaves the marker the second prepare branches on.
+                         ;; Before the log line, never after: the log is what the
+                         ;; test waits on, so anything written after it is a race
+                         ;; the assertions below would lose.
                          "[ \"$1\" = init ] && mkdir -p \"$2/.codegraph\" && echo db > \"$2/.codegraph/codegraph.db\"\n"
+                         "echo \"$1 $2\" >> " calls "\n"
                          "exit 0\n"))
             _ (fs/set-posix-file-permissions (fs/path stubdir "codegraph") "rwxr-xr-x")
             ;; Prepended to the REAL PATH, never a hardcoded prefix: a literal
@@ -223,7 +234,7 @@
         (testing "every worktree is indexed, and with init because none had an index"
           (is (= #{(str "init " wt)
                    (str "init " (fs/path dir "worktrees" "other"))}
-                 (set (str/split-lines (slurp calls))))))
+                 (logged-calls calls))))
         (testing "the index does not make the worktree look dirty"
           ;; `.codegraph/` carries its own .gitignore, which hides the database
           ;; but not the directory: without the exclude, `status --porcelain`
@@ -243,7 +254,7 @@
           (run {:env env} cli "prepare" "t-cg")
           (is (= #{(str "sync " wt)
                    (str "sync " (fs/path dir "worktrees" "other"))}
-                 (set (str/split-lines (slurp calls)))))
+                 (logged-calls calls)))
           (let [lines (str/split-lines (slurp (str (fs/path src ".git" "info" "exclude"))))]
             (is (= 1 (count (filter #(= ".codegraph/" (str/trim %)) lines)))
                 "the exclude is appended once, not once per prepare")))))))
@@ -253,7 +264,10 @@
   ;; binary must open a task exactly as it did before this existed.
   (with-home
     (fn [{:keys [env src] :as h}]
-      (let [onlybin (fs/create-temp-dir {:prefix "sk-nobin-"})
+      ;; Inside the sandbox, so `with-home`'s own teardown takes it. A separate
+      ;; create-temp-dir would leak one directory per run with nothing to delete
+      ;; it — TMPDIR held 1098 of exactly that shape when this was written.
+      (let [onlybin (fs/create-dirs (fs/path (:sandbox h) "onlybin"))
             ;; The tools prepare genuinely needs, SYMLINKED into a bin of their
             ;; own rather than putting their real directories on PATH — bb and
             ;; codegraph are both npm globals in the same directory here, so
