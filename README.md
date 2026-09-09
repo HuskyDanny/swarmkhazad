@@ -290,3 +290,20 @@ Read them back three ways: `swarmkhazad telemetry <task-id>` prints cost, tokens
 bb test            # everything
 bb test task       # namespaces matching a substring
 ```
+
+Two gates sit beside the suite, because a green suite makes a weaker claim than it looks like it makes.
+
+**`bb mutate`** breaks one guard at a time and requires the named test to notice. The table is `test/mutants.edn` — one entry per guard, each carrying the exact code that implements it and the `deftest` that failed when it was taken away. That last field is the point: "3/3 killed" hides the mutant nobody wrote, and a mutant that dies in a *different* test proves that test rather than this one, so the runner reports `wrong-test` separately from `survived`.
+
+```
+bb mutate                        # the whole table (~15 min; every mutant runs its namespace)
+bb mutate contract               # one namespace
+bb mutate --changed origin/main  # only mutants the branch could have affected
+bb mutate --list                 # the table, run nothing
+```
+
+An entry whose `:old` no longer matches fails as `anchor-gone` rather than being skipped — a guard that moved is exactly when you want to be told. The runner edits tracked files and restores each in a `finally`; a hard kill can strand a mutant, so `git diff` is the check, and CI asserts a clean tree after.
+
+**`bb test schema`** is the brittleness gate, and it is a count rather than a coverage number: how many file formats are written down more than once. Every TSV here is written by one function and parsed by another, and the column order is the contract between them — so it is a named def (`sessions-tsv-columns`, `tasks-tsv-columns`) that both ends map over, never a literal in both places. `board_lib` had the same five keys spelled out twice six lines apart, and `zipmap` fails silently: it drops a column the writer added and pads a dropped one with nil, so a card reads back with the wrong lane and nothing errors. The count is at zero.
+
+There is no coverage number and no CRAP score. Both need the coverage half, which needs a JVM Clojure build — this repo is babashka only, with no `deps.edn` and no classpath, and buying a build system to compute a number nobody would act on is the wrong trade.
