@@ -719,6 +719,25 @@
                  (mapv #(first (str/split % #"\t"))
                        (str/split-lines (slurp (str (fs/path dir "state" "sessions.tsv"))))))
               "and a session per (role, repo), because no goal line tagged a repo")
+          (testing "the opening note goes to every session of the first role"
+            ;; One seed for the whole task left the other sessions of the first
+            ;; role with empty inboxes and nothing downstream that would ever
+            ;; address them — handoffd holds a git_handoff until every session
+            ;; of the sender's role has handed off, so that join could not
+            ;; clear unless they decided for themselves to work from the brief.
+            ;; Task gobelhygine did exactly that, twice.
+            ;;
+            ;; Outbox and sent together: delivery is a daemon tick away and
+            ;; which side of it the file is on is a race, while its existence
+            ;; and its recipient are not.
+            (let [seeds (mapcat #(when (fs/exists? %) (map fs/file-name (fs/glob % "*.handoff")))
+                                [(fs/path dir "mail" "_system" "outbox")
+                                 (fs/path dir "mail" "_system" "sent")])]
+              (is (= #{"implement_fixture" "implement_nested"}
+                     (set (keep #(second (re-matches #".*_to_(.+)\.handoff" %)) seeds)))
+                  "one per session of the first role, in every repo the task holds")
+              (is (not-any? #(str/includes? % "_to_run") seeds)
+                  "and none for a later role — nothing has handed off to it yet")))
           (testing "the card appears in the project's swimlane, in the lane its own board says"
             (is (str/includes? (:body (request env :get "/")) (str "class=\"tcard\" href=\"/tasks/" id "\""))))
           (testing "a second task with the same id is refused"
@@ -1026,3 +1045,94 @@
                     (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
                     "kill-server")
         (fs/delete-tree sandbox)))))
+
+(defn eval-in-portal
+  "Evaluate one form against portal.bb in a child bb and read back its value."
+  [env form]
+  (read-string (str/trim (:out (run {:env env} "bb" "-e"
+                                    (str "(load-file \"" scripts "/portal.bb\") (pr " form ")"))))))
+
+(deftest a-task-picks-a-subset-of-its-projects-checkouts
+  ;; Task gobelhygine opened against a project holding cirdan, lothlorien and
+  ;; superset, for a goal whose every line lives in gobel. `repos` was copied
+  ;; from the project with nothing on the form to say otherwise, so four roles
+  ;; fanned out over three trees that could not hold the change and spent
+  ;; $23.48 finding that out one session at a time.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-sub."})
+        home (str (fs/path sandbox "home"))
+        a (str (fs/path sandbox "src" "alpha"))
+        b (str (fs/path sandbox "src" "beta"))
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src"))}
+        project "p-sub"]
+    (try
+      (make-source-repo! a)
+      (make-source-repo! b)
+
+      (testing "the pick is the project's set when the form names none"
+        ;; A POST with no `repo:` key at all is the CLI, a scripted call, and
+        ;; every form from before this field existed. It must keep working, and
+        ;; a form with every box CLEAR posts the same thing, so the safe
+        ;; reading of both is the whole set.
+        (is (= {:repos [a b]}
+               (eval-in-portal env (str "(portal/task-repos {:name \"" project "\" :repos [\"" a "\" \"" b "\"]} {})")))))
+
+      (testing "a subset is the subset, and nothing widens it"
+        (is (= {:repos [b]}
+               (eval-in-portal env (str "(portal/task-repos {:name \"" project "\" :repos [\"" a "\" \"" b "\"]} "
+                                        "{\"repo:" b "\" \"on\" \"task-id\" \"t\"})")))))
+
+      (testing "a checkout the project does not hold is refused, not added"
+        ;; The whole point of the two levels: widening scope is a project edit,
+        ;; which is a decision with a name on it.
+        (let [outside (str (fs/path sandbox "src" "gamma"))
+              r (eval-in-portal env (str "(portal/task-repos {:name \"" project "\" :repos [\"" a "\"]} "
+                                         "{\"repo:" outside "\" \"on\"})"))]
+          (is (str/includes? (:error r) (str "not in project " project)))
+          (is (str/includes? (:error r) outside) "and says which one")
+          (is (str/includes? (:error r) "project's edit page") "and where to go"))
+        (testing "including one named alongside repos that are in scope"
+          (let [r (eval-in-portal env (str "(portal/task-repos {:name \"" project "\" :repos [\"" a "\"]} "
+                                           "{\"repo:" a "\" \"on\" \"repo:/nope\" \"on\"})"))]
+            (is (str/includes? (:error r) "/nope")
+                "a valid pick beside an invalid one is still refused — the alternative silently drops it"))))
+
+      (testing "the review page shows the project's checkouts, every box ticked"
+        (request env :post "/projects" {:body (str "name=" project "&repo%3A" a "=on&repo%3A" b "=on"
+                                                   "&role%3Aimplement=on")})
+        (let [body (:body (request env :post (str "/projects/" project "/review")
+                                   {:body (str "brief=" (java.net.URLEncoder/encode "## Goal\n- [ ] implement — a thing" "UTF-8"))}))]
+          (is (str/includes? body (str "checked=\"checked\" name=\"repo:" a "\"")))
+          (is (str/includes? body (str "checked=\"checked\" name=\"repo:" b "\""))
+              "the default is what a task got before this field existed")
+          (is (str/includes? body (str "/projects/" project "/edit"))
+              "and the way out of the scope is a link, not a guess")))
+
+      (testing "and the pick is what lands in the task's repos file"
+        ;; The assertion that closes the loop. Without it a mutant that writes
+        ;; `project-lib/repos-text project` here — the exact line that opened
+        ;; gobelhygine over three trees — passes every test above, because they
+        ;; only prove task-repos COMPUTES the subset.
+        ;;
+        ;; `open` is spawned after this write and fails in the sandbox for want
+        ;; of a lane on PATH, which is why there is no sessions.tsv to read.
+        ;; `repos` is the seam that matters: `parse-repos` is what every
+        ;; downstream reader consults.
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=t-one&repo%3A" b "=on&brief="
+                                     (java.net.URLEncoder/encode "## Goal\n- [ ] implement — a thing" "UTF-8"))})
+              repos (slurp (str (fs/path home "tasks" "t-one" "repos")))]
+          (is (= 303 (:status r)))
+          (is (str/includes? repos b) "the checkout that was ticked")
+          (is (not (str/includes? repos a))
+              "and not the one that was not — a task in a two-repo project runs one lane per role")))
+
+      (testing "opening with a checkout outside the project writes no task folder"
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=t-sub&repo%3A" (fs/path sandbox "src" "gamma") "=on&brief="
+                                     (java.net.URLEncoder/encode "## Goal\n- [ ] implement — a thing" "UTF-8"))})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) (str "not in project " project)))
+          (is (not (fs/exists? (fs/path home "tasks" "t-sub")))
+              "refused before the CLI is shelled, so there is nothing to clean up")))
+      (finally (fs/delete-tree sandbox)))))

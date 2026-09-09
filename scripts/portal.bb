@@ -409,13 +409,51 @@
         p
         (do (project-lib/write-project! p) {:ok name})))))
 
+(defn task-repos
+  "The checkouts one task runs in: the subset of its project's repos the form
+   ticked, or {:error}.
+
+   The project owns the scope and a task picks inside it. A checkout the
+   project does not hold is a refusal rather than a widening — the fix is one
+   edit on the project page, which is a decision with a name on it, instead of
+   a project that quietly grows every time a task needs one more tree.
+
+   A POST naming no `repo:` key at all gets the project's whole set: that is
+   the CLI, a scripted call, and every form from before this field existed, and
+   it is what every task got until now.
+
+   Why this is worth a function. Task gobelhygine opened against a project
+   holding cirdan, lothlorien and superset, for a goal whose every line lives
+   in gobel. `repos` was copied from the project with nothing to say otherwise,
+   so four roles fanned out over three trees that could not hold the change,
+   found that out one session at a time, and spent $23.48 doing it. Both
+   escalations say the same sentence. The form could not have been wrong here —
+   it was never asked."
+  [project params]
+  (let [scope (set (:repos project))
+        picked (->> (keys params)
+                    (keep #(second (re-matches #"repo:(.+)" %)))
+                    sort vec)
+        outside (remove scope picked)]
+    (cond
+      (seq outside)
+      {:error (str "not in project " (:name project) ": " (str/join ", " outside)
+                   " — add the checkout on the project's edit page first, "
+                   "then open the task")}
+      ;; Distinct from picking none: a form with the field present and every box
+      ;; clear posts no `repo:` key either, so the two cases arrive identical
+      ;; and the safe reading of an empty pick is the project's set.
+      (empty? picked) {:repos (vec (:repos project))}
+      :else {:repos picked})))
+
 (defn kickstart-project!
-  "A task inside a project: the repos and the role lineup come from the project,
-   so the form contributes only the brief — one pasted block that parse-brief
-   splits into the goal, the not-goals and the bars."
-  [project {:strs [task-id brief]}]
+  "A task inside a project: the role lineup comes from the project and the
+   repos are the subset of it the form ticked, so the form contributes the
+   brief and the trees it runs in."
+  [project {:strs [task-id brief] :as params}]
   (let [id (str/trim (or task-id ""))
         {:keys [goal not-goal bars seen]} (project-lib/parse-brief brief)
+        {picked :repos repo-error :error} (task-repos project params)
         ctx (when (task-lib/valid-task-id? id) (task-lib/task-ctx id))]
     (cond
       (not (task-lib/valid-task-id? id)) {:error (str "invalid task id: " (pr-str id))}
@@ -428,9 +466,12 @@
                                  "Near spellings are fine; the text above the first heading is ignored.")}
       (empty? goal) {:error (str "the Goal section is empty — found "
                                  (str/join ", " (sort (map name seen))))}
+      repo-error {:error repo-error}
+      (empty? picked) {:error (str "project " (:name project) " holds no checkouts — "
+                                   "add one on its edit page")}
       :else
       (let [new (apply process/sh {:continue true} "bb" cli "new" id
-                       (mapcat #(vector "--repo" %) (:repos project)))]
+                       (mapcat #(vector "--repo" %) picked))]
         (if-not (zero? (:exit new))
           {:error (str "new failed: " (:err new))}
           (do
@@ -439,7 +480,9 @@
               (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
             (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
             (spit (str (:roles-file ctx)) (project-lib/roles-text project))
-            (spit (str (:repos-file ctx)) (project-lib/repos-text project))
+            ;; The pick, not `project-lib/repos-text` — the project's set is
+            ;; the bound, and this file is the task's own answer inside it.
+            (spit (str (:repos-file ctx)) (task-lib/repos-text picked))
             (fs/create-dirs (:state-dir ctx))
             (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
               (process/process ["bb" cli "open" id] {:out log :err log}))
@@ -941,6 +984,26 @@
               [:input {:type "text" :name "task-id" :required true
                        :placeholder (str (java.time.LocalDate/now) "-something")
                        :value (get params "task-id" "")}]]
+             ;; The list is the project's, and every box starts ticked, so the
+             ;; default is exactly what a task got before this field existed.
+             ;; Its job is to be VISIBLE while the goal is on the screen: the
+             ;; run that produced this field opened against three checkouts for
+             ;; a goal living in a fourth, and nothing on this page said which
+             ;; three, so nobody could notice the one that was missing.
+             (let [scope (:repos project)
+                   ;; Nothing ticked and no field at all post the same thing, so
+                   ;; a first render ticks everything and a re-render after an
+                   ;; error keeps what was picked.
+                   any? (some #(re-matches #"repo:(.+)" %) (keys params))]
+               [:label (str "checkouts — one lane per role per checkout, from project " (:name project))
+                [:div.picklist
+                 (for [r scope]
+                   [:label.pick [:input {:type "checkbox" :name (str "repo:" r)
+                                         :checked (or (not any?) (contains? params (str "repo:" r)))}]
+                    [:span.trunc (str/replace r (str (fs/expand-home "~")) "~")]])]
+                [:span.muted "a checkout this task needs and the project does not hold is a "
+                 [:a.doc {:href (str "/projects/" (:name project) "/edit")} "project edit"]
+                 " — the project owns the scope"]])
              [:label "the brief, sorted — edit anything, this is what opens"
               [:textarea {:name "brief" :rows 20} markdown]]]
             [:div.go

@@ -52,6 +52,14 @@ event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null) ||
 
 TRUTH=(goal.md metrics.md)
 MINE=(decision.md gotcha.md finding.md escalation.md)
+# Locked like the truth, injected like neither. `repos` is the task's SCOPE —
+# which checkouts it runs in — and `ship` reads it after the swarm has been
+# running for hours to decide which branches to push and open PRs from
+# (ship.bb:314). A role is already standing in its own worktree and has no use
+# for the list, so it is not in TRUTH: that array also drives the injection and
+# the missing-contract check, and a role told "TASK HAS NO CONTRACT" because
+# `repos` was empty would stop for the wrong reason.
+SCOPE=(repos)
 
 # ------------------------------------------------------------------ SessionStart
 session_start() {
@@ -60,7 +68,7 @@ session_start() {
   source=$(printf '%s' "$input" | jq -r '.source // "startup"' 2>/dev/null) || source="startup"
 
   for f in "${MINE[@]}"; do [ -e "$task_dir/$f" ] || : >"$task_dir/$f" 2>/dev/null; done
-  for f in "${TRUTH[@]}"; do [ -e "$task_dir/$f" ] && chmod 444 "$task_dir/$f" 2>/dev/null; done
+  for f in "${TRUTH[@]}" "${SCOPE[@]}"; do [ -e "$task_dir/$f" ] && chmod 444 "$task_dir/$f" 2>/dev/null; done
   for f in "${TRUTH[@]}"; do [ -s "$task_dir/$f" ] || missing+=("$f"); done
 
   ctx="TASK CONTRACT · $task_id · $task_dir${role:+ · role $role}
@@ -199,9 +207,11 @@ task_file() {
 
 TRUTH_FILES='goal.md metrics.md'
 NOTE_FILES='decision.md gotcha.md finding.md escalation.md'
+SCOPE_FILES='repos'
 
 truth_path() { task_file "$1" "$2" "$TRUTH_FILES"; }
 note_path()  { task_file "$1" "$2" "$NOTE_FILES"; }
+scope_path() { task_file "$1" "$2" "$SCOPE_FILES"; }
 
 # Which set a word belongs to, or nothing. Sets `hit_kind` as a side effect so
 # the caller can deny with the right message.
@@ -209,6 +219,7 @@ hit_kind=""
 classify() {
   if truth_path "$1" "$2"; then hit_kind="truth"; return 0; fi
   if note_path  "$1" "$2"; then hit_kind="note";  return 0; fi
+  if scope_path "$1" "$2"; then hit_kind="scope"; return 0; fi
   return 1
 }
 
@@ -227,6 +238,9 @@ pre_tool_use() {
       fi
       if note_path "$fp" "$cwd"; then
         deny "$(basename "$fp") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$fp"
+      fi
+      if scope_path "$fp" "$cwd"; then
+        deny "repos is the task's scope, fixed when the swarm opened (chmod 444). The sessions running now were spawned from it and ship reads it to decide which branches to push, so changing it here would not add a session — it would push a branch nobody worked. A checkout this task needs and does not have is an escalation.md line." "$tool" "$fp"
       fi
       exit 0 ;;
     Bash)
@@ -437,6 +451,9 @@ pre_tool_use() {
         mutating=1
       fi
       [ "$mutating" -eq 1 ] || exit 0
+      if [ "$hit_kind" = "scope" ]; then
+        deny "repos is the task's scope, fixed when the swarm opened (chmod 444). The sessions running now were spawned from it and ship reads it to decide which branches to push, so changing it here would not add a session — it would push a branch nobody worked. A checkout this task needs and does not have is an escalation.md line." "Bash" "$cmd"
+      fi
       if [ "$hit_kind" = "note" ]; then
         deny "decision.md, gotcha.md, finding.md and escalation.md are append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "Bash" "$cmd"
       fi
