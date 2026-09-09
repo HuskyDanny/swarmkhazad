@@ -153,6 +153,11 @@
                   (is (str/ends-with? (get-in settings ["hooks" "SessionStart" 0 "hooks" 0 "command"]) "hooks/run-contract.sh"))
                   (is (= "Edit|Write|MultiEdit|NotebookEdit|Bash" (get-in settings ["hooks" "PreToolUse" 0 "matcher"]))))
                 (is (= "444" (str/trim (:out (process/sh "stat" "-f" "%Lp" (str (fs/path dir "goal.md")))))) "open locked goal.md")
+                ;; The scope is fixed at open too: `sessions.tsv` was written
+                ;; from `repos` once, and `ship` reads it hours later to decide
+                ;; which branches to push, so an edit mid-run cannot add a
+                ;; session — only push a branch nobody worked.
+                (is (= "444" (str/trim (:out (process/sh "stat" "-f" "%Lp" (str (fs/path dir "repos")))))) "and repos, the task's scope")
                 (is (some #{"--permission-mode"} argv))
                 (is (some #{"bypassPermissions"} argv))
                 (is (= ["--model" "sonnet"] (filterv #{"--model" "sonnet"} argv)))

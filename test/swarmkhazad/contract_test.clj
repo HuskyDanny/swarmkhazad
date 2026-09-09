@@ -500,3 +500,47 @@
           (is (denied? (bash task task (str "cd " task " && git checkout -- goal.md"))))
           (is (denied? (bash task task (str "cd " task " && git -C . restore goal.md"))))
           (is (denied? (bash task task (str "cd " task " && git -C . checkout HEAD -- metrics.md")))))))))
+
+(deftest repos-is-the-scope-and-the-scope-is-fixed-when-the-swarm-opens
+  ;; goal.md and metrics.md were the only locked files, and `repos` is read
+  ;; long after open: `ship` consults it to decide which branches to push and
+  ;; open PRs from, and `sessions.tsv` was written from it once. So an edit
+  ;; mid-run cannot add a session — it can only make the file disagree with the
+  ;; panes that are running, and then push a branch nobody worked.
+  (with-task
+    (fn [task _sandbox]
+      (spit (str (fs/path task "repos")) "/tmp/alpha\n")
+      (session-start task)
+
+      (testing "SessionStart locks it, like the truth"
+        (is (= "444" (perms (fs/path task "repos")))))
+
+      (testing "an edit is refused, and the reason is about scope, not about a bar"
+        ;; The message matters: `repos` is not a bar, and telling a role that a
+        ;; bar it cannot meet belongs in escalation.md when it was trying to
+        ;; add a checkout sends it to argue with the wrong file.
+        (let [r (edit task "Write" (str (fs/path task "repos")))
+              why (get-in (:json r) ["hookSpecificOutput" "permissionDecisionReason"])]
+          (is (denied? r))
+          (is (str/includes? why "the task's scope"))
+          (is (str/includes? why "push a branch nobody worked"))
+          (is (not (str/includes? why "never an edit to the bar"))
+              "that sentence is goal.md's, and it is not what this file is")))
+
+      (testing "and so is the chmod that would undo the lock"
+        (is (denied? (bash task task (str "chmod 644 " task "/repos"))))
+        (is (denied? (bash task task (str "cd " task " && echo /tmp/beta >> repos"))))
+        (is (denied? (bash task task (str "cd " task " && sed -i '' 's|alpha|beta|' repos")))))
+
+      (testing "reading it is still free — every role's own worktree is in there"
+        (is (allowed? (bash task task (str "cat " task "/repos"))))
+        (is (allowed? (bash task task (str "cd " task " && grep -c . repos"))))
+        (is (allowed? (bash task task (str "cd " task " && wc -l repos && git status --short")))))
+
+      (testing "a repos file in a worktree is not the task's"
+        ;; Roles work in a checkout that may have its own `repos`; only the one
+        ;; in the task folder is the scope.
+        (let [wt (fs/path task "worktrees" "alpha")]
+          (fs/create-dirs wt)
+          (spit (str (fs/path wt "repos")) "not the task's\n")
+          (is (allowed? (bash task wt "chmod 644 repos"))))))))
