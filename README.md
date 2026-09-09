@@ -108,6 +108,7 @@ Runtime home is `~/.swarmkhazad/` (override with `SWARMKHAZAD_HOME`). Nothing is
   mail/<session>/              outbox/ sent/ failed/ inbox/{new,in_process,completed}
   bin/                         per-role harness shims (claude, codex, grok)
   prompts/ hooks/              generated per launch
+  .claude-plugin/ agents/ skills/   the task folder IS a Claude Code plugin; every role's argv names it with --plugin-dir
   state/                       sessions.tsv (the (role, repo) table), tmux socket, board/, daemon/, sessions/, judge/
   tmp/                         scratch; handoff drafts live here, never in the repo
 ```
@@ -327,9 +328,13 @@ run claude task --model haiku
 
 The model goes on the argv because `model=` names a VENDOR — a base URL and a keychain service — so `model=opus` fails at prepare with `unknown model vendor opus`. And the tool list carries **no quotes**: a `roles` line is whitespace-split and each token becomes one argv slot, so `--disallowedTools "a,b"` reaches the CLI as the literal token `"a,b"` and denies nothing.
 
-Denying the parent its telemetry is deliberate and is stronger than khazad, which grants the parent everything. The investigator then cannot gather confirming evidence for its own favourite story — it has to dispatch the `investigation-hypothesis-tester` subagent, which holds `logfire`/`datadog`/`argocd` and was instructed to refute. Partial, and knowingly so: `gh` is a CLI, so `Bash` routes around any MCP denial. The tester has no write tools at all, so the parent calling `note.bb` per returned verdict is the only route by which a clue reaches `finding.md`.
+Denying the parent its telemetry is deliberate and is stronger than khazad, which grants the parent everything. The investigator then cannot gather confirming evidence for its own favourite story — it has to dispatch the `swarmkhazad:investigation-hypothesis-tester` subagent, which holds `logfire`/`datadog`/`argocd` and was instructed to refute. Partial, and knowingly so: `gh` is a CLI, so `Bash` routes around any MCP denial. The tester has no write tools at all, so the parent calling `note.bb` per returned verdict is the only route by which a clue reaches `finding.md`.
 
-**The skill and the subagent are generated per task**, from `agent-home/.claude/` in this repo, into `<task>/.claude/` *and* into every worktree. Both, because a parent directory's `.claude` is **not** a load path: RAN, a spec at `<task>/.claude/agents/x.md` with cwd `<task>/worktrees/foo` was absent from the session's subagent list, and the identical file at `<task>/worktrees/foo/.claude/agents/x.md` appeared in it. The worktree copies are excluded from git per exact file path in the checkout's shared `info/exclude`, so a role running `git add -A` cannot commit swarm scaffolding into the target repo — and per file rather than per directory, because that exclude file is shared with the operator's own checkout, where `.claude/` is legitimately tracked.
+**The skill and the subagent are generated per task as a plugin, and NAMED rather than copied.** `plugin/` in this repo is a Claude Code plugin — a `.claude-plugin/plugin.json` manifest beside `agents/` and `skills/` — and `prepare` copies it into the task folder, which becomes its plugin root: `<task>/.claude-plugin/plugin.json`, `<task>/agents/`, `<task>/skills/`. Every claude role's argv then carries `--plugin-dir <task-dir>`, and the two load under the plugin's name: `swarmkhazad:investigate` and `swarmkhazad:investigation-hypothesis-tester`.
+
+Naming rather than copying is the whole point. A worktree lives inside the target repo, so the copy that used to go there wrote into lothlorien, minas-tirith and istari — and then needed `info/exclude` entries in those repos so a role running `git add -A` could not commit the scaffolding. Now swarmkhazad writes nothing into them: the only path it still excludes in a checkout it does not own is the codegraph index. Per task, not centralised — `--plugin-dir` is per-session and repeatable, so one task can carry a different skill from the one beside it.
+
+RAN, and it is why naming suffices where a parent directory's `.claude/` did not: a spec at `<task>/.claude/agents/x.md` with cwd `<task>/worktrees/foo` was absent from the session's subagent list, while from a cwd holding no `.claude` at all, `claude -p --plugin-dir <task-dir>` listed both `swarmkhazad:investigation-hypothesis-tester` and `swarmkhazad:investigate`.
 
 **The loop session.** One long-lived `cc_loop` session, its prompt in `prompts/investigation-loop.prompt` — poll query, the `repo:` label → checkout mapping, the attempt cap, and how `Repro:` is read off the runner's comment. It reaches swarmkhazad through one MCP tool:
 

@@ -38,7 +38,7 @@ CONFIRMED branch, because the reader can see what you ruled out and why.
 ## You do not hold the telemetry, and that is the design
 
 `logfire`, `datadog` and `argocd` are DENIED to you and granted to the
-`investigation-hypothesis-tester` subagent. This is deliberate and it is stronger than it looks: you
+`swarmkhazad:investigation-hypothesis-tester` subagent. This is deliberate and it is stronger than it looks: you
 cannot go and fetch confirming evidence for the story you already like. Evidence from a telemetry
 plane reaches your tree only through a fresh context that was instructed to refute.
 
@@ -96,7 +96,7 @@ observation lives in telemetry, dispatching is the ONLY way to test it.
    - **Telemetry contradicts a human record?** Telemetry wins, and the contradiction is a finding.
    - **Couldn't reach the primary evidence?** Say so, and name the one observation that would settle it.
 
-6. **Dispatch `investigation-hypothesis-tester`, one per branch you want tested independently.** Give
+6. **Dispatch `swarmkhazad:investigation-hypothesis-tester`, one per branch you want tested independently.** Give
    it the hypothesis, the refuting evidence you expect, and which plane to look on; it returns
    REBUTTED/CONFIRMED/UNCLEAR with evidence. Scale to the question: one obvious root cause needs no
    fan-out, and a branch whose discriminating observation is in telemetry has no other route.

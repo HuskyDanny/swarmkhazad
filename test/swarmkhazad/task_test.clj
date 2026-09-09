@@ -164,9 +164,11 @@
         (testing "the four bullet files exist and are empty; nothing clones into the task folder"
           (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
-          (is (= #{".claude" "decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md"
+          (is (= #{".claude-plugin" "agents" "skills"
+                   "decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md"
                    "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
-                 (set (map fs/file-name (fs/list-dir dir))))))
+                 (set (map fs/file-name (fs/list-dir dir))))
+              "the plugin's three entries make the task folder its own plugin root, which is what --plugin-dir names"))
         (testing "prepare is idempotent, and a re-prepare keeps a commit the role made"
           (spit (str (fs/path wt "probe.txt")) "x\n")
           (run {:dir (str wt)} "git" "add" "probe.txt")
@@ -566,15 +568,17 @@
           (testing "and its mail dirs are there for the sessions it actually has"
             (is (fs/directory? (fs/path dir "mail" "implement")))
             (is (fs/directory? (fs/path dir "mail" "review"))))
-          (testing "the agent home reaches a legacy task's worktree too"
-            ;; `open` IS the resume path, and a resumed investigation whose
-            ;; worktree has no `.claude/` comes back with no skill and no
-            ;; subagent — the investigate role's entire method lives in that
-            ;; skill, so the pane would launch and improvise.
-            (doseq [p [".claude/skills/investigate/SKILL.md"
-                       ".claude/agents/investigation-hypothesis-tester.md"]]
+          (testing "a legacy task gets the plugin too, and still nothing in its worktree"
+            ;; `open` IS the resume path, and a resumed investigation whose task
+            ;; folder has no plugin comes back with no skill and no subagent —
+            ;; the investigate role's entire method lives in that skill, so the
+            ;; pane would launch and improvise.
+            (doseq [p [".claude-plugin/plugin.json"
+                       "skills/investigate/SKILL.md"
+                       "agents/investigation-hypothesis-tester.md"]]
               (is (fs/regular-file? (fs/path dir p)) (str "task folder: " p))
-              (is (fs/regular-file? (fs/path wt p)) (str "legacy worktree: " p))))))))
+              (is (not (fs/exists? (fs/path wt p)))
+                  (str "legacy worktree must stay untouched: " p))))))))
   (testing "a task with neither repos nor roles.tsv is not a legacy task, it is broken"
     (with-home
       (fn [{:keys [env] :as h}]

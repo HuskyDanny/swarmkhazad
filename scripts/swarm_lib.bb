@@ -366,7 +366,23 @@
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
                         ["--append-system-prompt-file" (str prompt)
-                         "--settings" (str (write-hook-settings! ctx row))]
+                         "--settings" (str (write-hook-settings! ctx row))
+                         ;; The task folder IS the plugin root — its manifest is
+                         ;; at <task>/.claude-plugin/plugin.json and its
+                         ;; components at <task>/agents and <task>/skills (see
+                         ;; task-lib's install-plugin!). Naming the path here is
+                         ;; what replaced copying the skill and the subagent
+                         ;; into every worktree, which meant writing into repos
+                         ;; the swarm does not own.
+                         ;;
+                         ;; Two argv slots, built here rather than declared on a
+                         ;; `roles` line: that line is whitespace-split twice, so
+                         ;; a path with a space in it would arrive as two flags
+                         ;; and a quoted one would arrive with its quotes. The
+                         ;; flag is repeatable (`--plugin-dir A --plugin-dir B`)
+                         ;; rather than last-wins, so a lane's own plugins load
+                         ;; alongside this one instead of losing to it.
+                         "--plugin-dir" (str (:task-dir ctx))]
                         ;; A lane already declares its own permission posture —
                         ;; cc_auto bypasses, cc_control screens — and restating
                         ;; ours would collapse the two into one choice.

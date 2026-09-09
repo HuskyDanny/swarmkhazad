@@ -354,12 +354,20 @@
         argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
         start-with #(str/starts-with? % "You are role r working in fixture (session r) of task t.")]
     (try
-      (testing "claude: system prompt file, hook settings, bypass, name in the pane, extra args, then the message after --"
+      (testing "claude: system prompt file, hook settings, the task folder as a plugin, bypass, name in the pane, extra args, then the message after --"
+        ;; `--plugin-dir <task-dir>` is what makes the generated skill and
+        ;; subagent LOADABLE, and it is why nothing is copied into a worktree
+        ;; any more. Two argv slots, unquoted: a `roles` line is whitespace-split
+        ;; twice, so a quoted path would reach the CLI with its quotes and load
+        ;; nothing — which is why this is built here and not declared there.
         (let [a (argv "claude" :interactive)]
           (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude" "--append-system-prompt-file" (str prompt)
                   "--settings" (str (fs/path scratch "hooks" "r.settings.json"))
+                  "--plugin-dir" "/tmp/t"
                   "--permission-mode" "bypassPermissions" "-n" "sk r" "--flag" "va'lue" "--"] (butlast a)))
           (is (start-with (last a))))
+        (testing "and the plugin is named in print mode too — the smoke run loads the same session shape"
+          (is (= "/tmp/t" (second (drop-while #(not= "--plugin-dir" %) (argv "claude" :smoke))))))
         (let [a (argv "claude" :smoke)]
           (is (some #{"-p"} a))
           (is (= "json" (second (drop-while #(not= "--output-format" %) a))))

@@ -186,9 +186,6 @@
      :bin-dir (fs/path task-dir "bin")
      :prompts-dir (fs/path task-dir "prompts")
      :hooks-dir (fs/path task-dir "hooks")
-     ;; The skills and subagents a role can load, generated per task beside its
-     ;; prompts/ and hooks/. See install-agent-home!.
-     :agent-home-dir (fs/path task-dir ".claude")
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
      :sessions-tsv (fs/path state-dir "sessions.tsv")
@@ -707,25 +704,24 @@
 (defn exclude-paths!
   "Teach a checkout to ignore the paths the swarm writes inside it, once each.
 
-   Two callers, one rule. `.codegraph/` carries its own `.gitignore`, which
-   hides the database but not the directory itself: `git status --porcelain`
-   still reports `?? .codegraph/` (RAN). Three readers take that for work in
-   progress — the summary's `uncommitted:` block, the judge's git-status
-   section, and the runtime stamp's `dirty` field — so an unexcluded index makes
-   every task look dirty from the moment it opens. The generated skill and
-   subagent are the same problem with a worse ending: a role running
-   `git add -A` would commit swarm scaffolding into the target repo.
+   One caller now, and one path: the codegraph index. `.codegraph/` carries its
+   own `.gitignore`, which hides the database but not the directory itself:
+   `git status --porcelain` still reports `?? .codegraph/` (RAN). Three readers
+   take that for work in progress — the summary's `uncommitted:` block, the
+   judge's git-status section, and the runtime stamp's `dirty` field — so an
+   unexcluded index makes every task look dirty from the moment it opens.
+
+   The skill and the subagent were the second caller and are no longer written
+   into a checkout at all: the plugin is named on each role's argv instead. See
+   install-plugin!. This is the ONLY thing swarmkhazad still writes into a repo
+   it does not own, so keep the list at one entry unless there is no
+   alternative.
 
    `info/exclude` lives in the COMMON git dir, which every linked worktree of a
    checkout shares (RAN: a worktree's --git-common-dir resolves to the source's
    .git, and a `.codegraph/` written inside that worktree then reports clean).
    So one append covers every worktree this repo will ever have, and it stays
-   local to the machine rather than becoming a diff in the repo.
-
-   That sharing is also why the agent-home entries are exact FILE paths rather
-   than `.claude/agents/`: the operator's own checkout reads the same file, and
-   `.claude/` is legitimately tracked in these repos. Excluding a directory
-   there would silently hide a new `.claude/` file the operator wrote by hand."
+   local to the machine rather than becoming a diff in the repo."
   [src patterns]
   (let [raw (git src "rev-parse" "--git-common-dir")
         common (if (fs/absolute? raw) (fs/path raw) (fs/path src raw))
@@ -863,69 +859,41 @@
     (when-not (fs/regular-file? f)
       (throw (ex-info (str "task is missing " (fs/file-name f) ": " f) {})))))
 
-;; ------------------------------------------------------------- agent home
+;; ----------------------------------------------------------- the plugin
 
-(def agent-home-src
-  "The skills and subagents this repo ships to every task it opens. One tree in
-   the repo, copied per task — not a path each reader spells for itself."
-  (fs/path (fs/parent (fs/parent (fs/absolutize *file*))) "agent-home" ".claude"))
+(def plugin-src
+  "The skills and subagents this repo ships to every task it opens, laid out as
+   a Claude Code plugin: a `.claude-plugin/plugin.json` manifest beside
+   `agents/` and `skills/`."
+  (fs/path (fs/parent (fs/parent (fs/absolutize *file*))) "plugin"))
 
-(defn agent-home-files
-  "Every file the agent home holds, as a path relative to the worktree root —
-   `.claude/agents/investigation-hypothesis-tester.md`. Derived from the tree
-   rather than listed, so adding a skill needs no second edit here."
-  []
-  (when (fs/directory? agent-home-src)
-    (let [root (fs/parent agent-home-src)]
-      (->> (fs/glob agent-home-src "**")
-           (filter fs/regular-file?)
-           (map #(str (fs/relativize root %)))
-           sort
-           vec))))
+(defn install-plugin!
+  "Copy the repo's plugin into the task folder, which becomes its plugin root:
+   the manifest lands at `<task>/.claude-plugin/plugin.json` and its components
+   beside prompts/ and hooks/, as `<task>/agents/` and `<task>/skills/`.
 
-(defn install-agent-home!
-  "Copy the repo's agent home into the task folder AND into every worktree.
+   Copied per task rather than named in the repo, because a task must be able
+   to carry a different skill from the one beside it — the path is per-session
+   and repeatable, so this is not centralisation.
 
-   Both, because they answer different questions. The task folder's copy is the
-   canonical one — one tree per task, beside prompts/ and hooks/. The worktree
-   copies are the ones a role can actually LOAD: RAN, with a spec at
-   `<task>/.claude/agents/sk-probe-agent.md` and cwd `<task>/worktrees/foo`, a
-   `claude -p` asked to list its subagent types returned 22 and not that one;
-   the identical file inside that worktree made it appear. A parent directory's
-   `.claude` is not a load path.
+   Nothing is written into a WORKTREE, and that is the whole point of the
+   shape. A worktree lives inside somebody else's repo, so the copy that used
+   to go there made swarmkhazad write into lothlorien, minas-tirith and istari
+   — and then add `info/exclude` entries in those repos so a role running
+   `git add -A` could not commit the scaffolding. Naming the load path on each
+   role's argv (`--plugin-dir <task-dir>`, see swarm_lib's harness-argv) writes
+   nothing into them at all.
 
-   **A file the target repo TRACKS is never written.** `.claude/` is not ours:
-   RAN, `git -C ~/repos/mithra_ai/lothlorien ls-files '.claude/*'` lists 80+
-   files, `.claude/settings.json`, `.claude/hooks/*` and `.claude/skills/*/SKILL.md`
-   among them, and minas-tirith tracks `.claude/agents/*.md`. Nothing collides
-   today, but a rename on either side would have `:replace-existing true`
-   overwrite a checked-in file — and `info/exclude` masks only UNTRACKED paths,
-   so the damage would show up as a modification in someone's PR. So each file
-   is copied individually and a tracked destination is skipped and reported.
+   RAN, and this is what makes naming sufficient where a parent directory's
+   `.claude/` was not: from a cwd holding no `.claude`, with this layout copied
+   into a task-shaped folder, `claude -p --plugin-dir <task-dir>` listed both
+   `swarmkhazad:investigation-hypothesis-tester` and `swarmkhazad:investigate`.
 
-   Idempotent, and each worktree copy is excluded from git per file. See
-   escalation.md for the `--plugin-dir` shape that would stop writing into a
-   target repo at all."
-  [ctx worktrees]
-  (when-let [files (seq (agent-home-files))]
-    (fs/create-dirs (:agent-home-dir ctx))
-    (fs/copy-tree agent-home-src (:agent-home-dir ctx) {:replace-existing true})
-    (doseq [path worktrees
-            :when (and path (fs/directory? path))
-            :let [tracked (set (remove str/blank?
-                                       (str/split-lines
-                                        (or (git path "ls-files" "--" ".claude") ""))))
-                  mine (remove tracked files)]]
-      (doseq [rel mine
-              :let [dest (fs/path path rel)]]
-        (fs/create-dirs (fs/parent dest))
-        (fs/copy (fs/path (fs/parent agent-home-src) rel) dest {:replace-existing true}))
-      (doseq [rel (filter tracked files)]
-        (binding [*out* *err*]
-          (println (str "swarmkhazad: " (fs/file-name path) " tracks " rel
-                        " — left alone, so that role loads the repo's own copy"))))
-      (exclude-paths! path mine))
-    files))
+   Idempotent."
+  [ctx]
+  (when (fs/directory? plugin-src)
+    (fs/copy-tree plugin-src (:task-dir ctx) {:replace-existing true})
+    true))
 
 (defn create-layout! [ctx]
   (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
@@ -947,7 +915,7 @@
     ;; at the empty ones, which is how a resume loses a day of work.
     (let [rows (read-sessions-tsv ctx)]
       (create-layout! ctx)
-      (install-agent-home! ctx (keep :worktree-path rows))
+      (install-plugin! ctx)
       (prepare-mail-dirs! ctx rows)
       (write-sessions-tsv! ctx rows)
       {:task-id (:task-id ctx)
@@ -962,7 +930,7 @@
       (create-layout! ctx)
       (let [worktrees (prepare-worktrees! ctx repos)
             rows (sessions ctx roles repos role->repos)]
-        (install-agent-home! ctx (map :path worktrees))
+        (install-plugin! ctx)
         (prepare-mail-dirs! ctx rows)
         (write-sessions-tsv! ctx rows)
         {:task-id (:task-id ctx)

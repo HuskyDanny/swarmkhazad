@@ -194,28 +194,36 @@
   :killed-by "a-repro-bar-may-name-the-origin-and-branch-the-worktree-is-not-on"
   :why "the reproduction runs on the task branch, which carries no code — the one branch certain not to have the bug"}
 
- {:file "scripts/task_lib.bb"
-  :ns "investigation"
-  :old "      (doseq [rel mine\n              :let [dest (fs/path path rel)]]"
-  :new "      (doseq [rel nil\n              :let [dest (fs/path path rel)]]"
-  :killed-by "the-skill-and-the-subagent-are-generated-into-the-task-folder-and-into-every-worktree"
-  :why "only the task folder gets the agent home, and a parent directory's .claude is not a load path — so the skill and subagent exist and nothing reads them"}
-
- {:file "scripts/task_lib.bb"
+  {:file "scripts/task_lib.bb"
   :ns "investigation"
   :old "        missing (remove present patterns)]"
   :new "        missing patterns]"
-  :killed-by "a-re-prepare-neither-duplicates-the-excludes-nor-clobbers-a-claude-the-repo-owns"
+  :killed-by "a-re-prepare-adds-no-second-exclude-line"
   :why "every prepare appends the same patterns again, so a checkout resumed a dozen times carries a dozen copies — and `open` IS the resume path"}
+
+ ;; ------------------------------------- the plugin, named rather than copied
+ {:file "scripts/swarm_lib.bb"
+  :ns "mail"
+  :old "                         \"--plugin-dir\" (str (:task-dir ctx))]"
+  :new "                         ]"
+  :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
+  :why "the generated skill and subagent are on disk and nothing names them, so every investigate role launches with no protocol and improvises — the exact failure the copy shape existed to prevent"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "mail"
+  :old "                         \"--plugin-dir\" (str (:task-dir ctx))]"
+  :new "                         \"--plugin-dir\" (str \"\\\"\" (:task-dir ctx) \"\\\"\")]"
+  :killed-by "harness-argv-carries-each-cli-s-own-flags-in-both-modes"
+  :why "the path reaches the CLI with its quotes, naming a directory that does not exist — the same shape that made a quoted --disallowedTools list deny nothing"}
 
  {:file "scripts/task_lib.bb"
   :ns "investigation"
-  :old "      (exclude-paths! path mine))"
-  :new "      (identity path))"
-  :killed-by "the-skill-and-the-subagent-are-generated-into-the-task-folder-and-into-every-worktree"
-  :why "the generated files show as untracked in the target checkout, so a role running `git add -A` commits swarm scaffolding into istari"}
+  :old "    (fs/copy-tree plugin-src (:task-dir ctx) {:replace-existing true})"
+  :new "    (fs/copy-tree plugin-src (fs/path (:task-dir ctx) \"tmp\") {:replace-existing true})"
+  :killed-by "the-plugin-is-generated-into-the-task-folder-and-nothing-is-written-into-the-target-repo"
+  :why "the plugin lands where --plugin-dir does not name it, so the manifest and both components exist and no session loads either"}
 
- {:file "scripts/task_lib.bb"
+  {:file "scripts/task_lib.bb"
   :ns "investigation"
   :old "       \" --disallowedTools mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*\\n\""
   :new "       \" --disallowedTools \\\"mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*\\\"\\n\""
@@ -293,14 +301,6 @@
   :new "                              \"\")]"
   :killed-by "the-second-bar-source-reaches-the-page-and-the-merge-verdict-not-only-the-runner"
   :why "the runner measures a repro bar and writes its evidence, and the one page a human checks never lists the row — recorded, and invisible"}
-
- ;; ------------------------------------- .claude belongs to the target repo
- {:file "scripts/task_lib.bb"
-  :ns "investigation"
-  :old "                  mine (remove tracked files)]]"
-  :new "                  mine files]]"
-  :killed-by "a-file-the-target-repo-tracks-is-never-overwritten"
-  :why "the copy overwrites a file the target repo has checked in — and info/exclude masks only UNTRACKED paths, so it surfaces as a modification in somebody's PR"}
 
  {:file "scripts/run_evidence.bb"
   :ns "investigation"
