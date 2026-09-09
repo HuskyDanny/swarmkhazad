@@ -216,6 +216,41 @@
               :when (str/includes? (str/lower-case (:title p)) "per hour")]
         (is (every? #(str/includes? % "[1h]") (:expr p))
             (str "\"" (:title p) "\" says per hour and must query an hour"))))
+    (testing "no two panels are the same chart wearing a different title"
+      ;; A panel's signature is what it actually asks the database: which
+      ;; metrics, which labels it groups by, over what window, under what label
+      ;; filter. Two panels sharing all four are one chart shown twice, however
+      ;; differently they are worded — and a dashboard grows them quietly,
+      ;; because each one looked reasonable on the day it was added.
+      ;;
+      ;; Same metrics and grouping at a DIFFERENT window is caught too. That
+      ;; pairing is sometimes deliberate (a trend beside a total), but it is
+      ;; the shape a duplicate takes most often, so it has to be argued for
+      ;; rather than accumulated.
+      (let [sig (fn [p]
+                  (let [blob (str/join " " (:expr p))
+                        pull (fn [re] (sort (distinct (map second (re-seq re blob)))))]
+                    ;; re-seq with NO capture group yields the matched STRINGS,
+                    ;; so `map first` here took the first character of each and
+                    ;; every panel signed as (\c) — the guard reported all six
+                    ;; role panels as duplicates of each other. A test that
+                    ;; fails for the wrong reason tests nothing.
+                    {:metrics (sort (distinct (re-seq #"claude_code\.[a-z_.]+" blob)))
+                     :groups (sort (distinct (mapcat #(map str/trim (str/split % #","))
+                                                     (map second (re-seq #"by \(([^)]*)\)" blob)))))
+                     :windows (pull #"\[(\d+[smhd])\]")
+                     :filters (pull #"type[=~!]+\"([^\"]+)\"")}))
+            dupes (->> panels
+                       (group-by sig)
+                       (filter (fn [[_ ps]] (< 1 (count ps))))
+                       (map (fn [[_ ps]] (mapv :title ps))))
+            near (->> panels
+                      (group-by #(dissoc (sig %) :windows))
+                      (filter (fn [[_ ps]] (< 1 (count ps))))
+                      (map (fn [[_ ps]] (mapv :title ps))))]
+        (is (empty? dupes) (str "identical panels: " (pr-str dupes)))
+        (is (empty? near)
+            (str "same metrics and grouping, only the window differs: " (pr-str near)))))
     (testing "the cost levers are charted, not just the totals"
       ;; A total says what was spent. A ratio says what to change.
       ;; Not `includes? "cacheRead"` over the whole dashboard: there are two
