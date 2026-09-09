@@ -11,12 +11,15 @@
 
 (def usage-text
   (str "Usage:\n"
-       "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]\n"
+       "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>] [--investigate]\n"
        "                                                 scaffold goal.md, metrics.md, roles\n"
        "  swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
-       "  swarmkhazad open --linear <KEY> [--repo <path>]...\n"
-       "                                                 scaffold from a Linear issue, then open\n"
+       "  swarmkhazad open --linear <KEY> [--repo <path>]... [--investigate]\n"
+       "                                                 scaffold from a Linear issue, then open;\n"
+       "                                                 --investigate uses the investigate → run lineup\n"
+       "                                                 instead of a single implement role\n"
+       "  swarmkhazad mcp                                serve `add_task` as one MCP tool on stdio\n"
        "  swarmkhazad close <task-id> [--reclaim] [--force]\n"
        "                                                 archive panes, stop the daemon, kill the tmux server;\n"
        "                                                 --reclaim also cleans and removes the worktrees and\n"
@@ -71,6 +74,24 @@
   (->> (partition 2 1 (cons nil args))
        (keep (fn [[f value]] (when (= f flag) value)))))
 
+(def value-flags
+  "Flags that consume the token after them. The set has to be explicit: a
+   positional scan that assumes EVERY flag takes a value swallows the token
+   after a boolean one, so `open --linear K --investigate --repo /p` read `/p`
+   as the task id and scaffolded a task called `/p`."
+  #{"--linear" "--repo"})
+
+(defn positional-args
+  "The bare arguments, with every flag — and the value of a value-taking flag —
+   removed."
+  [args]
+  (loop [[a & more :as all] (vec args) out []]
+    (cond
+      (empty? all) out
+      (value-flags a) (recur (rest more) out)
+      (str/starts-with? a "-") (recur more out)
+      :else (recur more (conj out a)))))
+
 (defn new!
   "Scaffold a task folder. With --linear <KEY> the goal comes from the issue
    instead of the template, and `roles` is one implement role.
@@ -84,6 +105,7 @@
   [task-id args]
   (let [repos (flag-values args "--repo")
         issue-key (first (flag-values args "--linear"))
+        investigate? (boolean (some #{"--investigate"} args))
         ctx (task-lib/task-ctx task-id)]
     (when (fs/exists? (:task-dir ctx))
       (task-lib/fail! (str "task already exists: " (:task-dir ctx))))
@@ -95,10 +117,10 @@
       (fs/create-dirs (:task-dir ctx))
       (spit (str (:metrics-file ctx)) (metrics-template task-id))
       (if issue
-        (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos)
+        (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos investigate?)
             (println (str "linear: " (:identifier issue) " " (:title issue))))
         (do (spit (str (:goal-file ctx)) (goal-template task-id))
-            (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
+            (spit (str (:roles-file ctx)) (task-lib/roles-template repos investigate?))
             (spit (str (:repos-file ctx)) (task-lib/repos-text repos))))
       (println (str (:task-dir ctx))))))
 
@@ -132,12 +154,7 @@
         ;; A flag's VALUE is not the task id. Dropping every `--flag value` pair
         ;; first is the difference between `open --linear MITH-3437` scaffolding
         ;; `mith-3437` and scaffolding a task literally named `MITH-3437`.
-        positional (loop [[a & more :as all] (vec args) out []]
-                     (cond
-                       (empty? all) out
-                       (str/starts-with? a "-") (recur (rest more) out)
-                       :else (recur more (conj out a))))
-        named (first positional)
+        named (first (positional-args args))
         task-id (or named (when issue-key
                             (load-file (str (fs/path script-dir "linear_intake.bb")))
                             ((resolve 'linear-intake/task-id-for) issue-key)))]
@@ -194,6 +211,8 @@
       "delete" (if (second args) (delete! (second args) args) (usage!))
       "smoke" (if (second args) (smoke! (second args)) (usage!))
       "paths" (if (second args) (paths! (second args)) (usage!))
+      "mcp" (do (load-file (str (fs/path script-dir "mcp_gateway.bb")))
+                (apply (resolve 'mcp-gateway/-main) (rest args)))
       "portal" (do (load-file (str (fs/path script-dir "portal.bb")))
                    (apply (resolve 'portal/-main) (rest args)))
       "telemetry" (do (load-file (str (fs/path script-dir "telemetry.bb")))

@@ -153,6 +153,13 @@
     (str
      (section "goal.md" (read-file (:goal-file ctx) file-budget))
      (section "metrics.md" (read-file (:metrics-file ctx) file-budget))
+     ;; The second bar source, beside the first. `evidence-section` below lists
+     ;; the whole evidence directory by filename, so a repro bar's own output
+     ;; already reaches the verdict — and without this the verdict was reading
+     ;; evidence for a bar whose threshold it had never been shown, which is the
+     ;; shape of question a reader answers by guessing.
+     (section "repro.md — the reproduction the investigator named (investigation lane only)"
+              (read-file (:repro-file ctx) file-budget))
      (section "decision.md — what the roles chose, and why" (read-file (:decision-file ctx) file-budget))
      (section "gotcha.md — what tripped them" (read-file (:gotcha-file ctx) file-budget))
      (section "escalation.md — what they say needs a human" (live-escalations ctx))

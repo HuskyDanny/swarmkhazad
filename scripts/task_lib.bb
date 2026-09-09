@@ -176,6 +176,9 @@
      ;; counted as an ask reads as a problem nobody is solving.
      :finding-file (fs/path task-dir "finding.md")
      :evidence-dir (fs/path task-dir "evidence")
+     ;; The second bar source, and the only one a role may write: metrics.md is
+     ;; locked at open, this is not. See run_evidence.bb's header.
+     :repro-file (fs/path task-dir "repro.md")
      :repos-file (fs/path task-dir "repos")
      :worktrees-dir (fs/path task-dir "worktrees")
      :mail-dir (fs/path task-dir "mail")
@@ -183,6 +186,9 @@
      :bin-dir (fs/path task-dir "bin")
      :prompts-dir (fs/path task-dir "prompts")
      :hooks-dir (fs/path task-dir "hooks")
+     ;; The skills and subagents a role can load, generated per task beside its
+     ;; prompts/ and hooks/. See install-agent-home!.
+     :agent-home-dir (fs/path task-dir ".claude")
      :state-dir state-dir
      :roles-tsv (fs/path state-dir "roles.tsv")
      :sessions-tsv (fs/path state-dir "sessions.tsv")
@@ -231,10 +237,44 @@
 (def repos-grammar-comment
   "# one checkout per line; the task branches sk/<task-id> off origin/<default>\n# <abs-path> [branch=<name>]\n")
 
+(def investigation-roles-text
+  "The two-role lineup an investigation task runs: one pane thinks, one pane
+   dispatches a reproduction. Both close at handoff, so a ticket's laptop cost
+   is bounded — that bound is a requirement, not an optimisation.
+
+   The telemetry MCPs are DENIED to the investigator on purpose, and this is the
+   one line that does it. It cannot then gather confirming evidence for its own
+   favourite story; it has to dispatch the hypothesis-tester subagent, which
+   holds those planes and was instructed to refute. Partial by construction —
+   `gh` is a CLI, so `Bash` routes around any MCP denial — and accepted
+   knowingly.
+
+   The model goes on the argv, not in `model=`. `model=` names a VENDOR (a base
+   URL and a keychain service, validated against vendors.tsv), so `model=opus`
+   fails at prepare with `unknown model vendor opus`. `--model` is last-wins in
+   the CLI's own parser, which is what lets a role override a lane's default.
+
+   No quotes around the tool list. The line is split on whitespace here and
+   again in `extra-argv`, and each element becomes one argv slot — so
+   `--disallowedTools \"a,b\"` would reach the CLI as the literal token
+   `\"a,b\"`, quotes included, and deny nothing."
+  (str roles-grammar-comment
+       "investigate claude task --model opus"
+       " --disallowedTools mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*\n"
+       "run claude task --model haiku\n"))
+
 (defn roles-template
-  "A starter `roles` file. Repos are the task's, not a role's — see repos-text."
-  [_repos]
-  (str roles-grammar-comment "implement claude task\n"))
+  "A starter `roles` file: the default single `implement` role, or the
+   investigation lineup. Repos are the task's, not a role's — see repos-text.
+
+   One function with a flag, not two defs. As siblings they forced the identical
+   `(if investigate? … …)` at both scaffold sites (`new!` and
+   `write-from-issue!`), which is two places to edit for every lane after this
+   one."
+  [_repos & [investigate?]]
+  (if investigate?
+    investigation-roles-text
+    (str roles-grammar-comment "implement claude task\n")))
 
 (defn repos-text [repos]
   (str repos-grammar-comment (str/join "" (map #(str % "\n") repos))))
@@ -662,34 +702,43 @@
   [ctx]
   (str "sk/" (:task-id ctx)))
 
-;; ------------------------------------------------------------------ codegraph
+;; ------------------------------------------------- what git must not see
 
-(defn exclude-codegraph!
-  "Teach the source checkout to ignore `.codegraph/`, once.
+(defn exclude-paths!
+  "Teach a checkout to ignore the paths the swarm writes inside it, once each.
 
-   The index directory carries its own `.gitignore`, which hides the database
-   but not the directory itself: `git status --porcelain` still reports
-   `?? .codegraph/` (RAN). Three readers take that for work in progress — the
-   summary's `uncommitted:` block, the judge's git-status section, and the
-   runtime stamp's `dirty` field — so an unexcluded index makes every task look
-   dirty from the moment it opens.
+   Two callers, one rule. `.codegraph/` carries its own `.gitignore`, which
+   hides the database but not the directory itself: `git status --porcelain`
+   still reports `?? .codegraph/` (RAN). Three readers take that for work in
+   progress — the summary's `uncommitted:` block, the judge's git-status
+   section, and the runtime stamp's `dirty` field — so an unexcluded index makes
+   every task look dirty from the moment it opens. The generated skill and
+   subagent are the same problem with a worse ending: a role running
+   `git add -A` would commit swarm scaffolding into the target repo.
 
    `info/exclude` lives in the COMMON git dir, which every linked worktree of a
    checkout shares (RAN: a worktree's --git-common-dir resolves to the source's
    .git, and a `.codegraph/` written inside that worktree then reports clean).
    So one append covers every worktree this repo will ever have, and it stays
-   local to the machine rather than becoming a diff in the repo."
-  [src]
+   local to the machine rather than becoming a diff in the repo.
+
+   That sharing is also why the agent-home entries are exact FILE paths rather
+   than `.claude/agents/`: the operator's own checkout reads the same file, and
+   `.claude/` is legitimately tracked in these repos. Excluding a directory
+   there would silently hide a new `.claude/` file the operator wrote by hand."
+  [src patterns]
   (let [raw (git src "rev-parse" "--git-common-dir")
         common (if (fs/absolute? raw) (fs/path raw) (fs/path src raw))
         exclude (fs/path common "info" "exclude")
-        current (if (fs/regular-file? exclude) (slurp (str exclude)) "")]
-    (when-not (some #{".codegraph/"} (map str/trim (str/split-lines current)))
+        current (if (fs/regular-file? exclude) (slurp (str exclude)) "")
+        present (set (map str/trim (str/split-lines current)))
+        missing (remove present patterns)]
+    (when (seq missing)
       (fs/create-dirs (fs/parent exclude))
       (spit (str exclude)
             (str current
                  (when-not (or (str/blank? current) (str/ends-with? current "\n")) "\n")
-                 ".codegraph/\n")))))
+                 (str/join "" (map #(str % "\n") missing)))))))
 
 (defn index-worktree!
   "Build a codegraph index INSIDE the worktree, so a role's structural reads
@@ -787,7 +836,7 @@
     ;; queueing. The exclude comes first for each: an index built before its
     ;; checkout ignores it shows up as `?? .codegraph/` in the next status read.
     (await-indexes! (mapv (fn [{:keys [source path]}]
-                            (exclude-codegraph! source)
+                            (exclude-paths! source [".codegraph/"])
                             (index-worktree! path))
                           worktrees))
     ;; The sha the branch started from IS the task's base. Keep it, so no later
@@ -814,6 +863,70 @@
     (when-not (fs/regular-file? f)
       (throw (ex-info (str "task is missing " (fs/file-name f) ": " f) {})))))
 
+;; ------------------------------------------------------------- agent home
+
+(def agent-home-src
+  "The skills and subagents this repo ships to every task it opens. One tree in
+   the repo, copied per task — not a path each reader spells for itself."
+  (fs/path (fs/parent (fs/parent (fs/absolutize *file*))) "agent-home" ".claude"))
+
+(defn agent-home-files
+  "Every file the agent home holds, as a path relative to the worktree root —
+   `.claude/agents/investigation-hypothesis-tester.md`. Derived from the tree
+   rather than listed, so adding a skill needs no second edit here."
+  []
+  (when (fs/directory? agent-home-src)
+    (let [root (fs/parent agent-home-src)]
+      (->> (fs/glob agent-home-src "**")
+           (filter fs/regular-file?)
+           (map #(str (fs/relativize root %)))
+           sort
+           vec))))
+
+(defn install-agent-home!
+  "Copy the repo's agent home into the task folder AND into every worktree.
+
+   Both, because they answer different questions. The task folder's copy is the
+   canonical one — one tree per task, beside prompts/ and hooks/. The worktree
+   copies are the ones a role can actually LOAD: RAN, with a spec at
+   `<task>/.claude/agents/sk-probe-agent.md` and cwd `<task>/worktrees/foo`, a
+   `claude -p` asked to list its subagent types returned 22 and not that one;
+   the identical file inside that worktree made it appear. A parent directory's
+   `.claude` is not a load path.
+
+   **A file the target repo TRACKS is never written.** `.claude/` is not ours:
+   RAN, `git -C ~/repos/mithra_ai/lothlorien ls-files '.claude/*'` lists 80+
+   files, `.claude/settings.json`, `.claude/hooks/*` and `.claude/skills/*/SKILL.md`
+   among them, and minas-tirith tracks `.claude/agents/*.md`. Nothing collides
+   today, but a rename on either side would have `:replace-existing true`
+   overwrite a checked-in file — and `info/exclude` masks only UNTRACKED paths,
+   so the damage would show up as a modification in someone's PR. So each file
+   is copied individually and a tracked destination is skipped and reported.
+
+   Idempotent, and each worktree copy is excluded from git per file. See
+   escalation.md for the `--plugin-dir` shape that would stop writing into a
+   target repo at all."
+  [ctx worktrees]
+  (when-let [files (seq (agent-home-files))]
+    (fs/create-dirs (:agent-home-dir ctx))
+    (fs/copy-tree agent-home-src (:agent-home-dir ctx) {:replace-existing true})
+    (doseq [path worktrees
+            :when (and path (fs/directory? path))
+            :let [tracked (set (remove str/blank?
+                                       (str/split-lines
+                                        (or (git path "ls-files" "--" ".claude") ""))))
+                  mine (remove tracked files)]]
+      (doseq [rel mine
+              :let [dest (fs/path path rel)]]
+        (fs/create-dirs (fs/parent dest))
+        (fs/copy (fs/path (fs/parent agent-home-src) rel) dest {:replace-existing true}))
+      (doseq [rel (filter tracked files)]
+        (binding [*out* *err*]
+          (println (str "swarmkhazad: " (fs/file-name path) " tracks " rel
+                        " — left alone, so that role loads the repo's own copy"))))
+      (exclude-paths! path mine))
+    files))
+
 (defn create-layout! [ctx]
   (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
              :evidence-dir :board-dir :daemon-dir :sessions-dir]]
@@ -834,6 +947,7 @@
     ;; at the empty ones, which is how a resume loses a day of work.
     (let [rows (read-sessions-tsv ctx)]
       (create-layout! ctx)
+      (install-agent-home! ctx (keep :worktree-path rows))
       (prepare-mail-dirs! ctx rows)
       (write-sessions-tsv! ctx rows)
       {:task-id (:task-id ctx)
@@ -848,6 +962,7 @@
       (create-layout! ctx)
       (let [worktrees (prepare-worktrees! ctx repos)
             rows (sessions ctx roles repos role->repos)]
+        (install-agent-home! ctx (map :path worktrees))
         (prepare-mail-dirs! ctx rows)
         (write-sessions-tsv! ctx rows)
         {:task-id (:task-id ctx)

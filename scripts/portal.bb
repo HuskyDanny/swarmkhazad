@@ -115,8 +115,19 @@
         {:exit (get headers "exit") :at (get headers "started_at")
          :tail (str/join "\n" (take-last 6 (str/split-lines (or out head))))}))))
 
-(defn bars-with-evidence [ctx]
-  (for [bar (run-evidence/bars ctx (or (text (:metrics-file ctx)) ""))]
+(defn bars-with-evidence
+  "Every bar the runner will measure, with its evidence file.
+
+   BOTH bar sources, in the same order `measure-all!` reads them — the page has
+   to show what the runner ran, and the runner reads `repro.md` too. Passing
+   metrics.md alone measured a repro bar, wrote its `evidence/<bar>.txt`, and
+   then omitted the row from the one page a human checks: invisible evidence for
+   a bar nobody could see was declared. Same argument order matters, because
+   that is what makes the two agree on `<bar>-2` when a name repeats."
+  [ctx]
+  (for [bar (run-evidence/bars ctx
+                              (or (text (:metrics-file ctx)) "")
+                              (or (text (:repro-file ctx)) ""))]
     (assoc bar :evidence (evidence-for ctx (:id bar)))))
 
 (defn count-files [dir]

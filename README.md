@@ -155,12 +155,14 @@ Nothing else may resolve a base by guessing. Where the pin is absent (a task ope
 ## Commands
 
 ```
-swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>]
+swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>] [--investigate]
                                                scaffold goal.md, metrics.md, roles
 swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv — no agents yet
 swarmkhazad open <task-id>                     prepare, then spawn exactly the declared roles
-swarmkhazad open --linear <KEY> [--repo <path>]...
-                                               scaffold from a Linear issue, then open
+swarmkhazad open --linear <KEY> [--repo <path>]... [--investigate]
+                                               scaffold from a Linear issue, then open; --investigate
+                                               uses the investigate → run lineup instead of implement
+swarmkhazad mcp                                serve `add_task` as one MCP tool on stdio
 swarmkhazad close <task-id> [--reclaim] [--force]
                                                archive panes, stop the daemon, kill the tmux server;
                                                --reclaim also cleans and removes the worktrees and
@@ -219,7 +221,11 @@ Grading used to run on every `Stop`. Measured on a real task: the same role grad
 
 ### Run-stage evidence
 
-The `run` role does not judge; it measures. `run_evidence.bb`, run from its worktree, executes the repo's own test command (detected from the worktree: `package.json` → `npm test`, or the lockfile's manager running that same script — `pnpm`/`yarn`/`bun run test`, never `bun test`, which is Bun's own runner and fails a Vitest suite outright; `bb.edn` → `bb test`, `pyproject.toml` → `pytest`, `go.mod`, `Cargo.toml`, a `Makefile` `test:` target) and every `measure:` command in `metrics.md`'s Quantitative section (`- <name> — bar: <threshold> — measure: \`<command>\``; `<id>` and `<task-id>` in a command become the task id, `<task-dir>` the task folder). Each lands as `evidence/<bar>.txt` with the command, cwd, threshold, start time, duration, exit code and the interleaved output (clipped at 64 KiB; a command past the 20-minute timeout records exit 124). The goal judge reads every file in `evidence/` when it grades, so a bar is met when its file says so. Local only: `SWARMKHAZAD_RUN_REMOTE` is the seam for a later remote runner and refuses to run while set.
+The `run` role does not judge; it measures. `run_evidence.bb`, run from its worktree, executes the repo's own test command (detected from the worktree: `package.json` → `npm test`, or the lockfile's manager running that same script — `pnpm`/`yarn`/`bun run test`, never `bun test`, which is Bun's own runner and fails a Vitest suite outright; `bb.edn` → `bb test`, `pyproject.toml` → `pytest`, `go.mod`, `Cargo.toml`, a `Makefile` `test:` target) and every `measure:` command in `metrics.md`'s Quantitative section (`- <name> — bar: <threshold> — measure: \`<command>\``; `<id>` and `<task-id>` in a command become the task id, `<task-dir>` the task folder). Each lands as `evidence/<bar>.txt` with the command, cwd, threshold, start time, duration, exit code and the interleaved output (clipped at 64 KiB; a command past the 20-minute timeout records exit 124). The goal judge reads every file in `evidence/` when it grades, so a bar is met when its file says so. (`SWARMKHAZAD_RUN_REMOTE` was the seam for a later remote runner and used to refuse to run while set. The runner exists, a bar opts in per line, and the variable now only prints a notice saying so.)
+
+There are **two bar sources**, both in the same grammar. `metrics.md` is the task's contract and is `chmod 444` from the moment the swarm opens, so a role cannot author a bar for its own task — which is the point. `repro.md`, when it exists, is the one bar a role IS allowed to write, and it exists for the investigation lane: naming the command that reproduces a bug is the investigator's deliverable and cannot be known when the task is written. Names are uniqued across both files, so a repro bar sharing a name with a metrics bar gets `<bar>-2.txt` rather than overwriting the other's evidence.
+
+A bar whose `measure:` opens with **`@cloud`** is service-level and does not run on the laptop. `run_evidence.bb` dispatches it to the self-hosted environment the project names (`SWARMKHAZAD_CLOUD_ENV` overrides it once), and records `exit: pending` — never 0, because a bar is not met by having been sent somewhere. The dispatch is one-way: there is no read-back from the CLI, and `--teleport` migrates the session onto this machine, which is the one thing a cloud tier exists to prevent. So the runner reports by **commenting**, and the bar says where: `— ticket: <KEY>` sends it to a Linear ticket, and with no ticket it needs an open PR for the branch. The PR was never a precondition for execution — it is the return channel — which is exactly why a ticket can stand in for it. A bar may also name its own `— origin:` and `— branch:`, which win over the worktree's; the investigation lane reproduces on `main` from a task branch that carries no code, and deriving the target from the checkout would verify the one branch certain not to have the bug. A dispatch with no environment, an origin outside `MithraAI`, or no return channel at all records `exit: blocked` and says which.
 
 `swarmkhazad smoke <task-id>` proves each declared role callable without a swarm: in parallel, it runs each role's shim in print mode with the role's prompt, asking it to read `goal.md`, write a note draft addressed to itself and run `swarm_handoff.bb`; it reports per role the exit code, whether the note reached the outbox, the model the run reported (checked against the vendor's pin — another model is a collision, not a pass), cost and turns. The smoke notes are removed afterwards.
 
@@ -271,6 +277,73 @@ Three things it refuses to do. A check that has failed on two commits in a row �
 `swarmkhazad open --linear MITH-3437` (or `new --linear`) writes the task from the issue: the title becomes the heading, each acceptance or "Done when" line becomes one unticked `Goal` checkbox, the description is kept whole under `## From the issue`, the issue URL is the first Hint, and `roles` is one `implement` role (one per `--repo`, else `none`). `Not-goal` is left for the operator — intake never invents one. With no task id given, the id is the issue key lowercased.
 
 The fetch is a headless `claude -p` with exactly one MCP server and exactly one tool (`mcp__linear-server__get_issue`), schema-forced to `{found, identifier, title, description, url, state, acceptance}`. There is no Linear API key of our own and no second auth path: the operator's own Linear MCP config is the credential. A fetch that does not return the issue — missing, forbidden, the wrong issue, a dead server — fails before the task folder is created, so a retry is not blocked by a half-scaffolded task. An existing task folder is opened as it stands; intake never overwrites a goal someone has edited.
+
+## The investigation lane
+
+A Linear ticket with no `Evidence` label becomes a two-pane task: one pane thinks, one pane dispatches a reproduction. The ticket is the only shared surface, and two mutually-exclusive Linear label groups carry the state.
+
+```
+loop session       investigate (opus)      run (haiku)      cloud runner     Linear
+     │                     │                    │                 │            │
+     │─ poll: no Evidence group ─────────────────────────────────────────────▶ │
+     │◀ ticket + repo: label ───────────────────────────────────────────────── │
+     │─ MCP add_task{key} ─▶  open: both panes spawn                           │
+     │                     │ 3–5 hypotheses, telemetry MCPs DENIED             │
+     │                     │─ testers (sonnet) ─▶ REBUTTED / CONFIRMED         │
+     │                     │─ note.bb ─▶ finding.md                            │
+     │                     │─ RCA comment + Evidence: found│none ────────────▶ │
+     │                     │─ repro.md + handoff ─▶                            │
+     │                       Evidence: none  ─▶ │─ Repro: no (reason) ───────▶ │
+     │                       Evidence: found ─▶ │─ dispatch @cloud ─▶│         │
+     │                                          │  exit: pending, task closes  │
+     │                                                               │─ comment ─▶
+     │◀ poll: runner comment ───────────────────────────────────────────────── │
+     │─ Repro: yes│no ──────────────────────────────────────────────────────▶ │
+```
+
+Linear enforces exclusivity inside a label group, so a role **cannot** set both outcomes of a phase. Absence of a group means that phase never ran, which is how a crashed lane is told apart from a negative result — and it is why groups were chosen over flat labels.
+
+| group | labels | question answered |
+|---|---|---|
+| `Evidence` | `Evidence: found` / `Evidence: none` | did a hypothesis survive with evidence |
+| `Repro` | `Repro: yes` / `Repro: no` | did the named command reproduce it |
+
+| Evidence | Repro | means | the loop does |
+|---|---|---|---|
+| — | — | not investigated | open a lane |
+| found | — | dispatched, waiting | read the runner's comment |
+| found | yes | real, reproducible | leave it — the fix task does not exist yet, so this state IS the queue |
+| found | no | real, the swarm cannot verify it | surface to Allen |
+| none | no | no cause found | terminal |
+
+**Two properties the whole design turns on.** Reproduction is the anti-flake gate — a ticket is worth acting on when the behaviour it describes can be made to happen again. And **every label comes from a runner-produced artifact, never a role's claim**: the investigator NAMES the repro command, the runner RECORDS the outcome, and a third party (the loop session) writes the label. No role sets both halves of that, in any code path.
+
+**The roles.** `--investigate` writes this lineup:
+
+```
+investigate claude task --model opus --disallowedTools mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*
+run claude task --model haiku
+```
+
+The model goes on the argv because `model=` names a VENDOR — a base URL and a keychain service — so `model=opus` fails at prepare with `unknown model vendor opus`. And the tool list carries **no quotes**: a `roles` line is whitespace-split and each token becomes one argv slot, so `--disallowedTools "a,b"` reaches the CLI as the literal token `"a,b"` and denies nothing.
+
+Denying the parent its telemetry is deliberate and is stronger than khazad, which grants the parent everything. The investigator then cannot gather confirming evidence for its own favourite story — it has to dispatch the `investigation-hypothesis-tester` subagent, which holds `logfire`/`datadog`/`argocd` and was instructed to refute. Partial, and knowingly so: `gh` is a CLI, so `Bash` routes around any MCP denial. The tester has no write tools at all, so the parent calling `note.bb` per returned verdict is the only route by which a clue reaches `finding.md`.
+
+**The skill and the subagent are generated per task**, from `agent-home/.claude/` in this repo, into `<task>/.claude/` *and* into every worktree. Both, because a parent directory's `.claude` is **not** a load path: RAN, a spec at `<task>/.claude/agents/x.md` with cwd `<task>/worktrees/foo` was absent from the session's subagent list, and the identical file at `<task>/worktrees/foo/.claude/agents/x.md` appeared in it. The worktree copies are excluded from git per exact file path in the checkout's shared `info/exclude`, so a role running `git add -A` cannot commit swarm scaffolding into the target repo — and per file rather than per directory, because that exclude file is shared with the operator's own checkout, where `.claude/` is legitimately tracked.
+
+**The loop session.** One long-lived `cc_loop` session, its prompt in `prompts/investigation-loop.prompt` — poll query, the `repo:` label → checkout mapping, the attempt cap, and how `Repro:` is read off the runner's comment. It reaches swarmkhazad through one MCP tool:
+
+```
+swarmkhazad mcp        # JSON-RPC 2.0 on stdio, one tool: add_task{issue_key, repo, investigate}
+```
+
+One tool, not five. `close`, `paths` and the rest are reachable from the terminal and the portal already, and every one added there is another thing an unattended session can do at 3am. `add_task` does no work of its own — it runs `swarmkhazad open --linear <KEY>`, the same path a human uses, so the ticket arrives through the verbatim fetch above and `goal.md` is provably the issue's own text rather than a session's paraphrase. It validates the issue key before that string becomes an argv element and then a task id.
+
+`repo` is required in practice. A repo-less task is refused (RAN: an empty `repos` file exits 1 with `repos declaration is empty`; no `repos` file exits 1 with `task is missing repos`), because every role's session is opened in a worktree — so the ticket's `repo:` label has to map to a real checkout.
+
+**Attempt cap: two, then `Blocked`.** A crash leaves NO `Evidence` label, which is exactly the state the poll selects for, so without the cap a ticket whose investigate pane dies on launch is re-opened forever. The loop counts its own one-line attempt comments on the ticket, and reuses the workspace's existing `swarm-created` label rather than minting a parallel marker.
+
+Not in scope, deliberately: the **fix-task scaffolding** — `Evidence: found` + `Repro: yes` terminates in a queue rather than an action — and **creating the two label groups**, which is a manual step in the Linear UI.
 
 ## Telemetry
 
