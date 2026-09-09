@@ -137,6 +137,185 @@
   :killed-by "the-check-can-see-an-offender"
   :why "the schema gate scans zero files and passes on any repo at all"}
 
+ ;; ---------------------------------------------- the investigation lane
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "(bars ctx metrics-md repro-md)"
+  :new "(bars ctx metrics-md)"
+  :killed-by "repro-md-is-a-second-bar-source-and-the-ticket-replaces-the-pull-request"
+  :why "repro.md stops being a bar source, and the one bar the investigator is allowed to author never runs"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "      (and (nil? ticket) (nil? pr))"
+  :new "      (nil? pr)"
+  :killed-by "repro-md-is-a-second-bar-source-and-the-ticket-replaces-the-pull-request"
+  :why "the PR precondition comes back unconditionally, refusing every investigation — whose deliverable is an RCA and never a PR"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "      (and (nil? ticket) (nil? pr))\n"
+  :new "      false\n"
+  :killed-by "a-bar-with-neither-a-ticket-nor-a-pull-request-is-blocked-and-not-sent"
+  :why "a bar with no return channel at all dispatches anyway, and a cloud runner that verifies a bar and can post nowhere has burned an environment for nothing"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "              id (first (remove seen (cons base (map #(str base \"-\" %) (iterate inc 2)))))]"
+  :new "              id base]"
+  :killed-by "a-repro-bar-sharing-a-name-with-a-metrics-bar-gets-its-own-evidence-file"
+  :why "two bars with one name share one evidence file, so the second writer silently becomes the task's answer for the first bar"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "  (let [where (if ticket (str \"Linear ticket \" ticket) (str \"PR #\" pr))]"
+  :new "  (let [where (str \"PR #\" pr)]"
+  :killed-by "repro-md-is-a-second-bar-source-and-the-ticket-replaces-the-pull-request"
+  :why "the brief sends the runner to comment on PR #null, so its findings land nowhere and the lane waits forever"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "(or (not-empty (str/trim (str (:origin bar))))"
+  :new "(or nil"
+  :killed-by "a-repro-bar-may-name-the-origin-and-branch-the-worktree-is-not-on"
+  :why "the bar's own origin is ignored, so the runner clones whatever repo the task's worktree happens to be"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "          (str/replace #\"^git@github\\.com:\" \"https://github.com/\")"
+  :new "          (str/replace #\"^zzznever:\" \"https://github.com/\")"
+  :killed-by "a-repro-bar-may-name-the-origin-and-branch-the-worktree-is-not-on"
+  :why "a bar's origin in SSH form never becomes https, so the owner parses as nil and a correct line is refused with a message about the owner"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "        branch (or bar-branch (git-out worktree \"rev-parse\" \"--abbrev-ref\" \"HEAD\"))"
+  :new "        branch (git-out worktree \"rev-parse\" \"--abbrev-ref\" \"HEAD\")"
+  :killed-by "a-repro-bar-may-name-the-origin-and-branch-the-worktree-is-not-on"
+  :why "the reproduction runs on the task branch, which carries no code — the one branch certain not to have the bug"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "      (doseq [rel mine\n              :let [dest (fs/path path rel)]]"
+  :new "      (doseq [rel nil\n              :let [dest (fs/path path rel)]]"
+  :killed-by "the-skill-and-the-subagent-are-generated-into-the-task-folder-and-into-every-worktree"
+  :why "only the task folder gets the agent home, and a parent directory's .claude is not a load path — so the skill and subagent exist and nothing reads them"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "        missing (remove present patterns)]"
+  :new "        missing patterns]"
+  :killed-by "a-re-prepare-neither-duplicates-the-excludes-nor-clobbers-a-claude-the-repo-owns"
+  :why "every prepare appends the same patterns again, so a checkout resumed a dozen times carries a dozen copies — and `open` IS the resume path"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "      (exclude-paths! path mine))"
+  :new "      (identity path))"
+  :killed-by "the-skill-and-the-subagent-are-generated-into-the-task-folder-and-into-every-worktree"
+  :why "the generated files show as untracked in the target checkout, so a role running `git add -A` commits swarm scaffolding into istari"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "       \" --disallowedTools mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*\\n\""
+  :new "       \" --disallowedTools \\\"mcp__logfire__*,mcp__datadog-mcp__*,mcp__argocd__*\\\"\\n\""
+  :killed-by "the-investigation-lineup-denies-the-parent-its-telemetry-and-quotes-nothing"
+  :why "the quoted list reaches the CLI with its quotes, matching no tool — the investigator keeps the telemetry it was supposed to be denied, and can confirm its own favourite story"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "investigation"
+  :old "      (value-flags a) (recur (rest more) out)\n      (str/starts-with? a \"-\") (recur more out)"
+  :new "      (str/starts-with? a \"-\") (recur (rest more) out)"
+  :killed-by "a-boolean-flag-does-not-swallow-the-token-after-it"
+  :why "a boolean flag eats the token after it, so `open --linear K --investigate --repo /p` scaffolds a task called `/p`"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "investigation"
+  :old "  (let [notification? (nil? id)]"
+  :new "  (let [notification? false]"
+  :killed-by "the-gateway-exposes-one-tool-validates-the-key-and-never-answers-a-notification"
+  :why "a notification gets a reply nobody is waiting for, which lands on the next request's read and desynchronises the stream"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "investigation"
+  :old "      (not (linear-intake/valid-issue-key? issue_key))"
+  :new "      (not (string? issue_key))"
+  :killed-by "the-gateway-exposes-one-tool-validates-the-key-and-never-answers-a-notification"
+  :why "whatever a model puts in issue_key becomes an argv element and then a task id, with no shape check in front of it"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "investigation"
+  :old "        bad (remove #(and (string? %) (str/starts-with? % \"/\")) repos)]"
+  :new "        bad nil]"
+  :killed-by "the-gateway-exposes-one-tool-validates-the-key-and-never-answers-a-notification"
+  :why "a repo of `--investigate` is read as a flag rather than as `--repo`'s value, and a relative one resolves against whatever directory the server was started in"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "investigation"
+  :old "      (> (count repos) max-repos)"
+  :new "      (> (count repos) 9999)"
+  :killed-by "the-gateway-exposes-one-tool-validates-the-key-and-never-answers-a-notification"
+  :why "a repo list a model got wrong builds a worktree and a codegraph index per entry"}
+
+ ;; ------------------------------------- the origin the runner is sent to
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "  #\"https://github\\.com/MithraAI/[A-Za-z0-9._-]+\")"
+  :new "  #\".*/MithraAI/.*\")"
+  :killed-by "an-origin-the-runner-cannot-reach-is-refused-by-the-whole-url-not-by-a-path-segment"
+  :why "the guard stops looking at the HOST, so https://attacker.example/MithraAI/anything is cloned and run in the operator's credentialed cloud environment — the bug this shape replaced"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "      (not (re-matches reachable-origin-re (str origin)))"
+  :new "      (not (re-find reachable-origin-re (str origin)))"
+  :killed-by "an-origin-the-runner-cannot-reach-is-refused-by-the-whole-url-not-by-a-path-segment"
+  :why "unanchored, so any URL that merely CONTAINS a reachable repo passes — a redirector with it in the query string included"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "      (and bar-branch (not (re-matches #\"[A-Za-z0-9._/-]{1,200}\" bar-branch)))"
+  :new "      (and false bar-branch)"
+  :killed-by "a-branch-or-ticket-that-is-not-a-name-is-refused-before-it-reaches-the-runners-shell"
+  :why "a role-authored branch name reaches `git checkout` in the runner's own shell unchecked"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "      (and ticket (not (re-matches #\"[A-Za-z][A-Za-z0-9]*-[0-9]+\" ticket)))"
+  :new "      (and false ticket)"
+  :killed-by "a-branch-or-ticket-that-is-not-a-name-is-refused-before-it-reaches-the-runners-shell"
+  :why "the ticket IS the return channel, so a malformed one dispatches a run whose findings land nowhere"}
+
+ ;; ------------------------------------- the second bar source, everywhere
+ {:file "scripts/portal.bb"
+  :ns "investigation"
+  :old "                              (or (text (:repro-file ctx)) \"\"))]"
+  :new "                              \"\")]"
+  :killed-by "the-second-bar-source-reaches-the-page-and-the-merge-verdict-not-only-the-runner"
+  :why "the runner measures a repro bar and writes its evidence, and the one page a human checks never lists the row — recorded, and invisible"}
+
+ ;; ------------------------------------- .claude belongs to the target repo
+ {:file "scripts/task_lib.bb"
+  :ns "investigation"
+  :old "                  mine (remove tracked files)]]"
+  :new "                  mine files]]"
+  :killed-by "a-file-the-target-repo-tracks-is-never-overwritten"
+  :why "the copy overwrites a file the target repo has checked in — and info/exclude masks only UNTRACKED paths, so it surfaces as a modification in somebody's PR"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "investigation"
+  :old "                 ignored (when-not (cloud-bar? bar)\n                           (seq (filter bar [:ticket :origin :branch])))"
+  :new "                 ignored nil"
+  :killed-by "a-cloud-only-field-on-a-local-bar-is-reported-rather-than-silently-ignored"
+  :why "a local bar's `ticket:`/`branch:` is a line the author believed and nothing honoured, with nothing anywhere saying so"}
+
+ {:file "scripts/summary.bb"
+  :ns "investigation"
+  :old "     (section \"repro.md — the reproduction the investigator named (investigation lane only)\"\n              (read-file (:repro-file ctx) file-budget))"
+  :new "     \"\""
+  :killed-by "the-second-bar-source-reaches-the-page-and-the-merge-verdict-not-only-the-runner"
+  :why "the merge verdict reads a repro bar's evidence file without ever being shown the bar's own threshold"}
+
  ;; ---------------------------------------------- the daemon's own exit
  {:file "scripts/handoffd.bb"
   :ns "base"

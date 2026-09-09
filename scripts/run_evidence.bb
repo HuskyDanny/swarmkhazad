@@ -3,8 +3,9 @@
 ;; run_evidence.bb — the run role's one job: measurements, not opinions.
 ;;
 ;; From the role's worktree it executes the repo's own test command and every
-;; `measure:` command in metrics.md's Quantitative section, and writes one file
-;; per bar under <task>/evidence/:
+;; `measure:` command in the task's bar sources — metrics.md's Quantitative
+;; section, and `repro.md` when one exists — and writes one file per bar under
+;; <task>/evidence/:
 ;;
 ;;   bar: <name>            command: <cmd>      cwd: <worktree>
 ;;   threshold: <bar text>  started_at: <ts>    duration_ms: <n>
@@ -20,6 +21,12 @@
 ;; whose measure starts with `@cloud` is the other kind: spin the service up and
 ;; show the behaviour, which does not fit on a laptop shared with every other
 ;; task. Those dispatch to the operator's self-hosted environment.
+;;
+;; `repro.md` is the second bar source and it exists because metrics.md is
+;; LOCKED r--r--r-- from the moment the swarm opens: the investigation lane's
+;; investigator has to name the command that reproduces the bug it just
+;; diagnosed, and it cannot edit the contract to do so. Same grammar, one extra
+;; file, and a bar there may name its own `ticket:`, `origin:` and `branch:`.
 ;;
 ;; The dispatch is one-way ON PURPOSE. There is no read-back from the CLI (RAN:
 ;; `claude logs <cloud session>` answers "No job matching", and `claude agents
@@ -72,7 +79,14 @@
    a bar is still a bar — someone has to run it and write the evidence — so it
    is returned rather than dropped. Dropping it made two of a brief's seven bars
    vanish from the page while sitting in metrics.md, which is the worst place
-   for an acceptance criterion to be: recorded, and invisible."
+   for an acceptance criterion to be: recorded, and invisible.
+
+   `ticket:`, `origin:` and `branch:` are the same `— key: value` shape and are
+   read by the @cloud tier only. They exist for the investigation lane, whose
+   reproduction has to run against a named repo and branch and report onto a
+   Linear ticket instead of a PR. Three named fields rather than a bag: the
+   grammar stays something a person can read off one line, and a typo in a
+   fourth key is a typo, not a silently-ignored instruction."
   [line]
   (let [body (subs line 2)
         [head & rest] (str/split body #"\s+—\s+")
@@ -89,6 +103,9 @@
        :repos (mapv #(subs % 1) (filter tag? tokens))
        :threshold (get fields "bar")
        :measure measure
+       :ticket (get fields "ticket")
+       :origin (get fields "origin")
+       :branch (get fields "branch")
        :command (some->> measure (re-find #"`([^`]+)`") second)})))
 
 (defn substitute [command ctx]
@@ -98,10 +115,15 @@
       (str/replace "<task-dir>" (str (:task-dir ctx)))))
 
 (defn bars
-  "Every Quantitative bar, names made unique. A bar whose measure is prose comes
-   back with a nil :command; callers that run things check for it."
-  [ctx metrics-md]
-  (let [parsed (keep parse-bar (quantitative-lines metrics-md))]
+  "Every Quantitative bar across the given sources, names made unique. A bar
+   whose measure is prose comes back with a nil :command; callers that run
+   things check for it.
+
+   Variadic because a task has more than one bar source (see the header). The
+   uniquing has to span all of them, or a repro bar sharing a name with a
+   metrics bar would overwrite its evidence file."
+  [ctx & metrics-mds]
+  (let [parsed (mapcat #(keep parse-bar (quantitative-lines (str %))) metrics-mds)]
     (loop [todo parsed seen #{} out []]
       (if-let [b (first todo)]
         (let [base (slug (:name b))
@@ -165,41 +187,98 @@
   (str/starts-with? (str/triml (str (:measure bar))) cloud-marker))
 
 (defn cloud-brief
-  "What the runner is told. Repo, branch and PR are passed explicitly: the
-   runner clones from origin into its own workspace and cuts its own branch, so
-   nothing about this worktree reaches it implicitly."
-  [{:keys [origin branch pr]} bar]
-  (str "You are the run role of a swarmkhazad task, on the self-hosted environment.\n\n"
-       "Repo:   " origin "\n"
-       "Branch: " branch "\n"
-       "PR:     #" pr "\n\n"
-       "Check out that branch and verify this ONE bar at the service level — start the\n"
-       "thing and drive it, do not settle for a green unit suite:\n\n"
-       "  bar:     " (:name bar) "\n"
-       (when (:threshold bar) (str "  passes:  " (:threshold bar) "\n"))
-       "  measure: " (str/triml (subs (str/triml (str (:measure bar))) (count cloud-marker))) "\n\n"
-       "Then post ONE comment on PR #" pr " with what you observed: what you ran, what\n"
-       "happened, and the screenshots. Say plainly whether the bar is met. That comment\n"
-       "is the only way your findings reach the task — nothing here can read your\n"
-       "session — so a run that verifies the bar and posts nothing has failed.\n\n"
-       "Do not merge. Do not push to main. Do not modify the branch."))
+  "What the runner is told. Repo, branch and the return channel are passed
+   explicitly: the runner clones from origin into its own workspace and cuts its
+   own branch, so nothing about this worktree reaches it implicitly.
+
+   The return channel is a PR comment or a Linear comment, and which one is the
+   only difference between the two tiers. The PR was never a precondition for
+   EXECUTION — it is where the findings land — which is exactly why a ticket can
+   stand in for it. On the investigation lane the ticket is already the shared
+   surface: the investigator commented its RCA there and the loop session reads
+   the runner's reply to decide the `Repro` label."
+  [{:keys [origin branch pr ticket]} bar]
+  (let [where (if ticket (str "Linear ticket " ticket) (str "PR #" pr))]
+    (str "You are the run role of a swarmkhazad task, on the self-hosted environment.\n\n"
+         "Repo:   " origin "\n"
+         "Branch: " branch "\n"
+         (if ticket (str "Ticket: " ticket "\n") (str "PR:     #" pr "\n")) "\n"
+         "Check out that branch and verify this ONE bar at the service level — start the\n"
+         "thing and drive it, do not settle for a green unit suite:\n\n"
+         "  bar:     " (:name bar) "\n"
+         (when (:threshold bar) (str "  passes:  " (:threshold bar) "\n"))
+         "  measure: " (str/triml (subs (str/triml (str (:measure bar))) (count cloud-marker))) "\n\n"
+         "Then post ONE comment on " where " with what you observed: what you ran, what\n"
+         "happened, and the screenshots. Say plainly whether the bar is met. That comment\n"
+         "is the only way your findings reach the task — nothing here can read your\n"
+         "session — so a run that verifies the bar and posts nothing has failed.\n\n"
+         (when ticket
+           (str "State the OUTCOME, and only the outcome: did the command reproduce the\n"
+                "behaviour the bar describes, yes or no, and paste the decisive output. The\n"
+                "label on that ticket is set from your comment by a session that was not in\n"
+                "the room — so \"it reproduces\" with nothing quoted is not an answer.\n\n"))
+         "Do not merge. Do not push to main. Do not modify the branch.")))
 
 (defn git-out [worktree & args]
   (let [r (apply process/sh {:dir (str worktree)} "git" args)]
     (when (zero? (:exit r)) (str/trim (:out r)))))
 
+(defn normalize-origin
+  "A remote URL as the runner needs it: https form, no `.git`.
+
+   Applied to the BAR's origin as well as the worktree's, and that is the point
+   of pulling it out. Normalising only the derived one meant a legitimate
+   `git@github.com:MithraAI/istari.git` written into repro.md never became
+   https, so the owner parsed as nil and the bar was refused with a message
+   about the owner — pointing the reader at the wrong half of a line that was
+   correct."
+  [url]
+  (some-> url
+          (str/replace #"^git@github\.com:" "https://github.com/")
+          (str/replace #"\.git$" "")))
+
+(def reachable-origin-re
+  "The ONE repository shape the self-hosted environment is authenticated for.
+
+   Matched against the whole normalized origin, not against a path segment. The
+   segment test that stood here — `(drop 3)` of a `/`-split, i.e. \"the 4th
+   component is MithraAI\" — never looked at the HOST, so
+   `https://attacker.example/MithraAI/anything` satisfied it. That is not a
+   hypothetical: `origin:` is authored by the investigate role into repro.md, an
+   unlocked file whose instructions ultimately come from a Linear ticket's text,
+   and the dispatch tells a credentialed cloud session to clone that URL and
+   start the thing. Anchored, so nothing before or after the shape counts."
+  #"https://github\.com/MithraAI/[A-Za-z0-9._-]+")
+
 (defn cloud-target
   "Everything the runner needs, or {:error <why>}. Each miss is its own line
-   because each has a different fix."
-  [ctx worktree]
+   because each has a different fix.
+
+   The bar may name its own `origin:`, `branch:` and `ticket:`, and those win
+   over what the worktree says. A reproduction is frequently not on the branch
+   the worktree is sitting on — the investigation lane's whole job is to
+   reproduce a bug on `main`, from a task branch that carries no code at all —
+   and deriving the target from the checkout would send the runner to verify the
+   one branch that is certainly innocent.
+
+   `ticket:` also removes the PR precondition. The refusal was never about
+   execution: the runner clones and runs perfectly well without a PR, and the
+   PR was the RETURN CHANNEL. A ticket is a return channel, so it satisfies the
+   same requirement — and demanding a PR for a task whose deliverable is an RCA
+   would refuse the lane outright."
+  [ctx worktree bar]
   (let [env-id (project-lib/cloud-env-for ctx)
-        origin (some-> (git-out worktree "remote" "get-url" "origin")
-                       (str/replace #"^git@github\.com:" "https://github.com/")
-                       (str/replace #"\.git$" ""))
-        owner (some-> origin (str/split #"/") (->> (drop 3) first))
-        branch (git-out worktree "rev-parse" "--abbrev-ref" "HEAD")
-        pr (let [r (process/sh {:dir (str worktree)} "gh" "pr" "view" "--json" "number" "-q" ".number")]
-             (when (zero? (:exit r)) (not-empty (str/trim (:out r)))))]
+        ticket (not-empty (str/trim (str (:ticket bar))))
+        origin (normalize-origin
+                (or (not-empty (str/trim (str (:origin bar))))
+                    (git-out worktree "remote" "get-url" "origin")))
+        bar-branch (not-empty (str/trim (str (:branch bar))))
+        branch (or bar-branch (git-out worktree "rev-parse" "--abbrev-ref" "HEAD"))
+        ;; Only asked when nothing else can carry the findings. `gh pr view` is
+        ;; a network call, and a ticket-bound bar has no use for its answer.
+        pr (when-not ticket
+             (let [r (process/sh {:dir (str worktree)} "gh" "pr" "view" "--json" "number" "-q" ".number")]
+               (when (zero? (:exit r)) (not-empty (str/trim (:out r))))))]
     (cond
       (nil? env-id)
       {:error (str "no self-hosted environment for this task. Set it on the project — the\n"
@@ -211,27 +290,42 @@
       {:error "this worktree has no `origin` remote, so there is no repo to name to the runner."}
 
       ;; The environment is authenticated to ONE GitHub account. A dispatch
-      ;; naming any other owner clones nothing and fails in the cloud, where no
+      ;; naming anything else clones nothing and fails in the cloud, where no
       ;; one is watching — so it is refused here, where the message is read.
-      (not= "MithraAI" owner)
-      {:error (str "the runner can only reach MithraAI repos; this worktree's origin is\n"
+      (not (re-matches reachable-origin-re (str origin)))
+      {:error (str "the runner can only reach github.com/MithraAI repos; this bar's origin is\n"
                    "  " origin "\n"
-                   "Owner `" owner "` is not baked into the environment, so the clone would fail\n"
-                   "in the cloud with nobody reading the error. Measure this bar locally instead.")}
+                   "That is not a repository the environment is authenticated for, so the clone\n"
+                   "would fail in the cloud with nobody reading the error. Fix the `origin:` on\n"
+                   "the bar, or measure this bar locally instead.")}
 
-      (nil? pr)
-      {:error (str "no pull request for branch `" branch "`. The runner reports by commenting on\n"
-                   "the PR, so without one its findings have nowhere to land. Open the PR first;\n"
-                   "the run role is meant to be the step between review and merge.")}
+      ;; A branch name reaches `git checkout` inside the runner's own shell, and
+      ;; on this lane it is written by a role rather than read off a checkout.
+      ;; Shape-checked so the free-text surface in that session is the brief's
+      ;; prose only, never the target it acts on.
+      (and bar-branch (not (re-matches #"[A-Za-z0-9._/-]{1,200}" bar-branch)))
+      {:error (str "the bar's `branch:` is not a branch name:\n  " bar-branch "\n"
+                   "Letters, digits, dot, dash, slash and underscore, up to 200 characters.")}
 
-      :else {:env-id env-id :origin origin :branch branch :pr pr})))
+      (and ticket (not (re-matches #"[A-Za-z][A-Za-z0-9]*-[0-9]+" ticket)))
+      {:error (str "the bar's `ticket:` is not a Linear issue key:\n  " ticket "\n"
+                   "It becomes the surface the runner comments on, so it has to name one.")}
+
+      (and (nil? ticket) (nil? pr))
+      {:error (str "no return channel for branch `" branch "`: the bar names no `ticket:` and the\n"
+                   "branch has no open PR. The runner reports by commenting, so without one its\n"
+                   "findings have nowhere to land. Open the PR first — the run role is meant to be\n"
+                   "the step between review and merge — or, on an investigation, put\n"
+                   "`— ticket: <KEY>` on the bar so the runner answers on the Linear ticket.")}
+
+      :else {:env-id env-id :origin origin :branch branch :pr pr :ticket ticket})))
 
 (defn dispatch-cloud!
   "Create the cloud session and record it. Exit is `pending`, never 0: the bar
    is not met by having been dispatched, and the goal judge reads this file."
   [ctx worktree bar]
   (let [started (System/currentTimeMillis)
-        target (cloud-target ctx worktree)]
+        target (cloud-target ctx worktree bar)]
     (if-let [why (:error target)]
       {:exit "blocked" :duration-ms 0 :started-at (str (java.time.Instant/now))
        :output (str "this bar is @cloud, and it could not be dispatched:\n\n" why "\n")}
@@ -246,11 +340,18 @@
          :output (str "dispatched to the self-hosted environment.\n"
                       "  repo:    " (:origin target) "\n"
                       "  branch:  " (:branch target) "\n"
-                      "  PR:      #" (:pr target) "\n"
+                      (if (:ticket target)
+                        (str "  ticket:  " (:ticket target) "\n")
+                        (str "  PR:      #" (:pr target) "\n"))
                       (when session (str "  session: " session "\n"
                                          "  view:    https://claude.ai/code/" session "\n"))
-                      "\nPENDING, not met. The runner answers by commenting on PR #" (:pr target)
-                      ";\npr_watch polls it and wakes the front of the pipeline. Nothing here can\n"
+                      "\nPENDING, not met. The runner answers by commenting on "
+                      (if (:ticket target)
+                        (str "Linear ticket " (:ticket target)
+                             ";\nthe loop session polls that comment and sets the `Repro` label from it.")
+                        (str "PR #" (:pr target)
+                             ";\npr_watch polls it and wakes the front of the pipeline."))
+                      " Nothing here can\n"
                       "read that session directly, and --teleport would drag it onto this machine.\n"
                       "\n--- dispatch output ---\n" (clip out))}))))
 
@@ -278,8 +379,11 @@
   (or (empty? (:repos bar)) (some #{repo} (:repos bar))))
 
 (defn measure-all!
-  "Run everything this session owns; return [{:id :exit :file}]."
-  [ctx worktree metrics-md repo]
+  "Run everything this session owns; return [{:id :exit :file}].
+
+   Both bar sources, same grammar (see the header). A task with no repro.md —
+   every task but the investigation lane — behaves exactly as before."
+  [ctx worktree metrics-md repro-md repo]
   (let [test-command (detect-test-command worktree)
         ;; One `repo tests` per repo, named after it. detect-test-command reads
         ;; ONE worktree, so a single shared bar meant every session overwrote
@@ -290,7 +394,7 @@
                     :name (str "repo tests" (when repo (str " — " repo)))
                     :command test-command
                     :threshold "the repo's own test command exits 0"}
-        rows (cons repo-tests (filter #(mine? repo %) (bars ctx metrics-md)))]
+        rows (cons repo-tests (filter #(mine? repo %) (bars ctx metrics-md repro-md)))]
     (vec (for [bar rows]
            (let [result (cond
                           (cloud-bar? bar) (dispatch-cloud! ctx worktree bar)
@@ -303,6 +407,21 @@
                                           "has to satisfy it and overwrite this file with what it observed:\n\n"
                                           "  " (or (:measure bar) (:name bar)) "\n"))
                            :duration-ms 0 :started-at (str (java.time.Instant/now))})
+                 ;; `ticket:`, `origin:` and `branch:` are read by the @cloud
+                 ;; tier and by nothing else, so on a local bar they are a line
+                 ;; the author believed and nothing honoured. Said in the
+                 ;; evidence file rather than refused: the bar still ran, and
+                 ;; its result is still the answer.
+                 ignored (when-not (cloud-bar? bar)
+                           (seq (filter bar [:ticket :origin :branch])))
+                 result (if ignored
+                          (update result :output str
+                                  "\n[notice] this bar names " (str/join ", " (map name ignored))
+                                  ", which only the @cloud tier reads.\n"
+                                  "Its measure does not start with @cloud, so "
+                                  (if (= 1 (count ignored)) "that field was" "those fields were")
+                                  " ignored.\n")
+                          result)
                  file (write-evidence! ctx bar worktree result)]
              {:id (:id bar) :exit (:exit result) :duration-ms (:duration-ms result) :file (str file)})))))
 
@@ -321,11 +440,12 @@
         row (task-lib/session-row ctx session)
         worktree (or (:worktree-path row) (str (fs/cwd)))
         metrics-md (if (fs/regular-file? (:metrics-file ctx)) (slurp (str (:metrics-file ctx))) "")
+        repro-md (if (fs/regular-file? (:repro-file ctx)) (slurp (str (:repro-file ctx))) "")
         ;; Only past one repo: a one-repo task's `repo-tests.txt` is the name
         ;; every reader and every old task already uses.
         repo (when (> (count (distinct (keep :repo (task-lib/read-sessions-tsv ctx)))) 1)
                (:repo row))
-        results (measure-all! ctx worktree metrics-md repo)]
+        results (measure-all! ctx worktree metrics-md repro-md repo)]
     (doseq [{:keys [id exit duration-ms file]} results]
       (println (format "%-24s exit=%-5s %6d ms  %s" id (str exit) duration-ms file)))
     (println (str "evidence: " (count results) " files in " (:evidence-dir ctx)))

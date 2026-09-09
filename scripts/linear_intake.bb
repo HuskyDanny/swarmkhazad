@@ -109,9 +109,14 @@
   (str/lower-case issue-key))
 
 (defn write-from-issue!
-  "Write the task's goal.md, roles and repos from an already-fetched issue."
-  [ctx issue repos]
+  "Write the task's goal.md, roles and repos from an already-fetched issue.
+
+   `investigate?` swaps the single `implement` role for the two-role
+   investigation lineup. It is the only difference between the two lanes at
+   scaffold time: the ticket text, the repos and the goal shape are the same,
+   because an investigation's goal IS the ticket's own words."
+  [ctx issue repos & [investigate?]]
   (spit (str (:goal-file ctx)) (goal-md (:task-id ctx) issue))
-  (spit (str (:roles-file ctx)) (task-lib/roles-template repos))
+  (spit (str (:roles-file ctx)) (task-lib/roles-template repos investigate?))
   (spit (str (:repos-file ctx)) (task-lib/repos-text repos))
   issue)

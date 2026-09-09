@@ -282,8 +282,9 @@
           ;; one account only — a dispatch here would fail in the cloud, where
           ;; no one reads the error
           (is (= "blocked" (get (headers f) "exit")))
-          (is (str/includes? (output f) "only reach MithraAI"))
-          (is (str/includes? (output f) "acme"))
+          (is (str/includes? (output f) "only reach github.com/MithraAI"))
+          (is (str/includes? (output f) "example.invalid/acme/fixture")
+              "and it names the origin it refused — the whole URL, since the whole URL is what is checked")
           (is (not (fs/exists? (fs/path dir "claude-argv")))
               "and nothing was dispatched")
           (is (= 1 (:exit r)))))))
@@ -300,7 +301,7 @@
             (is (str/includes? (output f) "on the project")
                 "the fix is a field on the page, not an id to remember")
             (is (not (fs/exists? (fs/path dir "claude-argv")))))))))
-  (testing "no pull request to answer on"
+  (testing "nothing to answer on — no PR, and no ticket either"
     (with-task {"README.md" "one\n"} cloud-metrics
       (fn [{:keys [dir measure]}]
         (let [bin (stub-bin! dir {:pr nil})]
@@ -310,9 +311,11 @@
                     "PATH" (str bin ":" (System/getenv "PATH"))})
           (let [f (fs/path dir "evidence" "checkout-works.txt")]
             (is (= "blocked" (get (headers f) "exit")))
-            (is (str/includes? (output f) "no pull request"))
+            (is (str/includes? (output f) "no return channel"))
+            (is (str/includes? (output f) "ticket:")
+                "and it names the other channel, so an investigation is not left guessing")
             (is (not (fs/exists? (fs/path dir "claude-argv")))
-                "without a PR the findings have nowhere to land, so it is not sent")))))))
+                "with neither, the findings have nowhere to land, so it is not sent")))))))
 
 (deftest test-command-detection-prefers-the-lockfile-s-package-manager
   (let [detect (fn [files]

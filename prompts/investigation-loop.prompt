@@ -1,0 +1,98 @@
+# The investigation loop session
+
+Not a swarm role. This is the prompt for ONE long-lived `cc_loop` session that watches Linear and
+opens swarmkhazad tasks. It is the only part of the lane a human starts, and it is documented here
+rather than living in a shell history:
+
+    cc_loop --mcp-config '{"mcpServers":{
+        "swarmkhazad":{"command":"<this-repo>/swarmkhazad","args":["mcp"]},
+        "linear-server":{"type":"http","url":"https://mcp.linear.app/mcp"}}}'
+
+Then `/loop 15m` with the body below. It needs exactly two MCP servers: Linear to read and label,
+swarmkhazad to open. Nothing else, and no Bash — every action it takes is one of those tools.
+
+## Your one iteration
+
+You carry no memory between iterations. Everything you need is on the tickets, which is deliberate:
+a loop whose state lives in its own context loses that state to the first compaction.
+
+### 1. Poll
+
+List the team's open issues, then filter CLIENT-SIDE for the three predicates. Filter in your own
+head rather than in the query: which filter arguments `list_issues` accepts is a moving target, and a
+filter the server silently ignores returns a superset that reads exactly like a match.
+
+A ticket is a candidate when ALL of:
+
+- it carries a `repo:` label — that is what says which checkout can reproduce it;
+- it carries NO label from the `Evidence` group — `Evidence: found` and `Evidence: none` both mean a
+  lane already ran, and absence of the group is the only thing that means "never investigated";
+- it does NOT carry `Blocked` — the cap below applied, and a human owns it now.
+
+`Evidence: found` with no `Repro` label is not a candidate for opening. It is a candidate for step 4.
+
+### 2. Map the `repo:` label to a checkout
+
+The label names the repo; you pass the path. One mapping, and if a label names something not on this
+list, comment saying so and skip the ticket rather than guessing:
+
+| label | checkout |
+|---|---|
+| `repo:istari` | `/Users/allenpan/repos/mithra_ai/istari` |
+| `repo:minas-tirith` | `/Users/allenpan/repos/mithra_ai/minas-tirith` |
+| `repo:lothlorien` | `/Users/allenpan/repos/mithra_ai/lothlorien` |
+| `repo:mellon` | `/Users/allenpan/repos/mithra_ai/mellon` |
+| `repo:starchat` | ask — no checkout is recorded for this one |
+
+A repo-less task is REFUSED at prepare (`repos declaration is empty`), so a ticket with no usable
+`repo:` label cannot be opened at all. Say that on the ticket; do not open the task and hope.
+
+### 3. Open one lane
+
+    swarmkhazad add_task { issue_key: "<KEY>", repo: ["<path>"], investigate: true }
+
+One ticket per iteration. The two panes cost real laptop memory and the whole point of them closing
+at handoff is that a ticket's cost is bounded — opening five at once gives that back.
+
+**Attempt cap: two, then `Blocked`.** Before opening, count your own attempt comments on the ticket
+(step 5). At two, apply `Blocked`, comment why, and never pick it up again. This cap is not optional
+housekeeping: a crash leaves NO `Evidence` label, which is exactly the state step 1 selects for, so
+without the cap a ticket whose investigate pane dies on launch is re-opened forever.
+
+### 4. Read the runner's comment and set `Repro:`
+
+For every ticket with `Evidence: found` and no `Repro` label, read its comments newest-first and look
+for the cloud runner's report on the reproduction.
+
+- The runner says the command reproduced the behaviour, and quotes the output → `Repro: yes`.
+- The runner says it did not reproduce → `Repro: no`.
+- The runner's comment says "it reproduces" and quotes nothing → that is not an answer. Comment
+  asking for the output, and leave the group unset.
+- No runner comment yet → leave it. It is still running; that is what `Evidence: found` with no
+  `Repro` means.
+
+You set this label from the RUNNER's comment and from nothing else. Not from the investigator's RCA,
+not from the `exit: pending` in the evidence file, not from your own reading of the code. The
+investigator names the command and the runner records the outcome, and you are the third party that
+keeps those two from being the same voice.
+
+`Evidence: found` + `Repro: yes` is where this lane stops today — the fix task does not exist yet, so
+leave the ticket in that state; it is the queue. `Evidence: found` + `Repro: no` means the cause is
+real and the swarm cannot verify it: surface it to Allen.
+
+### 5. Leave a trace of the iteration
+
+One comment per ticket you acted on, one line, so the next iteration can count attempts and a human
+can see what happened:
+
+    swarm-loop: attempt <n> — opened task <task-id> at <UTC timestamp>
+
+Add the workspace's existing `swarm-created` label to anything you touch. Do not mint a new marker.
+
+## Never
+
+- Never set an `Evidence` label. That is the investigate role's, and setting it from here would tell
+  the next iteration a lane ran when none did.
+- Never set `Repro:` from anything but a runner comment.
+- Never re-open a ticket carrying `Blocked`.
+- Never write to a ticket outside the team you were pointed at.
