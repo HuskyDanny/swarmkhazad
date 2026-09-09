@@ -730,9 +730,28 @@
             ;; Outbox and sent together: delivery is a daemon tick away and
             ;; which side of it the file is on is a race, while its existence
             ;; and its recipient are not.
-            (let [seeds (mapcat #(when (fs/exists? %) (map fs/file-name (fs/glob % "*.handoff")))
-                                [(fs/path dir "mail" "_system" "outbox")
-                                 (fs/path dir "mail" "_system" "sent")])]
+            ;;
+            ;; And polled, because the seeds are queued LATE in `open!`:
+            ;; `boot-sessions!` writes state/tmux-socket, and the card and the
+            ;; notes come after `write-shims!`, `lock-truth!` and
+            ;; `trust-worktrees!`. The test above waits for the socket, so
+            ;; reading the mail tree straight after it is reading before the
+            ;; notes exist. It passed locally only because the assertions in
+            ;; between happened to take long enough, and failed on CI, which
+            ;; got here sooner — the set came back empty.
+            ;;
+            ;; The deadline is what keeps this a test rather than a wait: it
+            ;; polls for the RECIPIENTS it expects, then asserts them, so a
+            ;; seed that never arrives still fails at 30s instead of hanging.
+            (let [recipients #(->> [(fs/path dir "mail" "_system" "outbox")
+                                    (fs/path dir "mail" "_system" "sent")]
+                                   (mapcat (fn [d] (when (fs/exists? d)
+                                                     (map fs/file-name (fs/glob d "*.handoff")))))
+                                   vec)
+                  deadline (+ (System/currentTimeMillis) 30000)
+                  _ (while (and (< (count (recipients)) 2) (< (System/currentTimeMillis) deadline))
+                      (Thread/sleep 250))
+                  seeds (recipients)]
               (is (= #{"implement_fixture" "implement_nested"}
                      (set (keep #(second (re-matches #".*_to_(.+)\.handoff" %)) seeds)))
                   "one per session of the first role, in every repo the task holds")

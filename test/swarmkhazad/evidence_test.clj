@@ -60,7 +60,26 @@
         (f {:dir dir
             :measure (fn [& [extra-env]]
                        (run {:dir (str (fs/path dir "worktrees" "fixture"))
-                             :env (merge env {"SWARMKHAZAD_SESSION" "run" "SWARMKHAZAD_TASK_DIR" (str dir)} extra-env)
+                             ;; SWARMKHAZAD_CLOUD_ENV blank by default, because
+                             ;; `:extra-env` ADDS to the inherited environment
+                             ;; rather than replacing it. An operator with that
+                             ;; variable exported — cmux exports it here — had it
+                             ;; leak into the case below that says "deliberately
+                             ;; NO SWARMKHAZAD_CLOUD_ENV", which then measured a
+                             ;; successful dispatch and failed four assertions
+                             ;; about a block that could not happen. Green on CI,
+                             ;; red on the machine that owns a pool: a test whose
+                             ;; answer depends on the shell that ran it.
+                             ;;
+                             ;; Blank, not absent, because blank is already the
+                             ;; code's own "no environment" — `(keep not-empty)`
+                             ;; in project-lib/cloud-envs — and `:extra-env`
+                             ;; cannot unset a variable.
+                             :env (merge env
+                                         {"SWARMKHAZAD_CLOUD_ENV" ""
+                                          "SWARMKHAZAD_SESSION" "run"
+                                          "SWARMKHAZAD_TASK_DIR" (str dir)}
+                                         extra-env)
                              :ok? false}
                             "bb" (str (fs/path scripts "run_evidence.bb"))))}))
       (finally
