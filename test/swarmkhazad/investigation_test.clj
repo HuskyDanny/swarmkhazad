@@ -1,8 +1,8 @@
 (ns swarmkhazad.investigation-test
   "The investigation lane: repro.md as a second bar source, a @cloud bar that
-   answers on a Linear ticket instead of a PR, the skill and subagent generated
-   into the task folder and into every worktree, the two-role lineup, and the
-   MCP gateway.
+   answers on a Linear ticket instead of a PR, the plugin generated into the
+   task folder and named on each role's argv, the two-role lineup, and the MCP
+   gateway.
 
    Each test here names the guard it watches, because test/mutants.edn points at
    these deftests by name and a rename that loses a mutant loses it silently."
@@ -47,6 +47,14 @@
   (git dir "config" "user.name" "T")
   (write! (fs/path dir "README.md") "one\n")
   (write! (fs/path dir "bb.edn") "{:tasks {test {:task (println \"fixture tests ran\")}}}\n")
+  ;; `.claude/` is the target repo's, and these repos really do track it: RAN,
+  ;; lothlorien lists 80+ files under it and minas-tirith tracks
+  ;; `.claude/agents/*.md`. Committed here so every case below runs against a
+  ;; checkout that OWNS the directory the swarm used to copy into — the
+  ;; collision the old shape needed a per-file tracked-destination skip to
+  ;; survive, and that this shape has to make impossible rather than guard.
+  (write! (fs/path dir ".claude" "skills" "investigate" "SKILL.md") "THE REPO'S OWN SKILL\n")
+  (write! (fs/path dir ".claude" "settings.json") "{\"tracked\":\"by the repo\"}\n")
   (git dir "add" ".")
   (git dir "commit" "-q" "-m" "one")
   (git dir "remote" "add" "origin" "https://github.com/MithraAI/istari.git")
@@ -335,106 +343,112 @@
         (is (str/includes? (output f) "[notice] this bar names ticket, branch"))
         (is (str/includes? (output f) "only the @cloud tier reads"))))))
 
-;; ------------------------------------------------- the generated agent home
+;; --------------------------------------------------- the generated plugin
 
-(def skill-rel ".claude/skills/investigate/SKILL.md")
-(def agent-rel ".claude/agents/investigation-hypothesis-tester.md")
+;; `<task>/plugin/` is the plugin root, named on every claude role's argv. Its
+;; own directory rather than the task folder, because a plugin root is also read
+;; for `hooks/hooks.json`, `.mcp.json` and `commands/`, and `<task>/hooks/` is
+;; already the swarm's per-session settings dir.
+(def manifest-rel "plugin/.claude-plugin/plugin.json")
+(def skill-rel "plugin/skills/investigate/SKILL.md")
+(def agent-rel "plugin/agents/investigation-hypothesis-tester.md")
 
-(deftest a-re-prepare-neither-duplicates-the-excludes-nor-clobbers-a-claude-the-repo-owns
-  ;; `open` is also the resume-after-reboot path, so this runs many times per
-  ;; task — and it runs inside somebody else's repo, where `.claude/` is
-  ;; frequently tracked. Destroying a checked-in `.claude/settings.json` to
-  ;; install a generated skill would be the worst thing in this change.
-  (with-task
-    (fn [{:keys [dir src env]}]
-      (let [wt (fs/path dir "worktrees" "istari")
-            excl (fs/path src ".git" "info" "exclude")
-            owned (fs/path wt ".claude" "settings.json")]
-        (write! owned "{\"tracked\":\"by the repo\"}\n")
-        (let [before (slurp (str excl))]
-          (run {:env env} cli "prepare" "t-inv")
-          (is (= "{\"tracked\":\"by the repo\"}\n" (slurp (str owned)))
-              "the repo's own file survives — the copy merges into .claude, it does not replace it")
-          (is (= before (slurp (str excl)))
-              "and the exclude file is appended to once per pattern, not once per prepare")
-          (doseq [p [skill-rel agent-rel]]
-            (is (fs/regular-file? (fs/path wt p)) "while the generated copies are still there")))))))
-
-(deftest a-file-the-target-repo-tracks-is-never-overwritten
-  ;; `.claude/` is not ours. RAN: lothlorien tracks 80+ files under it,
-  ;; `.claude/settings.json`, `.claude/hooks/*` and `.claude/skills/*/SKILL.md`
-  ;; among them; minas-tirith tracks `.claude/agents/*.md`. Nothing collides
-  ;; today, but a rename on either side would have the copy overwrite a
-  ;; checked-in file — and `info/exclude` masks only UNTRACKED paths, so the
-  ;; damage would surface as a modification in somebody's PR.
-  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-tracked."})
-        home (str (fs/path sandbox "home"))
-        src (str (fs/path sandbox "src" "istari"))
-        env {"SWARMKHAZAD_HOME" home "SWARMKHAZAD_TASK_ID" "t-trk"}]
-    (try
-      (make-source-repo! src)
-      (write! (fs/path src skill-rel) "THE REPO'S OWN SKILL\n")
-      (git src "add" ".")
-      (git src "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "own skill")
-      (git src "update-ref" "refs/remotes/origin/main" (git src "rev-parse" "HEAD"))
-      (run {:env env} cli "new" "t-trk" "--repo" src "--investigate")
-      (let [r (run {:env env} cli "prepare" "t-trk")
-            wt (fs/path home "tasks" "t-trk" "worktrees" "istari")]
-        (is (= "THE REPO'S OWN SKILL\n" (slurp (str (fs/path wt skill-rel))))
-            "the repo's own file is left exactly as it was")
-        (is (str/includes? (str (:out r) (:err r)) "left alone")
-            "and prepare says so, rather than differing from the operator's expectation in silence")
-        (is (fs/regular-file? (fs/path wt agent-rel))
-            "the file that does NOT collide is still installed")
-        (is (= "" (git wt "status" "--porcelain"))
-            "the checkout reads clean — a tracked file overwritten would show as a modification")
-        (let [excl (slurp (str (fs/path src ".git" "info" "exclude")))]
-          (is (not (str/includes? excl skill-rel))
-              "and a tracked path is never excluded — that would hide the repo's own file from its owner")
-          (is (str/includes? excl agent-rel))))
-      (finally (fs/delete-tree sandbox)))))
-
-(deftest the-skill-and-the-subagent-are-generated-into-the-task-folder-and-into-every-worktree
+(deftest the-plugin-is-generated-into-the-task-folder-and-nothing-is-written-into-the-target-repo
+  ;; The point of the shape, and the reason it replaced copying into each
+  ;; worktree. A worktree is a working tree of somebody else's repo, so a file
+  ;; written there is a file swarmkhazad wrote into lothlorien, minas-tirith or
+  ;; istari — and it then needed an `info/exclude` entry in THAT repo so a role
+  ;; running `git add -A` could not commit it. Naming the path writes neither.
   (with-task
     (fn [{:keys [dir src]}]
-      (testing "the task folder holds the canonical copy, beside prompts/ and hooks/"
-        (doseq [p [skill-rel agent-rel]]
-          (is (fs/regular-file? (fs/path dir p)) (str "task folder: " p))))
-      (testing "and every worktree holds the copy a role can actually LOAD"
-        ;; RAN: a spec at <task>/.claude/agents/x.md with cwd
-        ;; <task>/worktrees/foo is NOT in the session's subagent list; the
-        ;; identical file at <task>/worktrees/foo/.claude/agents/x.md is. A
-        ;; parent directory's .claude is not a load path, so the task-folder
-        ;; copy alone would generate two files nothing reads.
-        (doseq [p [skill-rel agent-rel]]
-          (is (fs/regular-file? (fs/path dir "worktrees" "istari" p))
-              (str "worktree: " p))))
-      (testing "the skill's egress is Linear, not a GitHub issue"
-        (let [text (slurp (str (fs/path dir "worktrees" "istari" skill-rel)))]
-          (is (str/includes? text "mcp__linear-server__create_comment"))
-          (is (str/includes? text "Evidence: found"))
-          (is (str/includes? text "repro.md"))
-          (is (not (str/includes? text "swarm:spec-ready"))
-              "khazad's label is not this workspace's")))
-      (testing "the subagent still has no write tool of any kind"
-        (let [front (slurp (str (fs/path dir "worktrees" "istari" agent-rel)))
-              tools (second (re-find #"(?m)^tools:\s*(.*)$" front))]
-          (is (some? tools))
-          (doseq [w ["Write" "Edit" "MultiEdit" "NotebookEdit"]]
-            (is (not (str/includes? tools w))
-                (str w " would let the tester write the record it is supposed to report")))
-          (is (str/includes? tools "mcp__logfire__")
-              "and it holds telemetry the parent is denied — that asymmetry is the whole point")))
-      (testing "git in the target checkout cannot see either file"
-        ;; Otherwise a role running `git add -A` commits swarm scaffolding into
-        ;; istari. Exact file paths, not `.claude/`, because info/exclude is
-        ;; shared with the operator's own checkout of the same repo.
-        (is (= "" (git (fs/path dir "worktrees" "istari") "status" "--porcelain"))
-            "the worktree reads clean with the agent home written into it")
-        (let [excl (slurp (str (fs/path src ".git" "info" "exclude")))]
-          (doseq [p [skill-rel agent-rel]] (is (str/includes? excl p)))
-          (is (not (some #{".claude/"} (map str/trim (str/split-lines excl))))
-              "a directory exclude would hide a .claude file the operator wrote by hand"))))))
+      (let [wt (fs/path dir "worktrees" "istari")]
+        (testing "the task folder holds the plugin, beside prompts/ and hooks/"
+          (doseq [p [manifest-rel skill-rel agent-rel]]
+            (is (fs/regular-file? (fs/path dir p)) (str "task folder: " p))))
+        (testing "the manifest names the plugin, and that name is the namespace every reference spells"
+          ;; `swarmkhazad:investigate` resolves only while the manifest still
+          ;; says `swarmkhazad`. Rename one side and every reference in the
+          ;; prompts, the SKILL body and the README silently stops resolving —
+          ;; a role that improvises rather than an error anybody sees.
+          (let [name (get (json/parse-string (slurp (str (fs/path dir manifest-rel))) true) :name)]
+            (is (= "swarmkhazad" name))
+            ;; A `swarmkhazad:investigate` id has TWO halves, and pinning only
+            ;; the manifest's leaves the other free to drift: rename `name:` in
+            ;; the component's own frontmatter and every test here still passes
+            ;; while the id resolves to nothing — the role launches with no
+            ;; protocol and improvises. Presence at a path is not a name, which
+            ;; is the same confusion this whole change is about, one level down.
+            (doseq [[f want] [[skill-rel "investigate"]
+                              [agent-rel "investigation-hypothesis-tester"]]]
+              (is (= want (second (re-find #"(?m)^name:\s*(\S+)$"
+                                           (slurp (str (fs/path dir f))))))
+                  (str f " declares the name the manifest namespaces")))
+            (doseq [f ["investigate.prompt"]]
+              (let [text (slurp (str (fs/path repo-root "prompts" f)))]
+                (is (str/includes? text (str name ":investigate")))
+                (is (str/includes? text (str name ":investigation-hypothesis-tester")))))
+            (is (str/includes? (slurp (str (fs/path dir skill-rel)))
+                               (str name ":investigation-hypothesis-tester"))
+                "including the SKILL body, which is what tells the parent what to dispatch")))
+        (testing "and NOTHING is written into the target repo"
+          (doseq [p ["plugin" "agents" "skills" ".claude-plugin"]]
+            (is (not (fs/exists? (fs/path wt p)))
+                (str "the worktree must not carry " p " — it is a working tree of a repo we do not own")))
+          ;; `.claude/` is the one the repo owns, so absence is the wrong
+          ;; assertion — it is there, and it must come back byte-identical. The
+          ;; old shape copied into it and needed a per-file skip to avoid
+          ;; overwriting a checked-in file; this shape never opens it.
+          (is (= "THE REPO'S OWN SKILL\n"
+                 (slurp (str (fs/path wt ".claude" "skills" "investigate" "SKILL.md"))))
+              "a name collision is no longer a collision — we write nothing there")
+          (is (= "{\"tracked\":\"by the repo\"}\n"
+                 (slurp (str (fs/path wt ".claude" "settings.json")))))
+          (is (= "" (git wt "status" "--porcelain"))
+              "so the checkout reads clean without anything having to hide our files from it")
+          (let [excl (slurp (str (fs/path src ".git" "info" "exclude")))]
+            (doseq [pat ["investigation-hypothesis-tester" "skills/investigate" ".claude"]]
+              (is (not (str/includes? excl pat))
+                  (str "and the repo's exclude file gains no entry for " pat)))
+            (is (str/includes? excl ".codegraph/")
+                "the codegraph index is the one path we still write into a checkout, and it is still excluded")))
+        (testing "the skill's egress is Linear, not a GitHub issue"
+          (let [text (slurp (str (fs/path dir skill-rel)))]
+            (is (str/includes? text "mcp__linear-server__create_comment"))
+            (is (str/includes? text "Evidence: found"))
+            (is (str/includes? text "repro.md"))
+            (is (not (str/includes? text "swarm:spec-ready"))
+                "khazad's label is not this workspace's")))
+        (testing "the subagent still has no write tool of any kind"
+          (let [front (slurp (str (fs/path dir agent-rel)))
+                tools (second (re-find #"(?m)^tools:\s*(.*)$" front))]
+            (is (some? tools))
+            (doseq [w ["Write" "Edit" "MultiEdit" "NotebookEdit"]]
+              (is (not (str/includes? tools w))
+                  (str w " would let the tester write the record it is supposed to report")))
+            (is (str/includes? tools "mcp__logfire__")
+                "and it holds telemetry the parent is denied — that asymmetry is the whole point")))))))
+
+(deftest a-re-prepare-adds-no-second-exclude-line
+  ;; `open` is also the resume-after-reboot path, so this runs many times per
+  ;; task; an unguarded append gives a checkout resumed a dozen times a dozen
+  ;; copies of the same pattern.
+  ;;
+  ;; What makes the plugin LOADABLE is not a file — a parent directory's
+  ;; `.claude/` was present and not a load path, which is why the copy shape
+  ;; existed. It is the `--plugin-dir <task-dir>` flag on the role's argv, and
+  ;; that is pinned where the argv is built:
+  ;; harness-argv-carries-each-cli-s-own-flags-in-both-modes in mail_test.
+  (with-task
+    (fn [{:keys [src env]}]
+      (let [excl (fs/path src ".git" "info" "exclude")
+            before (slurp (str excl))]
+        ;; Without this, the equality below is equally true when the write path
+        ;; never ran at all — a test that passes for a reason other than the one
+        ;; its name claims.
+        (is (str/includes? before ".codegraph/")
+            "there is a first line for a second one to duplicate")
+        (run {:env env} cli "prepare" "t-inv")
+        (is (= before (slurp (str excl))))))))
 
 ;; ------------------------------------------------------------ the lineup
 

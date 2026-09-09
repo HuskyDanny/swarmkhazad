@@ -390,7 +390,32 @@
                         (when-let [denied (seq (project-lib/denied-tools (:role row)))]
                           (cons "--disallowedTools" denied))
                         ["--append-system-prompt-file" (str prompt)
-                         "--settings" (str (write-hook-settings! ctx row))]
+                         "--settings" (str (write-hook-settings! ctx row))
+                         ;; `<task>/plugin/` is the plugin root that carries the
+                         ;; generated skill and subagent (see task-lib's
+                         ;; install-plugin!). Naming the path here is what
+                         ;; replaced copying them into every worktree, which
+                         ;; meant writing into repos the swarm does not own.
+                         ;;
+                         ;; Its OWN directory rather than the task folder,
+                         ;; because a plugin root is also read for
+                         ;; `hooks/hooks.json`, `.mcp.json` and `commands/` —
+                         ;; and `<task>/hooks/` is already where this file
+                         ;; writes each session's settings. Pointing the flag at
+                         ;; the task folder would have put a loader that runs
+                         ;; shell commands on tool events one filename away from
+                         ;; a directory the swarm itself writes into.
+                         ;;
+                         ;; Two argv slots, built here rather than declared on a
+                         ;; `roles` line: that line is whitespace-split twice, so
+                         ;; a path with a space in it would arrive as two flags
+                         ;; and a quoted one would arrive with its quotes. The
+                         ;; flag is repeatable rather than last-wins — READ, the
+                         ;; 2.1.266 binary parses it as `pluginDir.push(path)` —
+                         ;; so a lane's own plugins load alongside this one
+                         ;; instead of losing to it, unlike
+                         ;; `--append-system-prompt-file` above.
+                         "--plugin-dir" (str (:plugin-dir ctx))]
                         ;; A lane already declares its own permission posture —
                         ;; cc_auto bypasses, cc_control screens — and restating
                         ;; ours would collapse the two into one choice.

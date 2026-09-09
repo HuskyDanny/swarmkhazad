@@ -1,0 +1,5 @@
+{
+  "name": "swarmkhazad",
+  "description": "The skills and subagents swarmkhazad generates into a task folder, loaded by every role's --plugin-dir.",
+  "version": "1.0.0"
+}
