@@ -373,6 +373,18 @@
         (testing "including the one in the fallback stage prompt"
           (is (str/includes? (prompt "tidy_gobel") "`draft-tidy_gobel.md`"))
           (is (not (str/includes? (prompt "tidy_gobel") "draft-<role>.md"))))
+        (testing "a role whose toolset is narrowed is told so, and one that is not is not"
+          ;; The alternative is a role diagnosing its own launcher: a missing
+          ;; Edit reads as a broken environment, and this harness has already
+          ;; watched a role spend turns probing a refusal and write the
+          ;; confusion into append-only escalation.md.
+          (is (str/includes? (prompt "implement_gobel")
+                             "Not in your toolset, by design for implement: mcp__logfire, mcp__chrome-devtools")
+              "named, not merely hinted at — the role has to recognise the tool it cannot find")
+          (is (str/includes? (prompt "implement_gobel") "Absent, not broken"))
+          (is (str/includes? (prompt "tidy_gobel")
+                             "Not in your toolset, by design for tidy: mcp__logfire")
+              "a role this file has never heard of still loses the universal set, and is still told"))
         (testing "a cross-role reference resolves to the sibling in the SAME repo"
           (is (str/includes? (prompt "review_gobel") "`draft-implement_gobel.md`")
               "review wants the implement that worked on the tree it is reviewing")

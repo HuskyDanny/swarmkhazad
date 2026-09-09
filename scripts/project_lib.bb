@@ -150,7 +150,7 @@
    the order the swimlane's columns take. Filesystem order would be
    alphabetical, and `architect, brainstorm, cleaner, hardener…` is not a
    pipeline. A prompt not listed here is appended alphabetically."
-  ["brainstorm" "specifier" "implement" "refactorer" "cleaner"
+  ["brainstorm" "implement" "refactorer" "cleaner"
    "review" "architect" "hardener" "run" "qa"])
 
 (defn stage-prompts
@@ -172,9 +172,13 @@
 
    Not one default for everyone: the roles do different work and the cost of
    getting them wrong differs. The building roles get Opus because a quiet
-   quality drop there ships wrong code; architect gets Fable for design work;
-   specifier and review get a different VENDOR on purpose, so the diff is read
-   by a model that did not write it and cannot agree with its own reasoning.
+   quality drop there ships wrong code; architect gets Fable for design work.
+
+   review reads on Opus rather than on a foreign vendor. Its second opinion
+   does not come from its own model — it comes from `/code-review` and
+   `/security-review`, built into the CLI, plus a panel picked from what the
+   diff touches. A lead that can dispatch a panel is worth more than a lead
+   that is itself one foreign vendor and reads everything alone.
 
    `<vendor>:<model-id>` — the vendor picks the endpoint and the credential,
    the suffix names the exact model."
@@ -185,7 +189,6 @@
    "run"        opus
    "qa"         opus
    "architect"  "anthropic:claude-fable-5-1"
-   "specifier"  "glm"
    "review"     opus})
 
 (defn default-model
@@ -193,17 +196,92 @@
   [role]
   (get role-models role "anthropic"))
 
-(def role-harness
-  "Which launcher a role runs under unless a project says otherwise.
+(def role-denied-tools
+  "What each role loses ON TOP of `denied-to-every-role`, as `--disallowedTools`.
 
-   cc_auto for everyone but specifier. Not for its permission mode — the swarm
-   already states `bypassPermissions` for a bare `claude` role, so that part is
-   a wash. What the lane adds is everything a role would otherwise have to be
-   taught twice: `--effort xhigh`, an MCP set narrowed to the four servers a
-   role actually uses (codegraph for a blast-radius read, chrome-devtools for a
-   browser check) instead of the operator's whole `~/.claude.json`, the SSO wrap
-   its Bash calls need, and its own brief — which `write-prompt!` now carries
-   ahead of this task's rather than replacing it.
+   A role is not given the whole toolbox because it happened to be launched by
+   a general-purpose lane. Three things fall out of naming the set per role: a
+   role that must not implement does not carry an implementing tool, an MCP
+   server nobody in the swarm uses registers no tools, and the browser goes to
+   the one role whose job is to drive it. chrome-devtools
+   is listed here rather than in the universal set because `qa` is the
+   exception that keeps it, and an exception to a universal is what a per-role
+   table is for.
+
+   `--disallowedTools` HOLDS under `--permission-mode bypassPermissions` (RAN:
+   with `Edit Write` denied, the tool was absent from the session and the role
+   reported `Cannot: the Edit tool isn't available in this session`). Both
+   granularities work — an exact `mcp__logfire__query_run` and a whole server
+   as `mcp__logfire` (RAN, one probe each way).
+
+   What a server prefix does NOT do is unload the server: it still connects and
+   its instruction text still occupies context, only its tools go unregistered.
+   Asked to invoke a denied tool, a role answered `NOT-CALLED: tool absent from
+   my function schema this session (context7 server instructions loaded, but no
+   mcp__context7__* tools registered)`, while the allowed codegraph call in the
+   same run returned (RAN). So this saves tool schemas and closes a capability;
+   it does not save the server blurb. Asking a role to LIST its servers is not
+   the test — one did name the denied ones, reading the instructions it could
+   still see. Only an attempted call answers the question.
+
+   THE CEILING, so this is not read as enforcement: Bash defeats it. The same
+   probe, asked for the edit `by any means`, answered `Done — Bash with sed -i`
+   and the file changed. Every role needs Bash for tests and commits, so no
+   entry here can make a role read-only. `brainstorm`, `architect` and `run`
+   are held to `do not implement / do not rewrite / do not fix` by their
+   prompts; taking Edit away removes the obvious path, not the possible one.
+
+   `Write` is NOT denied to those three: `draft-<role>.md` is a file they must
+   create, and it is the one thing every role writes. Taking Edit closes the
+   path to changing code that already exists, which is what the prompts forbid.
+
+   Every name here is one the CLI knows. An unknown one is not an error — it
+   prints `Permission deny rule <name> matches no known tool` and the role starts
+   with that tool still available, so a typo reads as a working restriction.
+   `MultiEdit` was in this map's first draft and does not exist (RAN).
+
+   Not `--tools`, which REPLACES the available set: a role whose allowlist
+   omitted one tool it needed would die mid-run with no operator watching, and
+   a denylist fails the safe way — the role keeps working with more than it
+   needed. Not `--mcp-config` either: cc_auto already curates that file, and a
+   second copy of the server list here is a second thing to keep in step.
+"
+  {"brainstorm" ["Edit" "NotebookEdit" "mcp__chrome-devtools"]
+   "implement"  ["mcp__chrome-devtools"]
+   "refactorer" ["mcp__chrome-devtools"]
+   "cleaner"    ["mcp__chrome-devtools"]
+   "review"     ["mcp__chrome-devtools"]
+   "architect"  ["Edit" "NotebookEdit" "mcp__chrome-devtools"]
+   "hardener"   ["mcp__chrome-devtools"]
+   "run"        ["Edit" "NotebookEdit" "mcp__chrome-devtools"]
+   "qa"         ["mcp__context7"]})
+
+(def denied-to-every-role
+  "Denied whatever the role, including one this file has never heard of.
+
+   logfire is the operator's observability: no role's prompt names it, and its
+   `dashboard_*` family carries large Perses schemas. Structural rather than a
+   line repeated in every entry above, so a role added later loses it too —
+   nine copies of one universal is nine chances to forget the tenth."
+  ["mcp__logfire"])
+
+(defn denied-tools
+  "What this role does not get: the universal set plus its own entry. An
+   unlisted role gets the universal set and nothing guessed beyond it."
+  [role]
+  (into denied-to-every-role (get role-denied-tools role)))
+
+(defn default-harness
+  "Which launcher every role runs under. One answer, not a table.
+
+   cc_auto for all of them, and not for its permission mode — the swarm already
+   states `bypassPermissions` for a bare `claude` role, so that part is a wash.
+   What the lane adds is everything a role would otherwise have to be taught
+   twice: `--effort xhigh`, an MCP set narrowed to four servers instead of the
+   operator's whole `~/.claude.json`, the SSO wrap its Bash calls need, its own
+   brief — which `write-prompt!` carries ahead of this task's rather than
+   replacing it — and the local model router, the only way a `<vendor>/<model>`
+   slug resolves at all.
 
    The codegraph half of that was aspirational until `index-worktree!` existed:
    the server was loaded and reachable, but a task worktree sits outside its
@@ -211,25 +289,10 @@
    calling it. `prepare-worktrees!` now builds an index in each worktree and
    `constitution.prompt` names the tool, which is what makes this line true.
 
-   The lane also starts the local model router (`lane_router_env`), which is the
-   only way a `<vendor>/<model>` slug resolves at all. That matters for any role
-   whose reviewers are left on their frontmatter vendors; it does NOT matter for
-   a reviewer dispatched with an explicit `opus` or `sonnet`, which resolves on
-   the ordinary path. So the router is the floor under the vendor case, not the
-   reason for the default.
-
-   specifier is the exception: one vendor, no panel, so cc_alt points straight
-   at that vendor with no router in between.
-
-   review reads on Opus rather than on a foreign vendor, which reverses an
-   earlier default. Its second opinion no longer comes from its own model — it
-   comes from `/code-review` and `/security-review`, which are built into the
-   CLI, plus a panel picked from what the diff touches. A lead that can dispatch
-   a panel is worth more than a lead that is itself one foreign vendor and reads
-   everything alone."
-  {"specifier" "cc_alt"})
-
-(defn default-harness [role] (get role-harness role "cc_auto"))
+   A project that wants a role on a different launcher says so in its roles
+   file; a per-role default table earned nothing once the one exception went."
+  [_role]
+  "cc_auto")
 
 (def default-roles
   (mapv (fn [r] {:role r :harness (default-harness r) :model (default-model r)})

@@ -342,6 +342,12 @@
           (let [r (call {"SWARMKHAZAD_SESSION" "b"})]
             (is (zero? (:exit r)) (:err r))))))))
 
+(defn- resolve-map
+  "project-lib's per-role tool table, reached after swarm_lib has been loaded
+   (it arrives transitively through run_evidence.bb)."
+  []
+  @(resolve 'project-lib/role-denied-tools))
+
 (deftest harness-argv-carries-each-cli-s-own-flags-in-both-modes
   (load-file (str (fs/path scripts "swarm_lib.bb")))
   (let [scratch (fs/create-temp-dir {:prefix "sk-argv."})
@@ -356,7 +362,9 @@
     (try
       (testing "claude: system prompt file, hook settings, bypass, name in the pane, extra args, then the message after --"
         (let [a (argv "claude" :interactive)]
-          (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude" "--append-system-prompt-file" (str prompt)
+          (is (= ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" "/bin/claude"
+                  "--disallowedTools" "mcp__logfire"
+                  "--append-system-prompt-file" (str prompt)
                   "--settings" (str (fs/path scratch "hooks" "r.settings.json"))
                   "--permission-mode" "bypassPermissions" "-n" "sk r" "--flag" "va'lue" "--"] (butlast a)))
           (is (start-with (last a))))
@@ -382,6 +390,31 @@
         (let [line ((resolve 'swarm-lib/launch-script) ctx (row "claude") prompt)]
           (is (str/includes? line "exec 'env' 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1' '/tmp/t/bin/claude'"))
           (is (str/includes? line "'--flag' 'va'\"'\"'lue' '--' 'You are role r"))))
+      (testing "a role's own tool set reaches the argv, and the variadic flag is followed by a flag"
+        ;; --disallowedTools consumes words until the next --prefixed token, so
+        ;; its POSITION is the load-bearing part: emitted after `extra` it
+        ;; would swallow a role's non-flag argument and the `--` terminator
+        ;; with it. Asserting presence alone would pass on that placement.
+        (let [tools (fn [role]
+                      (let [a ((resolve 'swarm-lib/harness-argv)
+                               ctx (assoc (row "claude") :role role) "/bin/claude" prompt :interactive nil)
+                            i (.indexOf a "--disallowedTools")]
+                        (when (>= i 0)
+                          {:values (take-while #(not (str/starts-with? % "--")) (drop (inc i) a))
+                           :next (first (drop-while #(not (str/starts-with? % "--")) (drop (inc i) a)))})))]
+          (let [t (tools "run")]
+            (is (some #{"Edit"} (:values t)) "run produces evidence and does not fix code")
+            (is (some #{"mcp__chrome-devtools"} (:values t)) "and does not drive a browser")
+            (is (= "--append-system-prompt-file" (:next t))
+                "the values end at a flag, never at `extra` or the `--` terminator"))
+          (let [t (tools "qa")]
+            (is (not (some #{"mcp__chrome-devtools"} (:values t))) "qa is the role that drives the browser")
+            (is (not (some #{"Edit"} (:values t))) "and the one that fixes what it finds")
+            (is (some #{"mcp__logfire"} (:values t))))
+          (is (= ["mcp__logfire"] (vec (:values (tools "r"))))
+              "an unlisted role still loses the universal set, and nothing is guessed beyond it")
+          (is (empty? (filter #{"MultiEdit"} (mapcat val (resolve-map))))
+              "MultiEdit is not a tool this CLI knows: an unknown name prints a typo warning and restricts nothing")))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no launch command for harness" (argv "gemini" :interactive)))
       (finally (fs/delete-tree scratch)))))
 

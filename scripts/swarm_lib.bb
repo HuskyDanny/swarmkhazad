@@ -29,6 +29,8 @@
 ;; that no role will run. Same parser the portal and the runner use, so the
 ;; three cannot disagree about what a bar is.
 (load-file (str (fs/path script-dir "run_evidence.bb")))
+;; run_evidence loads project_lib, which is where `denied-tools` lives — the
+;; per-role `--disallowedTools` set `harness-argv` puts on the argv.
 ;; For `delete!` only — a task's cost outlives its folder otherwise, and the
 ;; dashboard goes on charting a task_id nothing can be opened from.
 (load-file (str (fs/path script-dir "telemetry.bb")))
@@ -203,7 +205,16 @@
          (if next-role
            (str " Forward finished work to `" next-role "` — the role, not a session. Every session it has gets it.\n")
            " You are the last role: your git_handoff goes to every other session and closes the task.\n")
-         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb\n\n")))
+         "- Helpers on PATH: ready_for_next.bb, done_with_current.bb, swarm_handoff.bb\n"
+         ;; Said out loud because the alternative is a role diagnosing its own
+         ;; launcher. A missing tool reads as a broken environment, and this
+         ;; harness has already watched a role spend turns probing a refusal
+         ;; and then write the confusion into escalation.md. Read from the same
+         ;; map that produced the flag, so the two cannot disagree.
+         (when-let [denied (seq (project-lib/denied-tools (:role row)))]
+           (str "- Not in your toolset, by design for " (:role row) ": " (str/join ", " denied)
+                ". Absent, not broken — do not escalate it.\n"))
+         "\n")))
 
 (defn own-drafts
   "Rewrite every `draft-<role>.md` a prompt names into the draft of that role's
@@ -365,6 +376,19 @@
        ;; and nothing is dropped.
        "claude" (concat ["env" "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" bin]
                         (when (= mode :smoke) claude-print-flags)
+                        ;; Ahead of every other flag, because this one is
+                        ;; variadic: it eats words until the next `--`-prefixed
+                        ;; one. `--append-system-prompt-file` always follows;
+                        ;; `extra` does not have to be a flag, so emitted after
+                        ;; it the values swallowed `--` and the message with it
+                        ;; (RAN, as a mutant: the argv ended `'--flag' 'va'lue'
+                        ;; '--disallowedTools' 'mcp__logfire' '--' 'You are
+                        ;; role r...'`). `when-let` for the same reason from
+                        ;; the other side — a variadic flag with NO values eats
+                        ;; the flag after it. Unexercised while `denied-tools`
+                        ;; always returns the universal set.
+                        (when-let [denied (seq (project-lib/denied-tools (:role row)))]
+                          (cons "--disallowedTools" denied))
                         ["--append-system-prompt-file" (str prompt)
                          "--settings" (str (write-hook-settings! ctx row))]
                         ;; A lane already declares its own permission posture —
