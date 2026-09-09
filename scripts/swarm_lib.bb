@@ -726,12 +726,39 @@
 
    The one question worth asking before deleting a worktree: work that is on
    origin can be got back, and work that is not cannot. A task that shipped
-   answers yes for every repo, which is the case task.md §10 describes."
+   answers yes for every repo, which is the case task.md §10 describes.
+
+   A branch that is no longer in this checkout answers yes too, because there is
+   nothing left to lose. That case is reached now that the question is asked
+   once and up front for every repo a task has, including the ones an earlier
+   `close --reclaim` already deleted the branch from. Asking git for a ref that
+   is not there exits non-zero and `task-lib/git` throws, so without this a
+   second `close --reclaim` died where it used to report \"already gone\"."
   [source branch]
-  (let [remote (str "refs/remotes/origin/" branch)]
-    (boolean (and (task-lib/git-ok? source "rev-parse" "--verify" "--quiet" (str remote "^{commit}"))
-                  (= (task-lib/git source "rev-parse" (str remote "^{commit}"))
-                     (task-lib/git source "rev-parse" (str branch "^{commit}")))))))
+  (let [remote (str "refs/remotes/origin/" branch)
+        resolves? (fn [ref]
+                    (task-lib/git-ok? source "rev-parse" "--verify" "--quiet" (str ref "^{commit}")))]
+    (boolean (or (not (resolves? branch))
+                 (and (resolves? remote)
+                      (= (task-lib/git source "rev-parse" (str remote "^{commit}"))
+                         (task-lib/git source "rev-parse" (str branch "^{commit}"))))))))
+
+(defn unpushed-repos
+  "The repos whose task branch still holds commits origin has never seen.
+
+   Asked BEFORE anything is torn down. reclaim! asks the same question per repo
+   and answers it by keeping that worktree, which is right for `close`: the
+   task folder survives, and the branch name is still written in it. `delete`
+   removes the folder, so the same answer there would strip the only pointer to
+   those commits. It refuses instead."
+  [ctx]
+  (let [branch (task-lib/task-branch ctx)
+        sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
+                           [(:name r) (:path r)]))]
+    (vec (distinct (for [row (task-lib/read-sessions-tsv ctx)
+                         :let [source (get sources (:repo row))]
+                         :when (and source (not (pushed? source branch)))]
+                     (:repo row))))))
 
 (defn reclaim!
   "Give the disk back: clean each worktree, remove it, drop the task branch from
@@ -744,14 +771,26 @@
    that is kept for its notes keeps three checkouts alive with it.
 
    A worktree holding commits the source's remote has never seen is KEPT, and
-   said so, because that is also what an unpushed day of work looks like. Same
-   rule reap uses, and `--force` is the same override."
+   said so, because that is also what an unpushed day of work looks like.
+   `--force` takes it anyway.
+
+   Not the same question `reap` asks. This one is `pushed?` — the branch is at
+   the same commit as `origin/<branch>`. reap asks whether the branch is merged
+   into its base and how far ahead it is otherwise. A branch merged but never
+   pushed, or pushed to a fork, is answered differently by the two, and the two
+   are asked at different times: this one about a live task, reap's about a
+   branch whose task folder is already gone."
   [ctx force?]
   (let [rows (task-lib/read-sessions-tsv ctx)
         branch (task-lib/task-branch ctx)
         by-repo (into {} (for [r rows :when (:repo r)] [(:repo r) r]))
         sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
-                           [(:name r) (:path r)]))]
+                           [(:name r) (:path r)]))
+        ;; One `pushed?` decision for the whole codebase, and `delete` asks the
+        ;; same function before it tears anything down.
+        ;; A set, never nil: the cond branch below calls it as a function, and
+        ;; `(nil repo)` is a NullPointerException in the middle of a reclaim.
+        kept (if force? #{} (set (unpushed-repos ctx)))]
     (vec
      (for [[repo row] (sort by-repo)
            :let [worktree (:worktree-path row)
@@ -760,7 +799,7 @@
          (not (and worktree (fs/directory? worktree)))
          (str "  " repo ": already gone")
 
-         (and source (not force?) (not (pushed? source branch)))
+         (kept repo)
          (str "  " repo ": kept — " branch " is not on origin; --force to remove it anyway")
 
          :else
@@ -791,23 +830,6 @@
        (doseq [line (reclaim! ctx force?)] (println line)))
      ctx)))
 
-(defn unpushed-repos
-  "The repos whose task branch still holds commits origin has never seen.
-
-   Asked BEFORE anything is torn down. reclaim! asks the same question per repo
-   and answers it by keeping that worktree, which is right for `close`: the
-   task folder survives, and the branch name is still written in it. `delete`
-   removes the folder, so the same answer there would strip the only pointer to
-   those commits. It refuses instead."
-  [ctx]
-  (let [branch (task-lib/task-branch ctx)
-        sources (into {} (for [r (try (task-lib/parse-repos ctx) (catch Exception _ nil))]
-                           [(:name r) (:path r)]))]
-    (vec (distinct (for [row (task-lib/read-sessions-tsv ctx)
-                         :let [source (get sources (:repo row))]
-                         :when (and source (not (pushed? source branch)))]
-                     (:repo row))))))
-
 (defn delete!
   "Remove the task and everything it left behind: the swarm, its worktrees and
    branches, its telemetry, and the folder itself.
@@ -822,8 +844,8 @@
    Refuses while any repo holds unpushed commits, before touching anything.
    `--force` is the same override reclaim takes, and means the same thing.
 
-   Returns a map the caller prints: {:removed bool :kept [repo] :reclaimed
-   [line] :metrics :forgotten|:refused|:unreachable}. The metrics key is a
+   Returns a map the caller prints: {:removed bool :kept [repo] :metrics
+   :forgotten|:refused|:unreachable}. The metrics key is a
    report, not a promise — a server that is not running keeps its series, and
    the operator has to be told that rather than shown a clean exit."
   [task-id force?]
@@ -839,14 +861,14 @@
          :metrics (telemetry/forget-task! task-id)}
         (throw (ex-info (str "no such task: " task-id) {:task-id task-id})))
       (let [kept (when-not force? (unpushed-repos ctx))]
-      (if (seq kept)
-        {:removed false :kept (vec kept)}
-        (do
-          (when (server-up? ctx) (handoff-lib/archive-all! ctx))
-          (stop-handoffd! ctx)
-          (kill-server! ctx)
-          (untrust-worktrees! ctx (task-lib/read-sessions-tsv ctx))
-          (let [reclaimed (reclaim! ctx force?)
+        (if (seq kept)
+          {:removed false :kept (vec kept)}
+          ;; `close --reclaim` IS the teardown — archive, stop the daemon, kill
+          ;; the server, drop the trust entries, reclaim the worktrees — and it
+          ;; prints the reclaim lines itself. Repeating those four calls here is
+          ;; how a fifth teardown step added to `close!` would come to be
+          ;; silently skipped by `delete`.
+          (let [ctx (close! task-id true force?)
                 metrics (telemetry/forget-task! task-id)]
             (fs/delete-tree (:task-dir ctx))
-            {:removed true :kept [] :reclaimed reclaimed :metrics metrics})))))))
+            {:removed true :kept [] :metrics metrics}))))))

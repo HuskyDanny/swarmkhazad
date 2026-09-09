@@ -223,16 +223,15 @@
   ;; closed and reclaimed before this command existed, whose series are still
   ;; being charted, and a mistyped id. One is worth forgetting; the other has to
   ;; come back as an error.
-  (let [answer (atom {:status 200 :headers {"Content-Type" "application/json"}
-                      :body (json/generate-string {:status "success"
-                                                   :data [{:__name__ "claude_code.cost.usage"
-                                                           :task_id "t-old"}]})})
+  (let [answer (atom (vector-result [[{} 116]]))
         stop (http/run-server (fn [_] @answer) {:ip "127.0.0.1" :port 0})
         endpoint (str "http://127.0.0.1:" (:local-port (meta stop)) "/opentelemetry")]
     (try
       (is (true? (known? endpoint "t-old")) "series in the store: the id is real")
-      (reset! answer {:status 200 :headers {"Content-Type" "application/json"}
-                      :body (json/generate-string {:status "success" :data []})})
+      ;; `count()` over nothing is an empty vector, not a zero — the shape a
+      ;; deleted id actually comes back as. RAN against the live server: gobel
+      ;; answered 116, t-pin (deleted an hour earlier) answered [].
+      (reset! answer (vector-result []))
       (is (false? (known? endpoint "t-old")) "an empty answer is not a task")
       (finally (stop))))
   (testing "and a server that is not there does not invent one"
@@ -306,10 +305,12 @@
       ;; differently they are worded — and a dashboard grows them quietly,
       ;; because each one looked reasonable on the day it was added.
       ;;
-      ;; Same metrics and grouping at a DIFFERENT window is caught too. That
-      ;; pairing is sometimes deliberate (a trend beside a total), but it is
-      ;; the shape a duplicate takes most often, so it has to be argued for
-      ;; rather than accumulated.
+      ;; Two checks, and between them they catch three shapes. Same metrics and
+      ;; grouping — whether or not the window differs — is one; that pairing is
+      ;; sometimes deliberate (a trend beside a total), but it is the shape a
+      ;; duplicate takes most often, so it has to be argued for rather than
+      ;; accumulated. Same metrics and window under a different grouping is the
+      ;; other, and those are cuts of one question.
       (let [sig (fn [p]
                   (let [blob (str/join " " (:expr p))
                         pull (fn [re] (sort (distinct (map second (re-seq re blob)))))]
@@ -327,10 +328,6 @@
                      ;; that queries the same metric over the same window.
                      :filters (sort (distinct (map (fn [[_ l v]] (str l "=" v))
                                                    (re-seq #"([a-z_]+)\s*[=!~]+\s*\"([^\"]*)\"" blob))))}))
-            dupes (->> panels
-                       (group-by sig)
-                       (filter (fn [[_ ps]] (< 1 (count ps))))
-                       (map (fn [[_ ps]] (mapv :title ps))))
             near (->> panels
                       (group-by #(dissoc (sig %) :windows))
                       (filter (fn [[_ ps]] (< 1 (count ps))))
@@ -339,9 +336,13 @@
                       (group-by #(dissoc (sig %) :groups))
                       (filter (fn [[_ ps]] (< 1 (count ps))))
                       (map (fn [[_ ps]] (mapv :title ps))))]
-        (is (empty? dupes) (str "identical panels: " (pr-str dupes)))
+        ;; Two panels, not three: an exact copy is caught by BOTH of these, so a
+        ;; third check keyed on the whole signature could never fire on its own.
+        ;; The message says "the window may differ" rather than "only the window
+        ;; differs", because an exact duplicate differs in nothing at all and
+        ;; lands here too.
         (is (empty? near)
-            (str "same metrics and grouping, only the window differs: " (pr-str near)))
+            (str "same metrics and grouping, the window may differ: " (pr-str near)))
         ;; The rule Allen gave, made checkable: spend by task, by repo and by
         ;; model were three panels asking one question three ways, and the page
         ;; made you scroll between them to compare. vmui has no dashboard

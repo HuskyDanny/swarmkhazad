@@ -256,7 +256,8 @@
                           {:status 200 :headers {"Content-Type" "application/json"}
                            :body (json/generate-string
                                   {:status "success"
-                                   :data [{:__name__ "claude_code.cost.usage" :task_id id}]})}))
+                                   :data {:resultType "vector"
+                                          :result [{:metric {} :value [1788699583 "116"]}]}})}))
                       {:ip "127.0.0.1" :port 0})
                 live (assoc env "SWARMKHAZAD_OTLP_ENDPOINT"
                             (str "http://127.0.0.1:" (:local-port (meta stop)) "/opentelemetry"))]
