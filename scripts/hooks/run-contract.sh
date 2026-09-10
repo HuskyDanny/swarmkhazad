@@ -42,7 +42,7 @@ task_dir="${SWARMKHAZAD_TASK_DIR:-}"
 [ -n "$task_dir" ] || exit 0
 [ -d "$task_dir" ] || exit 0
 TASK_REAL=$(cd "$task_dir" 2>/dev/null && pwd -P) || exit 0
-task_id="${SWARMKHAZAD_TASK_ID:-$(basename "$task_dir")}"
+task_id="${SWARMKHAZAD_TASK_ID:-$(basename -- "$task_dir")}"
 # The session, not the role: two sessions of one role differ by repo, and a
 # shared draft-<role>.md would have them overwriting each other.
 role="${SWARMKHAZAD_SESSION:-${SWARMFORGE_ROLE:-}}"
@@ -197,7 +197,7 @@ task_file() {
   # does the work: a Write creating a file that does not exist yet has no inode
   # to compare, and cannot be an alias for anything either.
   for f in $want; do same_file "$p" "$TASK_REAL/$f" && return 0; done
-  base=$(basename "$p")
+  base=$(basename -- "$p")
   for f in $want; do [ "$base" = "$f" ] && { hit=0; break; }; done
   [ "$hit" -eq 0 ] || return 1
   dir=$(dirname "$p")
@@ -234,10 +234,10 @@ pre_tool_use() {
       fp=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || exit 0
       [ -n "$fp" ] || exit 0
       if truth_path "$fp" "$cwd"; then
-        deny "$(basename "$fp") is the task's truth (chmod 444). A role never edits goal.md or metrics.md — a bar you cannot meet is an escalation.md line, never an edit to the bar." "$tool" "$fp"
+        deny "$(basename -- "$fp") is the task's truth (chmod 444). A role never edits goal.md or metrics.md — a bar you cannot meet is an escalation.md line, never an edit to the bar." "$tool" "$fp"
       fi
       if note_path "$fp" "$cwd"; then
-        deny "$(basename "$fp") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$fp"
+        deny "$(basename -- "$fp") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$fp"
       fi
       if scope_path "$fp" "$cwd"; then
         deny "repos is the task's scope, fixed when the swarm opened (chmod 444). The sessions running now were spawned from it and ship reads it to decide which branches to push, so changing it here would not add a session — it would push a branch nobody worked. A checkout this task needs and does not have is an escalation.md line." "$tool" "$fp"
@@ -261,7 +261,43 @@ pre_tool_use() {
       # to use. Two live denials, same cause. Alternation, not two passes: it
       # matches leftmost-first, so `"it's"` and `'say "hi"'` both close on the
       # quote they opened with.
-      scan=$(printf '%s' "$cmd" | sed -E "s/'[^']*'|\"[^\"]*\"//g")
+      # Same call, one level up: a heredoc BODY is data too. It is what the
+      # command WRITES, never what it runs — and `scan` is only ever asked
+      # "which commands does this run". `cat > tmp/h.md <<'EOF'` followed by
+      # `type: git_handoff` was refused because `type:` is not a known reader
+      # (a live denial on GobelCutover); a body reading `hello there` was
+      # refused for `hello`. Neither command touched a truth file.
+      #
+      # The line that OPENS the heredoc is kept — that line is a real command,
+      # and it is where the redirect the rest of this hook cares about lives.
+      # `<<<` is a herestring with no body, so it is left alone; treating its
+      # word as a delimiter would swallow every line that followed.
+      strip_heredocs() {
+        local line delim="" rest out=""
+        while IFS= read -r line || [ -n "$line" ]; do
+          if [ -n "$delim" ]; then
+            case "${line#"${line%%[![:space:]]*}"}" in
+              "$delim") delim="" ;;
+            esac
+            continue
+          fi
+          case "$line" in
+            *"<<<"*) : ;;
+            *"<<"*)
+              rest=${line#*<<}
+              rest=${rest#-}
+              rest=${rest#"${rest%%[![:space:]]*}"}
+              rest=${rest%%[[:space:];|&)]*}
+              rest=${rest//\"/}; rest=${rest//\'/}
+              [ -n "$rest" ] && delim=$rest
+              ;;
+          esac
+          out="$out$line
+"
+        done
+        printf '%s' "$out"
+      }
+      scan=$(printf '%s' "$cmd" | strip_heredocs | sed -E "s/'[^']*'|\"[^\"]*\"//g")
       scan=${scan//\"/}; scan=${scan//\'/}
       # Standing in the task folder, every bare filename is a candidate and the
       # names below prove nothing — `printf x > hard.md` is goal.md when
@@ -293,7 +329,7 @@ pre_tool_use() {
             case "$cd_word" in ">>"*|">|"*|">"*) cd_redirect=${cd_word#>}; cd_redirect=${cd_redirect#>}; cd_redirect=${cd_redirect#|} ;; *) cd_redirect="" ;; esac
             for cd_cand in "$cd_word" "$cd_redirect"; do
               [ -n "$cd_cand" ] || continue
-              case "$(basename "$cd_cand")" in
+              case "$(basename -- "$cd_cand")" in
                 goal.md|metrics.md) hit_kind="truth"; matched=1 ;;
                 decision.md|gotcha.md|finding.md|escalation.md) hit_kind="note"; matched=1 ;;
                 *) continue ;;
@@ -392,7 +428,7 @@ pre_tool_use() {
             # next word, so advance rather than judge the keyword. `if grep -q
             # x f` must be judged on `grep`.
             do|then|else|elif|if|while|until|"{"|"!") continue ;;
-            *) head_word=$(basename "$hw"); break ;;
+            *) head_word=$(basename -- "$hw"); break ;;
           esac
         done
         [ -n "$head_word" ] || continue
@@ -492,8 +528,8 @@ pre_tool_use() {
       # same task_file — no new matcher, no schema to keep up to date.
       while IFS= read -r v; do
         [ -n "$v" ] || continue
-        truth_path "$v" "$cwd" && deny "$(basename "$v") is the task's truth (chmod 444). A role never edits goal.md or metrics.md — a bar you cannot meet is an escalation.md line, never an edit to the bar. To READ it, use Read." "$tool" "$v"
-        note_path "$v" "$cwd" && deny "$(basename "$v") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$v"
+        truth_path "$v" "$cwd" && deny "$(basename -- "$v") is the task's truth (chmod 444). A role never edits goal.md or metrics.md — a bar you cannot meet is an escalation.md line, never an edit to the bar. To READ it, use Read." "$tool" "$v"
+        note_path "$v" "$cwd" && deny "$(basename -- "$v") is append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "$tool" "$v"
       done < <(printf '%s' "$input" | jq -r '[.tool_input | .. | strings] | .[]' 2>/dev/null)
       exit 0 ;;
   esac

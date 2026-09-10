@@ -501,6 +501,71 @@
           (is (denied? (bash task task (str "cd " task " && git -C . restore goal.md"))))
           (is (denied? (bash task task (str "cd " task " && git -C . checkout HEAD -- metrics.md")))))))))
 
+(deftest a-heredoc-body-is-data-not-commands
+  ;; The hook read the BODY of a heredoc as a pipeline of commands and refused
+  ;; on its first word. Live on GobelCutover: a `git_handoff` written with
+  ;; `cat > tmp/h.md <<'EOF'` was denied because `type:` is not a reader the
+  ;; hook knows — a command that named no truth file and wrote nothing but a
+  ;; handoff in tmp/. A body reading `hello there` reproduced it exactly.
+  ;;
+  ;; It is the same call `scan` already makes for quoted spans, one level up: a
+  ;; heredoc body is what the command WRITES, never what it runs.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-heredoc."})
+        dir (fs/path sandbox "task")]
+    (try
+      (fs/create-dirs (fs/path dir "tmp"))
+      (spit (str (fs/path dir "goal.md")) "# t\n## Goal\n- [ ] a thing\n")
+      (spit (str (fs/path dir "metrics.md")) "# t\n## Quantitative\n")
+
+      (testing "a heredoc passes, whatever its body says"
+        (doseq [[label cmd]
+                [["the handoff that was denied in the field"
+                  (str "cd " dir " && cat > tmp/h.md <<'EOF'\n"
+                       "type: git_handoff\nto: cleaner\npriority: 50\nEOF\n"
+                       "swarm_handoff.bb tmp/h.md")]
+                 ["prose, including words that look like verbs"
+                  (str "cd " dir " && cat > tmp/x.md <<'EOF'\nhello there\nrm -rf everything\nEOF")]
+                 ["an unquoted delimiter"
+                  (str "cd " dir " && cat > tmp/y.md <<EOF\nchmod 644 goal.md\nEOF")]
+                 ["a <<- heredoc, tab-indented"
+                  (str "cd " dir " && cat > tmp/z.md <<-END\n\tinstall something\n\tEND")]
+                 ;; `<<<` has no body. Reading its word as a delimiter would
+                 ;; swallow every line after it and hide whatever they do.
+                 ["a herestring is not a heredoc"
+                  (str "cd " dir " && grep -c goal <<< 'goal.md is fine'")]]]
+          (is (allowed? (bash dir dir cmd)) label)))
+
+      (testing "a herestring does not swallow the lines after it"
+        ;; The reason `<<<` is excluded, stated as a case. Read as a heredoc, its
+        ;; word becomes a delimiter that never appears again, so every following
+        ;; line is dropped from `scan` — and a chmod on the truth two lines down
+        ;; would be approved because the hook never saw it.
+        (is (denied? (bash dir dir (str "cd " dir " && grep -c goal <<< 'x'\n"
+                                        "chmod 644 goal.md")))
+            "the command after a herestring is still read"))
+
+      (testing "the line that opens a heredoc is itself still read"
+        ;; It carries the redirect. Dropping it with the body is the way this
+        ;; fix could have opened a door instead of closing noise.
+        (is (denied? (bash dir dir (str "cd " dir " && tee goal.md <<'EOF'\nx\nEOF")))
+            "tee INTO the truth, with a heredoc body"))
+
+      (testing "and the truth is still protected — the opening line is still read"
+        ;; The half that makes the fix safe rather than just quieter. The line
+        ;; that OPENS a heredoc is kept, which is where the redirect lives, so a
+        ;; heredoc aimed AT goal.md is denied exactly as before.
+        (doseq [[label cmd]
+                [["a heredoc that writes the truth"
+                  (str "cd " dir " && cat > goal.md <<'EOF'\nwhatever\nEOF")]
+                 ["an append to the truth" (str "cd " dir " && echo x >> goal.md")]
+                 ["a chmod on the truth" (str "cd " dir " && chmod 644 goal.md")]
+                 ["a mutating verb beside the truth" (str "cd " dir " && cp goal.md /tmp/x.md")]
+                 ["an unknown reader naming the truth" (str "cd " dir " && frobnicate goal.md")]]]
+          (is (denied? (bash dir dir cmd)) label))
+        (is (allowed? (bash dir dir (str "cd " dir " && cat goal.md")))
+            "and reading it still passes"))
+      (finally (fs/delete-tree sandbox)))))
+
 (deftest repos-is-the-scope-and-the-scope-is-fixed-when-the-swarm-opens
   ;; goal.md and metrics.md were the only locked files, and `repos` is read
   ;; long after open: `ship` consults it to decide which branches to push and
