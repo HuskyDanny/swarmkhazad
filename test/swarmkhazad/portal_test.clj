@@ -63,17 +63,34 @@
    uncaught exception with nothing to say about what it was actually testing.
    This machine won the race every time.
 
+   Three things, because `open` starts three: itself, a tmux server, and
+   handoffd. The daemon was the one this missed. `open` starts it LAST, so it is
+   alive the moment `open` exits and this function stops waiting — and it polls
+   `<task>/mail` every second, which is exactly the directory the failure names.
+   RAN, the error this fixes:
+
+     ERROR in (a-task-with-nothing-running-offers-to-resume)
+     clojure.lang.ExceptionInfo: …/swarmkhazad-resume.15032748…/home/tasks/t-resume/mail
+
+   Anchored on `$`, so `handoffd.bb t-one` does not also match a real task
+   whose id merely starts with it — `pkill -f` takes a regex and a bare id is a
+   substring match.
+
    Bounded: a leaked process must not hang the suite."
   [& ids]
-  (let [deadline (+ (System/currentTimeMillis) 30000)]
+  (let [deadline (+ (System/currentTimeMillis) 30000)
+        running? (fn [pattern]
+                   (zero? (:exit (process/sh {:continue true} "pgrep" "-f" pattern))))
+        wait-for-exit (fn [pattern]
+                        (while (and (running? pattern) (< (System/currentTimeMillis) deadline))
+                          (Thread/sleep 200)))]
     (doseq [id ids]
-      (while (and (zero? (:exit (process/sh {:continue true}
-                                            "pgrep" "-f" (str "swarmkhazad.bb open " id))))
-                  (< (System/currentTimeMillis) deadline))
-        (Thread/sleep 200))
+      (wait-for-exit (str "swarmkhazad.bb open " id))
       (process/sh {:continue true} "tmux" "-S"
                   (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
-                  "kill-server"))))
+                  "kill-server")
+      (process/sh {:continue true} "pkill" "-f" (str "handoffd\\.bb " id "$"))
+      (wait-for-exit (str "handoffd\\.bb " id "$")))))
 
 (deftest the-task-page-is-a-view-of-the-folder-and-the-index-lists-it
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal."})
