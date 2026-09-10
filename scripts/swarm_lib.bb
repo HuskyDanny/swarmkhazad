@@ -259,7 +259,7 @@
    nudge, and a swarm role hands off instead. Later instruction wins, so the
    general layer goes first and the specific one after — the ordinary overlay,
    which is not what the flag was doing before. A lane appending no file of its
-   own (cc_full, cc_alt) contributes nothing and the prompt is unchanged."
+   own (cc_full) contributes nothing and the prompt is unchanged."
   [ctx rows row]
   (fs/create-dirs (:prompts-dir ctx))
   (let [file (fs/path (:prompts-dir ctx) (str (:session row) ".md"))
@@ -742,7 +742,8 @@
         result (if done @p {:exit -1 :out "" :err "timed out"})
         json-out (try (json/parse-string (:out result)) (catch Exception _ nil))
         models (vec (keys (get json-out "modelUsage")))
-        expected (:model-main (get (task-lib/read-vendors) (:model row)))
+        expected (some-> (:model-main (get (task-lib/read-vendors) (:model row)))
+                         task-lib/base-model)
         note (smoke-note ctx role)
         ok? (and done (zero? (:exit result)) (some? note)
                  (or (nil? expected) (some #{expected} models))

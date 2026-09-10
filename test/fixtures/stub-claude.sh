@@ -39,6 +39,12 @@ if printf ' %s ' "$@" | grep -q ' -p '; then
   printf 'type: note\nto: %s\npriority: 50\nmessage: smoke from %s\n' "$to" "$R" > "$T/tmp/smoke-$R.txt"
   swarm_handoff.bb "$T/tmp/smoke-$R.txt" > "$T/tmp/smoke-$R.out" 2>&1 || { cat "$T/tmp/smoke-$R.out" >&2; exit 1; }
   model="${SWARMKHAZAD_STUB_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-stub}}"
+  # OpenRouter answers a `<slug>@preset/<name>` request labelled with the SLUG
+  # alone (RAN 2026-09-09), so a real session's modelUsage key never carries the
+  # preset. Echoing the env var verbatim made the fixture the only place in the
+  # world where it does, which hid a smoke that would have failed every vendor
+  # role.
+  model="${model%%@preset/*}"
   printf '{"type":"result","is_error":false,"num_turns":3,"total_cost_usd":0.01,"result":"HANDOFF_OK","modelUsage":{"%s":{}}}\n' "$model"
   exit 0
 fi

@@ -77,7 +77,7 @@
   (is (= 0 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :session)) "shim.sh matches $1 against the session")
   (is (= 6 (.indexOf @(resolve 'task-lib/sessions-tsv-columns) :model)) "shim.sh reads $7 for the vendor")
   (is (= #{"anthropic" "glm" "kimi" "deepseek" "qwen"} @(resolve 'task-lib/known-vendors)) "vendors.tsv rows plus anthropic")
-  (is (= "moonshotai/kimi-k3:exacto" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
+  (is (= "moonshotai/kimi-k3:exacto@preset/cc-tools" (:model-main (get ((resolve 'task-lib/read-vendors)) "kimi"))))
   (is (= "" (:ctx-tokens (get ((resolve 'task-lib/read-vendors)) "qwen"))) "an empty last column survives"))
 
 (deftest a-wrapper-shim-on-path-is-skipped-not-pinned
@@ -242,32 +242,34 @@
               (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL"))
                   "but the model is this role's, not the row's `moonshotai/kimi-k3:exacto` — and the id carries a colon of its own, which is why the split is on the FIRST one")
               (is (= "moonshotai/kimi-k2.5:exacto" (get e "ANTHROPIC_DEFAULT_SONNET_MODEL")))
-              (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL"))
-                  "the row's small model is not overridden; nothing else in the row moves either")
+              (is (= "moonshotai/kimi-k2.5@preset/cc-tools" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL"))
+                  "the row's small model is not overridden — preset and all; nothing else in the row moves either")
               (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
                   "the context window still comes from the vendor row")
               (is (= ["--model" "moonshotai/kimi-k2.5:exacto"]
                      (->> argv (drop-while #(not= "--model" %)) (take 2))))))
-          (testing "a kimi role gets the cc_alt env and a --model pin, and the run reports that model"
+          (testing "a kimi role gets the vendor env and a --model pin, and the run reports that model"
             (let [e (env-map (fs/path dir "tmp" "launch-fast.env"))
                   argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-fast.argv"))))]
               (is (= "https://openrouter.ai/api" (get e "ANTHROPIC_BASE_URL")))
               (is (= "tok-from-test:openrouter-token" (get e "ANTHROPIC_AUTH_TOKEN")) "looked up by the vendor's keychain service name")
               (is (= "" (get e "ANTHROPIC_API_KEY")) "empty-but-set, never unset")
-              (is (= "moonshotai/kimi-k3:exacto" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL")))
-              (is (= "moonshotai/kimi-k2.5" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
+              (is (= "moonshotai/kimi-k3:exacto@preset/cc-tools" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL"))
+                  "`@preset/cc-tools` rides along: it pins provider.ignore, without which Z.AI and Novita answer a tool-heavy request with an empty 200")
+              (is (= "moonshotai/kimi-k2.5@preset/cc-tools" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
               (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS")))
               (is (= "1" (get e "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")))
               (is (= (str "task_id=" id ",role=fast,session=fast,repo=fixture") (get e "OTEL_RESOURCE_ATTRIBUTES")))
-              (is (= ["--model" "moonshotai/kimi-k3:exacto"] (take 2 argv)) "the pin comes first so declared args can still override")
-              (is (str/includes? out "used=moonshotai/kimi-k3:exacto"))))
+              (is (= ["--model" "moonshotai/kimi-k3:exacto@preset/cc-tools"] (take 2 argv)) "the pin comes first so declared args can still override")
+              (is (str/includes? out "used=moonshotai/kimi-k3:exacto")
+                  "the preset is a routing directive: the wire label, and so modelUsage, carries the slug alone")))
           (testing "a deepseek role with declared extra args keeps both the pin and the args"
             (let [e (env-map (fs/path dir "tmp" "launch-deep.env"))
                   argv (str/split-lines (slurp (str (fs/path dir "tmp" "launch-deep.argv"))))]
-              (is (= "deepseek/deepseek-v4-flash-vision-exp" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL")))
-              (is (= "deepseek/deepseek-v4-flash" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
+              (is (= "deepseek/deepseek-v4-flash-vision-exp@preset/cc-tools" (get e "ANTHROPIC_DEFAULT_OPUS_MODEL")))
+              (is (= "deepseek/deepseek-v4-flash@preset/cc-tools" (get e "ANTHROPIC_DEFAULT_HAIKU_MODEL")))
               (is (= "1048576" (get e "CLAUDE_CODE_MAX_CONTEXT_TOKENS")))
-              (is (= ["--model" "deepseek/deepseek-v4-flash-vision-exp"] (take 2 argv)))
+              (is (= ["--model" "deepseek/deepseek-v4-flash-vision-exp@preset/cc-tools"] (take 2 argv)))
               (is (str/includes? out "used=deepseek/deepseek-v4-flash-vision-exp"))))
           (testing "smoke does not seed trust or start tmux; that is open's job"
             (is (= 1 (count (get (json/parse-string (slurp claude-json)) "projects"))))

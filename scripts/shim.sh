@@ -3,7 +3,7 @@
 #
 # A session's pane launches `<task>/bin/<harness>`; this file branches on it
 # in $SWARMKHAZAD_SESSION, applies that session's model configuration (one row of
-# state/vendors.tsv — the cc_alt vendor table: base URL, keychain token, model
+# state/vendors.tsv — the vendor table: base URL, keychain token, model
 # ids, context window) plus the OTEL exporter tagged with task_id and role,
 # then execs the real CLI recorded in state/harnesses.tsv at open time. Model
 # configuration is a claude concern; the other shims only pin the real binary.
@@ -37,7 +37,7 @@ case "$declared" in
   *)   vendor="$declared";       model_override="" ;;
 esac
 
-# A lane harness (cc_full/cc_auto/cc_control/cc_alt) is one of the operator's
+# A lane harness (cc_full/cc_auto/cc_control) is one of the operator's
 # launcher scripts. It calls `lane_router_env`, which exports its own
 # ANTHROPIC_BASE_URL pointing at the local model router — and it runs AFTER this
 # shim execs it, so anything we export here would be overwritten anyway. The
