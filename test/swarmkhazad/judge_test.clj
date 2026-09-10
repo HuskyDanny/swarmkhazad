@@ -296,6 +296,30 @@
         (testing "and another role's line is never this one's to grade"
           (is (not (str/includes? mine "THEIRS"))))))))
 
+(deftest one-goal-line-is-escalated-once-however-often-it-is-graded
+  ;; escalation.md is append-only, so a line written twice cannot be taken
+  ;; back. Comparing each verdict against the PREVIOUS one alone let an unmet
+  ;; set of A, A, {A,B}, A write A three times — and GobelCutover did exactly
+  ;; that: four of its fifteen bullets are one goal line, `Secret rotated
+  ;; first, then the PR merged`, with four different timestamps. One of those
+  ;; four is spelled with a trailing full stop, which is why the key is what
+  ;; the line is ABOUT and not how the judge worded it.
+  (with-task {}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (doseq [v ["{\"met\":false,\"unmet\":[\"GOAL-X\"]}"
+                 "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"
+                 "{\"met\":false,\"unmet\":[\"GOAL-X.\",\"GOAL-Y\"]}"
+                 "{\"met\":false,\"unmet\":[\"GOAL-X\"]}"]]
+        (handoff! "a" "fixture" "b" v))
+      (let [lines (->> (str/split-lines (slurp (str (fs/path dir "escalation.md"))))
+                       (remove str/blank?) vec)]
+        (is (= 2 (count lines)) (str "one bullet per goal line, not per grading: " lines))
+        (is (str/includes? (first lines) "GOAL-X"))
+        (is (str/includes? (second lines) "GOAL-Y"))
+        (is (not (str/includes? (second lines) "GOAL-X"))
+            "the second bullet names what is NEW, not the list the reader has already seen")))))
+
 (deftest the-judge-s-own-escalation-goes-through-note-bb-like-everyone-else
   ;; "note.bb is the only writer of the bullet files" was true of the roles —
   ;; the hook denies them — and false of the tool: the judge appended straight

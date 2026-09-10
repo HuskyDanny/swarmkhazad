@@ -134,7 +134,23 @@
         ;; that happens to be first in `to`. A role with three repos is one
         ;; column.
         next-lane (if (= "true" (get headers "non-forwarding"))
-                    "done"
+                    ;; The terminal broadcast says the SWARM is finished. It
+                    ;; does not say the work landed, and the board saying `done`
+                    ;; on the strength of it is the swarm marking its own
+                    ;; homework — GobelCutover read done while three of its
+                    ;; goal lines were unmet and half its bars had never run.
+                    ;;
+                    ;; Every git_handoff publishes now, so by this point the
+                    ;; PRs exist: `in-review` is the honest lane, and `done` is
+                    ;; what pr_watch writes when the last of them is MERGED or
+                    ;; CLOSED — earned by a human pressing the button rather
+                    ;; than claimed by the role that went last.
+                    ;;
+                    ;; A task with no PR at all — a checkout with no github
+                    ;; origin — still finishes here, because nothing else will
+                    ;; ever move it and `in-review` would then be the stall
+                    ;; that lane exists to rule out.
+                    (if (seq (pr-watch/shipped ctx)) board-lib/review-lane "done")
                     (or (:role (task-lib/session-row ctx (first recipients))) (first recipients)))]
     (when (and sender-role (not= sender-role next-lane))
       (board-lib/hand-off! ctx

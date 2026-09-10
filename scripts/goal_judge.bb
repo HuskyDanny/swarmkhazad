@@ -25,6 +25,13 @@
 ;; is handed over, removes the duplicates and the flipping by removing the
 ;; repetition rather than patching it.
 ;;
+;; It removed most of them. A role that tries again and still falls short is
+;; graded again, legitimately, and escalation.md is append-only — so the second
+;; verdict wrote the same goal line a second time. GobelCutover: four of its
+;; fifteen escalation bullets are one line, re-appended. A goal line is now
+;; escalated ONCE per session, keyed on what it is about rather than on how the
+;; judge worded it that time; the live state lives on the task page.
+;;
 ;; A judge that cannot run is never a silent pass: the verdict is met=false,
 ;; unmet=[judge_unavailable], and the refusal budget still applies, so an infra
 ;; fault delays a handoff rather than wedging the task.
@@ -272,28 +279,64 @@
                "Nothing else wakes the next role: write a git_handoff draft under the task's tmp/ "
                "and run swarm_handoff.bb on it. If the work is not ready, say why in escalation.md first.")))
 
+(defn goal-key
+  "What an unmet item is ABOUT, with the wording taken out: lower-cased, and
+   every run of non-alphanumerics folded to one space.
+
+   The judge writes the goal line back in its own words, so the same line comes
+   back spelled two ways across gradings. GobelCutover, READ from its
+   escalation.md: `Secret rotated first, then the PR merged` and `Secret
+   rotated first, then the PR merged.` — one trailing full stop apart, and
+   compared as strings they are two different unmet items."
+  [item]
+  (-> (str item) str/lower-case (str/replace #"[^a-z0-9]+" " ") str/trim))
+
+(defn escalated-file [ctx session]
+  (fs/path (:state-dir ctx) "judge" (str session ".escalated.json")))
+
+(defn escalated
+  "The goal keys this session has already escalated."
+  [ctx session]
+  (set (:keys (read-json (escalated-file ctx session)))))
+
 (defn escalate!
-  "One escalation line per DISTINCT unmet verdict. Graded once per handoff
-   attempt now, so a repeat only happens when the role tried again and still
-   fell short on something new.
+  "One escalation line per goal line, ever — not per grading, and not per
+   change of verdict.
+
+   escalation.md is append-only, so a line written twice cannot be taken back.
+   Comparing against the PREVIOUS verdict alone was not enough: an unmet set
+   that goes A, A, {A,B}, A writes A three times, and that is exactly what
+   GobelCutover did — four of its fifteen escalation bullets are one goal line,
+   `Secret rotated first, then the PR merged`, re-appended with four different
+   timestamps. What the reader needs to know is that the line is unmet, which
+   the first bullet already said; the live state is on the task page, in the
+   role card's verdict.
+
+   So each session keeps the goal keys it has escalated, and only genuinely new
+   ones are written — named on their own, rather than repeated inside a list
+   the reader has seen.
 
    Through note.bb, like every other writer. Appending here directly made the
    contract's `note.bb is the only writer` true of the roles — the hook denies
    them — and false of the tool itself, and the line it wrote carried no
    `[repo]` tag: in a task with three repos, the judge's own verdicts were the
    only escalations that did not say which one they were about."
-  [ctx session verdict previous]
-  (when (and (not (:met verdict))
-             (seq (:unmet verdict))
-             (not= (set (:unmet verdict)) (set (:unmet previous))))
-    (process/sh {:continue true
-                 :extra-env {"SWARMKHAZAD_SESSION" session
-                             "SWARMKHAZAD_TASK_ID" (:task-id ctx)
-                             "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))}}
-                "bb" (str (fs/path script-dir "note.bb")) "escalation"
-                (str session ": goal judge says unmet — " (str/join "; " (:unmet verdict)))
-                (str "at " (handoff-lib/timestamp)
-                     (when (:down verdict) (str "; judge unavailable: " (:error verdict)))))))
+  [ctx session verdict]
+  (when (and (not (:met verdict)) (seq (:unmet verdict)))
+    (let [seen (escalated ctx session)
+          fresh (vec (remove #(contains? seen (goal-key %)) (:unmet verdict)))]
+      (when (seq fresh)
+        (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
+        (spit (str (escalated-file ctx session))
+              (json/generate-string {:keys (vec (into seen (map goal-key fresh)))}))
+        (process/sh {:continue true
+                     :extra-env {"SWARMKHAZAD_SESSION" session
+                                 "SWARMKHAZAD_TASK_ID" (:task-id ctx)
+                                 "SWARMKHAZAD_TASK_DIR" (str (:task-dir ctx))}}
+                    "bb" (str (fs/path script-dir "note.bb")) "escalation"
+                    (str session ": goal judge says unmet — " (str/join "; " fresh))
+                    (str "at " (handoff-lib/timestamp)
+                         (when (:down verdict) (str "; judge unavailable: " (:error verdict)))))))))
 
 ;; ---------------------------------------------------------------- entry
 
@@ -361,14 +404,13 @@
    grading something else."
   [session]
   (let [{:keys [ctx row worktree goals other-roles]} (session-ctx session)
-        previous (read-json (verdict-file ctx session))
         verdict (-> (grade goals (working-state ctx session worktree (:repo row)))
                     (own-unmet-only (or (:role row) session) other-roles))]
     (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
     (spit (str (verdict-file ctx session))
           (json/generate-string (merge verdict {:role session :at (handoff-lib/timestamp)})
                                 {:pretty true}))
-    (escalate! ctx session verdict previous)
+    (escalate! ctx session verdict)
     verdict))
 
 (defn grade-cmd!

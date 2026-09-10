@@ -256,6 +256,37 @@
             (is (= "sk/t-ship" (:branch m)))
             (is (= "https://github.com/acme/gobel/pull/1" (:url m)))))))))
 
+(deftest done-means-the-prs-landed-not-that-the-last-role-finished
+  ;; The terminal broadcast used to put the card straight in `done`. That is
+  ;; the swarm marking its own homework: GobelCutover read done with three goal
+  ;; lines unmet and half its bars never run. Every handoff publishes now, so
+  ;; the PRs exist by this point — `in-review` is the honest lane, and pr_watch
+  ;; writes `done` when the last PR is MERGED or CLOSED.
+  (with-shipped-task
+    (fn [{:keys [dir env deliver!] :as t}]
+      ;; One handoff to record a PR, so this task has one at all.
+      (is (zero? (:exit (handoff! t "implement_gobel" "gobel" "review"))))
+      (is (fs/regular-file? (fs/path dir "state" "pr" "gobel.json")))
+      ;; `open` makes the board card; this harness only prepares, so the row
+      ;; the lane moves through has to be given to it. In `review`, because a
+      ;; card moves only once EVERY session of its lane's role has handed off.
+      (run {:env env} "bb" "-e"
+           (str "(load-file \"" scripts "/board_lib.bb\")"
+                "(board-lib/create-card! (task-lib/task-ctx \"t-ship\") \"t-ship\" \"review\")"))
+      (doseq [repo ["gobel" "cirdan"]]
+        (let [wt (fs/path dir "worktrees" repo)]
+          (write! (fs/path wt "reviewed.txt") "x\n")
+          (git wt "add" "reviewed.txt")
+          (git wt "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "review"))
+        ;; review is the last role, so each of these is a terminal broadcast.
+        (let [r (handoff! t (str "review_" repo) repo "implement")]
+          (is (zero? (:exit r)) (str (:out r) (:err r)))))
+      (deliver!)
+      (let [board (slurp (str (fs/path dir "state" "board" "tasks.tsv")))]
+        (is (str/includes? board "\tin-review\t")
+            (str "the last role finishing is not the work landing: " board))
+        (is (not (str/includes? board "\tdone\t")))))))
+
 (deftest ship-rewrites-the-body-of-the-pr-the-handoff-already-opened
   ;; Otherwise the early PR is permanently the one with no verdict in it: ship
   ;; used to print `PR already open` and leave the body alone.
