@@ -489,11 +489,26 @@
 
 (defn rpc
   "Feed the gateway a batch of frames; return the parsed replies in order.
-   A String frame is sent verbatim, so a malformed line can be tested."
+   A String frame is sent verbatim, so a malformed line can be tested.
+
+   In a home of its own holding one project, `fixture`. `add_task` reads the
+   projects to answer a name that is not one with the names that are, so
+   without this the replies are whatever projects the operator happens to have
+   — and every frame below names `fixture` so that it is the REPO shape each
+   one is refused for, not a missing project."
   [& frames]
-  (let [r (run {:in (str/join "\n" (map #(if (string? %) % (json/generate-string %)) frames)) :ok? false}
-               "bb" (str (fs/path scripts "mcp_gateway.bb")))]
-    (mapv #(json/parse-string % true) (remove str/blank? (str/split-lines (:out r))))))
+  (let [home (fs/create-temp-dir {:prefix "swarmkhazad-rpc."})]
+    (try
+      (fs/create-dirs (fs/path home "projects"))
+      (spit (str (fs/path home "projects" "fixture.edn"))
+            (pr-str {:repos ["/nowhere/fixture"]
+                     :roles [{:role "implement" :harness "claude"
+                              :model "anthropic:claude-opus-5[1m]"}]}))
+      (let [r (run {:in (str/join "\n" (map #(if (string? %) % (json/generate-string %)) frames))
+                    :ok? false :env {"SWARMKHAZAD_HOME" (str home)}}
+                   "bb" (str (fs/path scripts "mcp_gateway.bb")))]
+        (mapv #(json/parse-string % true) (remove str/blank? (str/split-lines (:out r)))))
+      (finally (fs/delete-tree home)))))
 
 (deftest the-gateway-exposes-one-tool-validates-the-key-and-never-answers-a-notification
   (let [replies (rpc {:jsonrpc "2.0" :id 1 :method "initialize" :params {}}
@@ -504,12 +519,15 @@
                      {:jsonrpc "2.0" :id 4 :method "tools/call"
                       :params {:name "close" :arguments {}}}
                      {:jsonrpc "2.0" :id 5 :method "tools/call"
-                      :params {:name "add_task" :arguments {:issue_key "MITH-1" :repo ["--investigate"]}}}
+                      :params {:name "add_task" :arguments {:issue_key "MITH-1" :project "fixture"
+                                                            :repo ["--investigate"]}}}
                      {:jsonrpc "2.0" :id 6 :method "tools/call"
-                      :params {:name "add_task" :arguments {:issue_key "MITH-1" :repo ["relative/path"]}}}
+                      :params {:name "add_task" :arguments {:issue_key "MITH-1" :project "fixture"
+                                                            :repo ["relative/path"]}}}
                      {:jsonrpc "2.0" :id 7 :method "tools/call"
                       :params {:name "add_task"
-                               :arguments {:issue_key "MITH-1" :repo ["/a" "/b" "/c" "/d" "/e"]}}}
+                               :arguments {:issue_key "MITH-1" :project "fixture"
+                                           :repo ["/a" "/b" "/c" "/d" "/e"]}}}
                      {:jsonrpc "2.0" :id 8 :method "tools/call" :params {:name "add_task"}}
                      "not json at all")]
     (testing "a notification carries no id and gets no reply"
@@ -531,11 +549,12 @@
       (is (true? (get-in (nth replies 7) [:result :isError]))))
     (testing "a line that is not JSON is a parse error and the stream carries on"
       (is (= -32700 (get-in (last replies) [:error :code]))))
-    (testing "one tool, and it takes an issue key"
+    (testing "one tool, and it takes an issue key and a project"
       (let [tools (get-in (second replies) [:result :tools])]
         (is (= 1 (count tools)) "every tool added here is another thing an unattended session can do at 3am")
         (is (= "add_task" (:name (first tools))))
-        (is (= ["issue_key"] (get-in (first tools) [:inputSchema :required])))))
+        (is (= ["issue_key" "project"] (get-in (first tools) [:inputSchema :required]))
+            "the key says what to build, the project says who builds it and where")))
     (testing "a key that is not a key is refused before it becomes an argv element or a task id"
       (let [r (get-in (nth replies 2) [:result])]
         (is (true? (:isError r)))
@@ -555,6 +574,8 @@
                                           (str "(load-file \"" scripts "/swarmkhazad.bb\") "
                                                "(prn (swarmkhazad/positional-args " (pr-str args) "))")))))]
     (is (= "[]" (positional ["--linear" "MITH-1" "--investigate" "--repo" "/p"])))
+    (is (= "[]" (positional ["--linear" "MITH-1" "--project" "duo" "--repo" "/p"]))
+        "`--project` takes a value, so its project is not left looking like the task id")
     (is (= "[\"mine\"]" (positional ["mine" "--linear" "MITH-1" "--investigate"])))
     (is (= "[\"mine\"]" (positional ["--investigate" "mine"]))
         "the token after a boolean flag is a positional, not its value")

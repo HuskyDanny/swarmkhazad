@@ -8,12 +8,22 @@
 ;; unbounded, and a session that may run ONE named tool is a much smaller thing
 ;; to leave running overnight.
 ;;
-;; The tool does no work of its own. It runs `swarmkhazad open --linear <KEY>`,
-;; which is the path a human uses at the terminal, so the issue arrives through
-;; linear_intake.bb's verbatim fetch — one MCP server, one allowed tool,
-;; schema-forced — and goal.md is provably the ticket's own text rather than a
-;; session's paraphrase of it. That guarantee is the reason the tool takes an
-;; issue KEY and not a description.
+;; The tool does no work of its own. It runs
+;; `swarmkhazad open --linear <KEY> --project <name>`, which is the path a human
+;; uses at the terminal, so the issue arrives through linear_intake.bb's
+;; verbatim fetch — one MCP server, one allowed tool, schema-forced — and
+;; goal.md is provably the ticket's own text rather than a session's paraphrase
+;; of it. That guarantee is the reason the tool takes an issue KEY and not a
+;; description.
+;;
+;; And a PROJECT, because the text is not the whole of a task: the lineup that
+;; will work on it, and the environment its @cloud bars dispatch to, both live
+;; on the project. Three tasks opened through this tool — mith-3633, mith-3635
+;; and mith-3636 — belong to no project and carry one role each, the scaffold's
+;; lone `implement`. No reviewer, no runner: nothing ever read the work back,
+;; and nothing downstream could tell, because a task with one role is exactly
+;; what a task that MEANT one role looks like. The project is where that answer
+;; already lives, so the tool asks for it rather than defaulting past it.
 ;;
 ;; One tool, not five. `close`, `paths` and the rest are already reachable from
 ;; the terminal and from the portal, and every one of them added here is another
@@ -30,6 +40,9 @@
 ;; owning a private copy of the grammar is what drifts, and the fetch this tool
 ;; ends up calling validates against that one.
 (load-file (str (fs/path script-dir "linear_intake.bb")))
+;; For reading the projects, so a bad name is answered here with the list of
+;; real ones instead of arriving as an `open` that exits 1.
+(load-file (str (fs/path script-dir "project_lib.bb")))
 
 (def protocol-version "2024-11-05")
 
@@ -40,20 +53,26 @@
         "operator's own Linear MCP credential and becomes the task's goal.md; nothing is "
         "summarised. An existing task folder for this key is opened as it stands rather than "
         "overwritten.\n\n"
-        "`repo` is required in practice: a task with no checkout is refused at prepare "
-        "(`repos declaration is empty`), because every role's session is opened in a worktree. "
-        "Pass the checkout the ticket's `repo:*` label maps to.\n\n"
+        "`project` is required and decides how the task runs: it inherits that project's "
+        "checkouts, its role lineup (implement → review → run, rather than one lone implement "
+        "role) and its cloud environment, which is what an @cloud bar dispatches against. "
+        "A name that is not a project is refused with the real ones listed, so a wrong guess "
+        "costs one call and never opens anything.\n\n"
+        "`repo` is optional and NARROWS: the task runs in the project's checkouts unless you "
+        "name a subset of them. A path the project does not hold is refused rather than added.\n\n"
         "`investigate` picks the two-role investigation lineup (investigate → run) instead of the "
-        "default single `implement` role. Use it for a ticket with no Evidence label.")
+        "project's lineup. Use it for a ticket with no Evidence label.")
    :inputSchema
    {:type "object"
     :properties {:issue_key {:type "string"
                              :description "The Linear issue key, e.g. MITH-1234."}
+                 :project {:type "string"
+                           :description "The project this task belongs to — its checkouts, roles and cloud environment."}
                  :repo {:type "array" :items {:type "string"}
-                        :description "Absolute paths of the checkouts this task works in."}
+                        :description "Absolute paths, a subset of the project's checkouts. Default: all of them."}
                  :investigate {:type "boolean"
                                :description "Open the investigation lineup (investigate → run). Default false."}}
-    :required ["issue_key"]}})
+    :required ["issue_key" "project"]}})
 
 (def max-repos
   "A ticket names one checkout, sometimes two. The cap is not about disk — it is
@@ -71,16 +90,32 @@
 (defn validate
   "The arguments as `open` should receive them, or {:error <why>}.
 
-   Both fields are checked HERE as well as downstream, and that is not
+   Every field is checked HERE as well as downstream, and that is not
    duplication: they arrive from a MODEL and become argv elements, a task id,
    and a git checkout path. `open` and `check-repos!` would refuse a bad one
-   too, but only after being handed whatever string came in."
-  [{:keys [issue_key repo investigate]}]
+   too, but only after being handed whatever string came in.
+
+   `project` is the one that has to be checked here even though `open` checks
+   it as well, because the failure it prevents is not a bad value — it is the
+   ABSENT one. A call with no project used to scaffold a task with a single
+   implement role, no reviewer, no runner and no cloud environment, and nothing
+   downstream could tell that apart from a task that meant it."
+  [{:keys [issue_key project repo investigate]}]
   (let [repos (cond (string? repo) [repo] (sequential? repo) (vec repo) :else [])
         bad (remove #(and (string? %) (str/starts-with? % "/")) repos)]
     (cond
       (not (linear-intake/valid-issue-key? issue_key))
       {:error (str "not a Linear issue key: " (pr-str issue_key))}
+
+      ;; `read-project` is total: an invalid name has no file, so this one
+      ;; branch answers a missing project, a misspelt one and a deleted one.
+      (nil? (project-lib/read-project project))
+      {:error (str "`project` is required and must name a real project; got " (pr-str project)
+                   ". A task opens inside a project so it inherits that project's checkouts, "
+                   "role lineup and cloud environment. "
+                   (if-let [known (seq (map :name (project-lib/list-projects)))]
+                     (str "Known projects: " (str/join ", " known) ".")
+                     "No projects exist yet — create one on the portal's index page."))}
 
       (seq bad)
       ;; A leading `-` would be read as a flag rather than as the value of
@@ -91,17 +126,26 @@
       (> (count repos) max-repos)
       {:error (str "at most " max-repos " repos; got " (count repos))}
 
-      :else {:issue-key issue_key :repos repos :investigate (true? investigate)})))
+      :else {:issue-key issue_key :project project :repos repos
+             :investigate (true? investigate)})))
+
+(defn open-argv
+  "The `open` invocation a validated call becomes. Its own function because it
+   is the seam this tool exists to hold: every guarantee above is a flag here,
+   and a flag that stops being passed is invisible from either side."
+  [{:keys [issue-key project repos investigate]}]
+  (concat ["bb" (str (fs/path script-dir "swarmkhazad.bb")) "open"
+           "--linear" issue-key "--project" project]
+          (when investigate ["--investigate"])
+          (mapcat (fn [p] ["--repo" p]) repos)))
 
 (defn add-task!
   "Shell `swarmkhazad open`. Returns {:ok? :text}."
   [args]
-  (let [{:keys [error issue-key repos investigate]} (validate args)]
+  (let [{:keys [error] :as call} (validate args)]
     (if error
       {:ok? false :text error}
-      (let [argv (concat ["bb" (str (fs/path script-dir "swarmkhazad.bb")) "open" "--linear" issue-key]
-                         (when investigate ["--investigate"])
-                         (mapcat (fn [p] ["--repo" p]) repos))
+      (let [argv (open-argv call)
             ;; `:in ""` and not the default. The default is INHERIT, and this
             ;; process's stdin is the JSON-RPC transport — so `open`, and the
             ;; headless `claude -p` it runs for the Linear fetch, would read the

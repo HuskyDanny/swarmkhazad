@@ -343,4 +343,53 @@
   :old "  (when (fs/directory? (:task-dir ctx))\n    (fs/create-dirs (:daemon-dir ctx))"
   :new "  (do\n    (fs/create-dirs (:daemon-dir ctx))"
   :killed-by "a-daemon-outlives-nothing"
-  :why "logs into a deleted task folder, rebuilding it — the state-only skeletons found in TMPDIR"}]
+  :why "logs into a deleted task folder, rebuilding it — the state-only skeletons found in TMPDIR"}
+ ;; ------------------------------------- a task belongs to a project
+ {:file "scripts/mcp_gateway.bb"
+  :ns "mcp"
+  :old "      (nil? (project-lib/read-project project))"
+  :new "      (and false (nil? (project-lib/read-project project)))"
+  :killed-by "the-tool-requires-a-project-and-says-which-ones-exist"
+  :why "a call with no project opens a task anyway — one implement role, no reviewer, no runner, which is what mith-3633, mith-3635 and mith-3636 each got"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "mcp"
+  :old "           \"--linear\" issue-key \"--project\" project]"
+  :new "           \"--linear\" issue-key]"
+  :killed-by "a-call-that-names-a-project-passes-it-through-to-open"
+  :why "the project is validated and then dropped on the way to `open` — the seam is invisible from both sides, since the tool answers ok and the task looks like one that meant one role"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "investigation"
+  :old "  #{\"--linear\" \"--repo\" \"--project\"})"
+  :new "  #{\"--linear\" \"--repo\"})"
+  :killed-by "a-boolean-flag-does-not-swallow-the-token-after-it"
+  :why "`--project` stops consuming its value, so `open --linear K --project duo` scaffolds a task called `duo`"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "mcp"
+  :old "          (spit (str (:roles-file ctx)) (project-lib/roles-text project)))"
+  :new "          nil)"
+  :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
+  :why "a task inside a project keeps the scaffold's lone implement role, so the project decides the scope and nothing decides who reviews the work"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "mcp"
+  :old "        (spit (str (project-lib/task-project-file ctx)) (str (:name project) \"\\n\"))"
+  :new "        nil"
+  :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
+  :why "the task never records which project it belongs to, so `cloud-env-for` finds no environment and the portal lists it outside every project"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "mcp"
+  :old "      (when (seq outside)"
+  :new "      (when (seq nil)"
+  :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
+  :why "a `--repo` the project does not hold is added instead of refused, so the scope a project exists to bound widens from the command line"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "mcp"
+  :old "      {:project project :repos (if (seq picked) (vec picked) (vec (:repos project)))})))"
+  :new "      {:project project :repos (vec (:repos project))})))"
+  :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
+  :why "`--repo` stops narrowing and every task fans out over the whole project — gobelhygine's $23.48 over three trees that could not hold the change, repeated at the CLI"}]
