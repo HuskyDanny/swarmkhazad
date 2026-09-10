@@ -11,11 +11,14 @@
 
 (def usage-text
   (str "Usage:\n"
-       "  swarmkhazad new <task-id> [--repo <path>]... [--linear <KEY>] [--investigate]\n"
-       "                                                 scaffold goal.md, metrics.md, roles\n"
+       "  swarmkhazad new <task-id> [--project <name>] [--repo <path>]... [--linear <KEY>] [--investigate]\n"
+       "                                                 scaffold goal.md, metrics.md, roles;\n"
+       "                                                 --project takes that project's checkouts, role\n"
+       "                                                 lineup and cloud environment, and --repo then\n"
+       "                                                 narrows to a subset of them\n"
        "  swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
-       "  swarmkhazad open --linear <KEY> [--repo <path>]... [--investigate]\n"
+       "  swarmkhazad open --linear <KEY> [--project <name>] [--repo <path>]... [--investigate]\n"
        "                                                 scaffold from a Linear issue, then open;\n"
        "                                                 --investigate uses the investigate → run lineup\n"
        "                                                 instead of a single implement role\n"
@@ -79,7 +82,7 @@
    positional scan that assumes EVERY flag takes a value swallows the token
    after a boolean one, so `open --linear K --investigate --repo /p` read `/p`
    as the task id and scaffolded a task called `/p`."
-  #{"--linear" "--repo"})
+  #{"--linear" "--repo" "--project"})
 
 (defn positional-args
   "The bare arguments, with every flag — and the value of a value-taking flag —
@@ -92,18 +95,55 @@
       (str/starts-with? a "-") (recur more out)
       :else (recur more (conj out a)))))
 
+(defn project-scope!
+  "The project `--project` names and the checkouts a task inside it runs in, or
+   nil when no project was named. Exits on a project that does not exist or a
+   checkout it does not hold.
+
+   The project owns the scope and the task picks inside it, exactly as the
+   portal's form does: `--repo` narrows, it never widens, and naming none means
+   all of them. Widening is one edit on the project's page — a decision with a
+   name on it — rather than a project that grows every time a task needs one
+   more tree."
+  [args]
+  (when-let [name (first (flag-values args "--project"))]
+    (let [project (project-lib/read-project name)
+          _ (when-not project
+              (task-lib/fail! (str "no such project: " name
+                                   (if-let [known (seq (map :name (project-lib/list-projects)))]
+                                     (str " — known: " (str/join ", " known))
+                                     " — create one on the portal's index page"))))
+          scope (set (:repos project))
+          picked (flag-values args "--repo")
+          outside (remove scope picked)]
+      (when (seq outside)
+        (task-lib/fail! (str "not in project " name ": " (str/join ", " outside)
+                             " — add the checkout on the project's edit page first, "
+                             "then open the task")))
+      (when (empty? scope)
+        (task-lib/fail! (str "project " name " holds no checkouts — add one on its edit page")))
+      {:project project :repos (if (seq picked) (vec picked) (vec (:repos project)))})))
+
 (defn new!
   "Scaffold a task folder. With --linear <KEY> the goal comes from the issue
    instead of the template, and `roles` is one implement role.
 
-   `--repo` takes any checkout, and that is deliberate. The portal has two
-   levels — a project owns the repo scope and a task picks a subset of it, so a
-   checkout the project does not hold is a project edit — and this is below
-   both: no project, no scope, whatever paths you name. It is the door you use
-   when the portal is the thing that is broken. `check-repos!` still refuses a
-   path that is not a git checkout."
+   With `--project <name>` the task belongs to that project: its checkouts are
+   the project's (narrowed by `--repo`), its `roles` file is the project's
+   lineup rather than the single implement role, and it drops a `project` file
+   so the portal lists it there and its @cloud bars find the project's
+   environment. `--investigate` still wins over the lineup — the investigation
+   lane IS a different pair of roles, and a project cannot mean otherwise.
+
+   Without `--project`, `--repo` takes any checkout, and that is deliberate.
+   The portal has two levels — a project owns the repo scope and a task picks a
+   subset of it — and this is below both: no project, no scope, whatever paths
+   you name. It is the door you use when the portal is the thing that is
+   broken. `check-repos!` still refuses a path that is not a git checkout."
   [task-id args]
-  (let [repos (flag-values args "--repo")
+  (let [scope (project-scope! args)
+        project (:project scope)
+        repos (if scope (:repos scope) (flag-values args "--repo"))
         issue-key (first (flag-values args "--linear"))
         investigate? (boolean (some #{"--investigate"} args))
         ctx (task-lib/task-ctx task-id)]
@@ -122,6 +162,13 @@
         (do (spit (str (:goal-file ctx)) (goal-template task-id))
             (spit (str (:roles-file ctx)) (task-lib/roles-template repos investigate?))
             (spit (str (:repos-file ctx)) (task-lib/repos-text repos))))
+      (when project
+        ;; Written after either scaffold, so there is one place a project
+        ;; overrides what the lane wrote rather than a branch inside both.
+        (when-not investigate?
+          (spit (str (:roles-file ctx)) (project-lib/roles-text project)))
+        (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
+        (println (str "project: " (:name project))))
       (println (str (:task-dir ctx))))))
 
 (defn prepare! [task-id]
