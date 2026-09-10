@@ -33,6 +33,14 @@ case "$1 $2" in
     done
     # What a real gh prints on success: the URL, nothing else.
     echo "https://github.com/acme/$here/pull/1" ;;
+  "pr edit")
+    # Same body capture as create: the PR a role's handoff opened is the one
+    # ship later rewrites with the verdict, so a test reads both from one file.
+    for a in "$@"; do
+      [ -n "${want_body:-}" ] && { cp "$a" "${GH_STUB_LOG:-/dev/null}.body-$here"; unset want_body; }
+      [ "$a" = "--body-file" ] && want_body=1
+    done
+    echo "https://github.com/acme/$here/pull/${3:-1}" ;;
   "api graphql")
     if [ -n "${GH_STUB_API_FAILS:-}" ]; then
       echo "stub gh: could not reach api.github.com" >&2

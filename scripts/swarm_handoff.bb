@@ -16,6 +16,13 @@
 ;; files that commit changed plus the sender's draft-<role>.md when it exists.
 ;; The last role's git_handoff is the terminal broadcast: it is marked
 ;; non-forwarding, recipients merge and stop, and the board card goes to done.
+;;
+;; A git_handoff also PUBLISHES: the branch goes to origin and a draft PR is
+;; opened on it if there is not one already. That is a precondition rather than
+;; a courtesy — the cloud runner clones from origin and comments its findings
+;; on the PR, so a task whose branch is local has nowhere for its answers to
+;; come back to, and a branch that lives only in a worktree is one
+;; `close --reclaim` from gone.
 
 (ns swarm-handoff
   (:require [babashka.fs :as fs]
@@ -272,6 +279,50 @@
                                 (refusals ctx sender) " of " max-refusals
                                 "). Address the items, then send it again, or write the block to escalation.md.")))))))
 
+;; ---------------------------------------------------------------- publish
+
+(defn publish-branch!
+  "Put this commit on origin and make sure the branch has a draft PR, before
+   the handoff is queued.
+
+   Here rather than in a role's prompt, because a prompt is advice and this is
+   a precondition for three things that come after it. The next role reviews a
+   branch; the cloud runner clones from ORIGIN and comments its findings on the
+   PR, so a task with no PR has nowhere for its answers to come back to; and a
+   branch that exists only in a worktree is one `close --reclaim` from gone.
+   Every one of those failures is silent — the work looks finished until
+   somebody goes looking for it.
+
+   The push is required and a failure stops the handoff: the role sees git's
+   own error and can fix it or escalate. Publishing is skipped, with a line
+   saying so, when there is nowhere to push — a checkout whose origin is not a
+   GitHub repo, or a commit that adds nothing past the default branch."
+  [ctx row]
+  (load-file (str (fs/path script-dir "ship.bb")))
+  (let [entry (first (filter #(= (:repo row) (:name %)) (task-lib/parse-repos ctx)))
+        plan (when entry ((resolve 'ship/repo-plan) ctx entry))]
+    (cond
+      (nil? entry)
+      (println (str "publish: no `repos` entry named " (pr-str (:repo row)) " — nothing pushed"))
+
+      (nil? plan)
+      (println (str "publish: " (:name entry) " has no commits past its default branch — nothing pushed"))
+
+      (nil? (:slug plan))
+      (println (str "publish: " (:name entry) " has no github.com origin — nothing pushed"))
+
+      :else
+      (do (println (str "publishing " (:repo plan) " " (:branch plan) " before the handoff…"))
+          (let [{:keys [url opened?]} ((resolve 'ship/publish!)
+                                       ctx plan
+                                       ((resolve 'ship/title) ctx)
+                                       ;; No summary at this point, and there
+                                       ;; will not be one until someone asks for
+                                       ;; a verdict. `ship` sets the body again
+                                       ;; when there is.
+                                       ((resolve 'ship/body-for) ctx plan nil))]
+            (println (str (if opened? "DRAFT PR OPENED: " "PUSHED, PR ALREADY OPEN: ") url)))))))
+
 (defn complete-current! [ctx sender]
   (when (seq (in-process-files ctx sender))
     (let [result (process/sh {:continue true} "bb" (str (fs/path script-dir "done_with_current.bb")))]
@@ -333,6 +384,9 @@
                         " file(s); send it as an ordinary handoff.")))
         (when-let [dup (and git? (duplicate-active ctx sender recipients commit))]
           (exit! 1 (str "Duplicate active handoff for the same from/to/commit: " dup)))
+        ;; Before the handoff is written, so a push that fails leaves no
+        ;; handoff claiming work the next role cannot fetch.
+        (when (and git? (not no-change?)) (publish-branch! ctx row))
         (let [verdict (when git? (judge-verdict ctx sender))
               ;; Forwarded past a spent budget: the recipient reads what is
               ;; unfinished on the handoff itself, not only in a file. Any
