@@ -527,6 +527,14 @@
 
 ;; ---------------------------------------------------------------- open gates
 
+(defn task-bars
+  "Every Quantitative bar metrics.md declares, or nothing when there is no
+   metrics.md yet."
+  [ctx]
+  (if (fs/regular-file? (:metrics-file ctx))
+    (run-evidence/bars ctx (slurp (str (:metrics-file ctx))))
+    []))
+
 (defn unmeasured-bars
   "Bars carrying a `measure:` command that no role in this task will run.
 
@@ -545,36 +553,80 @@
    invokes the runner, so renaming the role cannot make this wrong in either
    direction."
   [ctx roles]
-  (let [metrics (if (fs/regular-file? (:metrics-file ctx))
-                  (slurp (str (:metrics-file ctx)))
-                  "")
-        ;; A still-angle-bracketed command is a template placeholder, not a bar
+  (let [;; A still-angle-bracketed command is a template placeholder, not a bar
         ;; anyone meant to run. Counting it refused a freshly scaffolded task,
         ;; and the scaffold is the one file the operator has not written yet.
         placeholder? #(re-find #"<[^>]+>" (str %))
         commanded (remove #(placeholder? (:command %))
-                          (filter :command (run-evidence/bars ctx metrics)))]
+                          (filter run-evidence/runnable? (task-bars ctx)))]
     (when (and (seq commanded)
                (not (some #(str/includes? (stage-prompt (:role %)) "run_evidence.bb")
                           roles)))
       (vec commanded))))
 
-(defn require-measurable!
-  "Refuse to open a task whose quantitative bars have no one to measure them.
+(defn unreadable-bars
+  "Bars with an unclosed backtick span, so what the line says is not what it
+   means. See `run-evidence/unclosed-quote?` for the one that shipped."
+  [ctx]
+  (seq (filter run-evidence/unclosed-quote? (task-bars ctx))))
 
-   Refusing rather than warning, because the failure leaves no trace: a bar
-   that never ran writes no evidence file, and neither does one that ran and
-   produced nothing."
+(defn undispatchable-bars
+  "@cloud bars with nowhere to dispatch to.
+
+   Today such a bar runs the whole swarm, reaches the run role, and writes
+   `blocked` into its evidence file — after every session has been opened and
+   an hour of work has been done against a bar that could never have been
+   measured. The environment is a field on the project and is known before
+   anything is spawned, so this is answerable at the door."
+  [ctx]
+  (when-not (project-lib/cloud-env-for ctx)
+    (seq (filter run-evidence/cloud-bar? (task-bars ctx)))))
+
+(defn require-measurable!
+  "Refuse to open a task whose quantitative bars cannot produce evidence.
+
+   Three faults, each with its own fix, and all of them reported at once — an
+   operator fixing metrics.md should not learn about the second one by opening
+   the task again.
+
+   Refusing rather than warning, because every one of these failures leaves no
+   trace, or worse, leaves a trace that reads as a measurement. A bar nobody
+   runs writes no evidence file. A bar whose quoted identifier is run as a
+   command writes `exit: 127`, which reads exactly like a bar that failed."
   [ctx roles]
-  (when-let [orphans (unmeasured-bars ctx roles)]
-    (throw (ex-info
+  (let [faults
+        (remove
+         nil?
+         [(when-let [orphans (unmeasured-bars ctx roles)]
             (str "metrics.md declares " (count orphans)
-                 " measure: command(s) that no role will run:\n"
+                 " bar(s) that no role will measure:\n"
                  (str/join "\n" (for [b orphans]
-                                  (str "  - " (:name b) " — measure: `" (:command b) "`")))
+                                  (str "  - " (:name b) " — measure: "
+                                       (or (some->> (:command b) (format "`%s`")) (:measure b)))))
                  "\n\nAdd a role whose prompt runs run_evidence.bb — the `run` role —"
-                 "\nor move these under ## Qualitative, which names a human judge.")
-            {:exit 1}))))
+                 "\nor move these under ## Qualitative, which names a human judge."))
+
+          (when-let [broken (unreadable-bars ctx)]
+            (str "metrics.md has " (count broken)
+                 " bar(s) with an unclosed backtick span:\n"
+                 (str/join "\n" (for [b broken]
+                                  (str "  - " (:name b)
+                                       "\n      bar: " (:threshold b)
+                                       "\n      measure: " (:measure b))))
+                 "\n\nA ` — ` inside a backticked command splits the line one field early, so"
+                 "\nboth halves parse and neither means anything. Close the span, or take the"
+                 "\nem dash out of the command."))
+
+          (when-let [cloud (undispatchable-bars ctx)]
+            (str "metrics.md declares " (count cloud)
+                 " @cloud bar(s) and this task has no self-hosted environment:\n"
+                 (str/join "\n" (for [b cloud] (str "  - " (:name b))))
+                 "\n\nSet the environment on the task's project — the field is on the project"
+                 "\nform, beside the checkouts — or export SWARMKHAZAD_CLOUD_ENV to override it"
+                 "\nonce. Without one there is nowhere to dispatch to, and the bar comes back"
+                 "\n`blocked` after the whole swarm has run."))])]
+    (when (seq faults)
+      (throw (ex-info (str/join "\n\n" faults) {:exit 1})))))
 
 (defn- dir-kb [p]
   (let [r (process/sh {:continue true} "du" "-sk" (str p))]

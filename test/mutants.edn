@@ -392,4 +392,40 @@
   :old "      {:project project :repos (if (seq picked) (vec picked) (vec (:repos project)))})))"
   :new "      {:project project :repos (vec (:repos project))})))"
   :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
-  :why "`--repo` stops narrowing and every task fans out over the whole project — gobelhygine's $23.48 over three trees that could not hold the change, repeated at the CLI"}]
+  :why "`--repo` stops narrowing and every task fans out over the whole project — gobelhygine's $23.48 over three trees that could not hold the change, repeated at the CLI"}
+
+ ;; ------------------------------------- a bar that cannot be measured
+ {:file "scripts/run_evidence.bb"
+  :ns "base"
+  :old "  #\"(?s)^`([^`]+)`\\s*(?:→.*)?$\")"
+  :new "  #\"`([^`]+)`\")"
+  :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
+  :why "the first backticked span anywhere in a prose measure is run as a shell command — GobelCutover's `tools/list`, `update_chart` and a Secrets Manager path each exited 127, reported as four failing bars"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "base"
+  :old "  (seq (filter run-evidence/unclosed-quote? (task-bars ctx))))"
+  :new "  nil)"
+  :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
+  :why "a bar whose backtick span is never closed opens anyway, with a threshold that is half a command and a measure whose only closed span is ` → `"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "base"
+  :old "  (when-not (project-lib/cloud-env-for ctx)"
+  :new "  (when-not true"
+  :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
+  :why "an @cloud bar with no environment opens the whole swarm and comes back `blocked` an hour after the answer was knowable"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "base"
+  :old "                          (filter run-evidence/runnable? (task-bars ctx)))]"
+  :new "                          (filter :command (task-bars ctx)))]"
+  :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
+  :why "an @cloud bar has no :command, so a task can declare one with no role to dispatch it and open — the dispatch never happens and no evidence file is ever written"}
+
+ {:file "scripts/swarm_lib.bb"
+  :ns "base"
+  :old "      (throw (ex-info (str/join \"\\n\\n\" faults) {:exit 1})))))"
+  :new "      (throw (ex-info (first faults) {:exit 1})))))"
+  :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
+  :why "only the first fault is reported, so an operator fixing metrics.md learns about the second one by opening the task again"}]

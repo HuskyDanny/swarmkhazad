@@ -270,6 +270,118 @@
       (is (not (str/includes? tmpl "\"## Quantitative\\n- <metric>"))
           "the grammar must be a comment, not a bullet"))))
 
+(defn- eval-in-swarm-lib
+  "Evaluate one form against swarm_lib.bb in a child bb and read back its
+   value. A child, because the environment is an input here: `cloud-env-for`
+   reads SWARMKHAZAD_CLOUD_ENV and the projects under SWARMKHAZAD_HOME, and
+   this JVM cannot set either."
+  [env form]
+  (let [r (process/sh {:continue true :extra-env env}
+                      "bb" "-e" (str "(load-file \"scripts/swarm_lib.bb\") (pr " form ")"))]
+    (when-not (zero? (:exit r)) (throw (ex-info (str (:out r) (:err r)) {})))
+    (read-string (str/trim (:out r)))))
+
+(defn- cloud-task!
+  "A home holding task `t`, whose one bar is @cloud. Returns the home."
+  [& {:keys [project cloud-env]}]
+  (let [home (fs/create-temp-dir {:prefix "sk-cloud-"})
+        dir (fs/path home "tasks" "t")]
+    (fs/create-dirs dir)
+    (spit (str (fs/path dir "goal.md")) "# t\n## Goal\n- [ ] a thing\n")
+    (spit (str (fs/path dir "metrics.md"))
+          "# t — bars\n\n## Quantitative\n- reproduces on release — bar: exits 7 — measure: @cloud `false`\n")
+    (when project
+      (spit (str (fs/path dir "project")) (str project "\n"))
+      (fs/create-dirs (fs/path home "projects"))
+      (spit (str (fs/path home "projects" (str project ".edn")))
+            (pr-str (cond-> {:repos [] :roles []} cloud-env (assoc :cloud-env cloud-env)))))
+    home))
+
+(deftest a-bar-that-cannot-be-measured-is-refused-at-the-door
+  ;; GobelCutover, live: eight Quantitative bars, four of them `exit: 127`.
+  ;; Nothing was broken about the code under test — the parser had taken the
+  ;; first backticked span in a PROSE measure and run it as a shell command, so
+  ;; `tools/list`, `update_chart` and a Secrets Manager path were each executed
+  ;; and each answered `command not found`. The operator saw four red bars over
+  ;; a PR that changed one URL literal.
+
+  (testing "prose that merely quotes something is prose, and only a command is a command"
+    (let [ctx (metrics-ctx
+               (str "## Quantitative\n"
+                    "- tool surface unchanged — bar: delta 0 — measure: gobel `tools/list` count, before and after\n"
+                    "- a write persists — bar: all three calls — measure: `update_chart` on a chart returns success, then a read back\n"
+                    "- secrets paired — bar: equal — measure: `a/b` (dev) digest == prod `c/d`\n"
+                    "- edge gate holds — bar: 403 — measure: `curl -sS https://x/mcp` → `403`\n"))
+          bars (run-evidence/bars ctx (slurp (str (:metrics-file ctx))))]
+      (is (= [nil nil nil "curl -sS https://x/mcp"] (mapv :command bars))
+          "the three that quote an identifier have no command; the one that IS a command keeps it")
+      (testing "so the measure-owner gate asks about the command and not about the prose"
+        ;; Before, all four counted, and all four ran.
+        (is (= ["edge gate holds"]
+               (mapv :name (swarm-lib/unmeasured-bars ctx [{:role "implement"}])))))))
+
+  (testing "an unclosed backtick span is refused, showing both halves of the split"
+    ;; The line as it shipped. The ` — ` inside the backticked command split it
+    ;; one field early: `bar:` ends mid-span, `measure:` begins mid-span, and
+    ;; the only closed span left in the measure is the two characters ` → `,
+    ;; which is what ran.
+    (let [ctx (metrics-ctx
+               (str "## Quantitative\n"
+                    "- no secret in the diff — bar: `git diff origin/main... \\ — measure: "
+                    "grep -cE '[A-Za-z0-9+/]{40,}={0,2}'` → `0`\n"))
+          broken (swarm-lib/unreadable-bars ctx)]
+      (is (= ["no secret in the diff"] (mapv :name broken)))
+      (is (nil? (:command (first broken)))
+          "and nothing is run for it — ` → ` is not a command either")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unclosed backtick"
+                            (swarm-lib/require-measurable! ctx [{:role "implement"} {:role "run"}])))))
+
+  (testing "a bar that quotes a balanced pair is not refused"
+    ;; The half that keeps the guard from being a nuisance: prose may quote.
+    (let [ctx (metrics-ctx
+               "## Quantitative\n- secrets paired — bar: equal — measure: `a/b` digest == prod `c/d`\n")]
+      (is (nil? (swarm-lib/unreadable-bars ctx)))
+      (is (nil? (swarm-lib/require-measurable! ctx [{:role "implement"}])))))
+
+  (testing "an @cloud bar is a bar somebody has to dispatch"
+    ;; It has no `:command` — its measure opens with the marker — so a gate
+    ;; keyed on `:command` alone let a task declare one with no run role and
+    ;; open anyway. The dispatch never happens and the evidence file is never
+    ;; written, which is the same silence this gate exists to break.
+    (let [ctx (metrics-ctx
+               "## Quantitative\n- reproduces on release — bar: exits 7 — measure: @cloud `false`\n")]
+      (is (= ["reproduces on release"]
+             (mapv :name (swarm-lib/unmeasured-bars ctx [{:role "implement"}]))))
+      (is (nil? (swarm-lib/unmeasured-bars ctx [{:role "implement"} {:role "run"}])))))
+
+  (testing "and an @cloud bar with nowhere to dispatch is refused before anything is spawned"
+    ;; Today it opens the whole swarm, reaches the run role, and writes
+    ;; `blocked` into the evidence file — an hour after the answer was knowable.
+    (let [none (cloud-task!)
+          named (cloud-task! :project "p")
+          set-up (cloud-task! :project "p" :cloud-env "ccpool_FROMPROJECT")
+          ask (fn [home env]
+                (eval-in-swarm-lib (merge {"SWARMKHAZAD_HOME" (str home)} env)
+                                   "(mapv :name (swarm-lib/undispatchable-bars (task-lib/task-ctx \"t\")))"))]
+      (try
+        (is (= ["reproduces on release"] (ask none {})) "no project at all")
+        (is (= ["reproduces on release"] (ask named {})) "a project that declares no environment")
+        (is (= [] (ask set-up {})) "the environment on the project is the answer")
+        (is (= [] (ask named {"SWARMKHAZAD_CLOUD_ENV" "ccpool_OVERRIDE"}))
+            "and the variable still overrides it for a one-off dispatch")
+        (finally (run! fs/delete-tree [none named set-up])))))
+
+  (testing "three faults in one metrics.md are three messages, not three opens"
+    (let [ctx (metrics-ctx
+               (str "## Quantitative\n"
+                    "- orphan — bar: 0 — measure: `echo hi`\n"
+                    "- broken — bar: `half \\ — measure: a'` → `0`\n"))
+          e (try (swarm-lib/require-measurable! ctx [{:role "implement"}])
+                 (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e))
+      (is (str/includes? (ex-message e) "no role will measure"))
+      (is (str/includes? (ex-message e) "unclosed backtick")))))
+
 (deftest a-crossed-off-escalation-is-not-an-open-ask
   ;; escalation.md is append-only, so a wrong bullet can only be followed by
   ;; another retracting it. Measured: the file opened with `probe — probe`, and
