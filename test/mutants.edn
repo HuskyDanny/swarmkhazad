@@ -486,4 +486,26 @@
   :old "    (do (set-pr-body! plan (:number pr) body)"
   :new "    (do nil"
   :killed-by "ship-rewrites-the-body-of-the-pr-the-handoff-already-opened"
-  :why "the PR a handoff opened keeps `No verdict yet` in its body forever — ship prints `PR already open` and leaves the one thing a reviewer reads first unwritten"}]
+  :why "the PR a handoff opened keeps `No verdict yet` in its body forever — ship prints `PR already open` and leaves the one thing a reviewer reads first unwritten"}
+
+ ;; ------------------------------------- done is earned, and a line is escalated once
+ {:file "scripts/handoffd.bb"
+  :ns "ship"
+  :old "                    (if (seq (pr-watch/shipped ctx)) board-lib/review-lane \"done\")"
+  :new "                    \"done\""
+  :killed-by "done-means-the-prs-landed-not-that-the-last-role-finished"
+  :why "the swarm marks its own homework — the card reads done because the last role finished, with goal lines unmet and PRs nobody has merged"}
+
+ {:file "scripts/goal_judge.bb"
+  :ns "judge"
+  :old "          fresh (vec (remove #(contains? seen (goal-key %)) (:unmet verdict)))]"
+  :new "          fresh (vec (:unmet verdict))]"
+  :killed-by "one-goal-line-is-escalated-once-however-often-it-is-graded"
+  :why "every grading re-appends every unmet line to append-only escalation.md — GobelCutover's four bullets for one goal line"}
+
+ {:file "scripts/goal_judge.bb"
+  :ns "judge"
+  :old "  (-> (str item) str/lower-case (str/replace #\"[^a-z0-9]+\" \" \") str/trim))"
+  :new "  (str item))"
+  :killed-by "one-goal-line-is-escalated-once-however-often-it-is-graded"
+  :why "the same goal line worded twice is two items, so a trailing full stop is enough to write it again"}]
