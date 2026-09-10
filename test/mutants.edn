@@ -464,4 +464,26 @@
   :old "                           [\"release.md — what must be true around the merge, not about the diff\" :release-file]"
   :new "                           [\"release.md\" :decision-file]"
   :killed-by "the-task-page-is-a-view-of-the-folder-and-the-index-lists-it"
-  :why "release.md is written and rendered nowhere — a precondition recorded and invisible, which is the worst place for one"}]
+  :why "release.md is written and rendered nowhere — a precondition recorded and invisible, which is the worst place for one"}
+
+ ;; ------------------------------------- the branch is on origin before the handoff
+ {:file "scripts/swarm_handoff.bb"
+  :ns "ship"
+  :old "        (when (and git? (not no-change?)) (publish-branch! ctx row))"
+  :new "        (when (and false git? (not no-change?)) (publish-branch! ctx row))"
+  :killed-by "a-handoff-puts-the-branch-on-origin-and-opens-its-draft-pr"
+  :why "the work is handed over living only in a worktree — the next role reviews a branch that is not at the remote, the cloud runner has no PR to comment on, and `close --reclaim` deletes it"}
+
+ {:file "scripts/ship.bb"
+  :ns "ship"
+  :old "  (when-not (:pushed? plan) (push! plan))"
+  :new "  nil"
+  :killed-by "a-handoff-puts-the-branch-on-origin-and-opens-its-draft-pr"
+  :why "the PR is opened on a branch that was never pushed"}
+
+ {:file "scripts/ship.bb"
+  :ns "ship"
+  :old "    (do (set-pr-body! plan (:number pr) body)"
+  :new "    (do nil"
+  :killed-by "ship-rewrites-the-body-of-the-pr-the-handoff-already-opened"
+  :why "the PR a handoff opened keeps `No verdict yet` in its body forever — ship prints `PR already open` and leaves the one thing a reviewer reads first unwritten"}]

@@ -206,6 +206,70 @@
       (testing "the card is in its own lane: shipped and finished are different states"
         (is (str/includes? (slurp (str (fs/path dir "state" "board" "tasks.tsv"))) "\tin-review\t"))))))
 
+(defn- handoff!
+  "Send a git_handoff as one session, from its own worktree, with a stub
+   `claude` on PATH so the judge grades it met."
+  [{:keys [dir env sandbox]} session repo to]
+  (fs/copy (fs/path repo-root "test" "fixtures" "stub-claude.sh")
+           (fs/path sandbox "stubbin" "claude") {:replace-existing true})
+  (fs/set-posix-file-permissions (fs/path sandbox "stubbin" "claude") "rwxr-xr-x")
+  (let [draft (fs/path dir "tmp" (str session "-draft.txt"))]
+    (write! draft (str "type: git_handoff\nto: " to "\npriority: 50\n"))
+    (run {:dir (str (fs/path dir "worktrees" repo))
+          :env (assoc env "SWARMKHAZAD_TASK_ID" "t-ship"
+                      "SWARMKHAZAD_TASK_DIR" (str dir)
+                      "SWARMKHAZAD_SESSION" session
+                      "SWARMFORGE_ROLE" (first (str/split session #"_")))
+          :ok? false}
+         "bb" (str (fs/path scripts "swarm_handoff.bb")) (str draft))))
+
+(deftest a-handoff-puts-the-branch-on-origin-and-opens-its-draft-pr
+  ;; The work is finished and lives in a worktree nobody else can reach. The
+  ;; next role reviews a branch; the cloud runner clones from ORIGIN and
+  ;; comments its findings on the PR; `close --reclaim` deletes worktrees. All
+  ;; three failures are silent — the task looks finished until somebody goes
+  ;; looking for the change.
+  (with-shipped-task
+    (fn [{:keys [dir remote-branches gh-calls] :as t}]
+      (let [r (handoff! t "implement_gobel" "gobel" "review")]
+        (is (zero? (:exit r)) (str (:out r) (:err r)))
+        (testing "the branch is at the remote before the handoff is queued"
+          (is (= ["main" "sk/t-ship"] (remote-branches "gobel")))
+          (is (str/includes? (:out r) "DRAFT PR OPENED"))
+          (is (str/includes? (:out r) "HANDOFF QUEUED"))
+          (is (< (str/index-of (:out r) "DRAFT PR OPENED")
+                 (str/index-of (:out r) "HANDOFF QUEUED"))
+              "a push that fails must leave no handoff claiming work the next role cannot fetch"))
+        (testing "and only its own repo — a role speaks for the tree it worked in"
+          (is (= ["main"] (remote-branches "cirdan"))))
+        (testing "the PR is a draft, and says there is no verdict yet"
+          (let [creates (filter #(str/includes? % "pr create") (gh-calls))]
+            (is (= 1 (count creates)))
+            (is (str/includes? (first creates) "--draft"))
+            (is (str/starts-with? (first creates) "gobel ")))
+          (let [body (slurp (str (fs/path (:sandbox t) "gh.log.body-gobel")))]
+            (is (str/includes? body "No verdict yet"))
+            (is (str/includes? body "cloud runner has a place to comment"))
+            (is (str/includes? body "repoint DEFAULT_UPSTREAMS") "and the goals this repo carries")))
+        (testing "and it is recorded, so the PR poll has somewhere to start"
+          (let [m (json/parse-string (slurp (str (fs/path dir "state" "pr" "gobel.json"))) true)]
+            (is (= "sk/t-ship" (:branch m)))
+            (is (= "https://github.com/acme/gobel/pull/1" (:url m)))))))))
+
+(deftest ship-rewrites-the-body-of-the-pr-the-handoff-already-opened
+  ;; Otherwise the early PR is permanently the one with no verdict in it: ship
+  ;; used to print `PR already open` and leave the body alone.
+  (with-shipped-task
+    (fn [{:keys [sandbox ship summary!]}]
+      (summary! order-summary)
+      (let [r (ship {:in "yes\n"
+                     :extra-env {"GH_STUB_EXISTING" "https://github.com/acme/gobel/pull/1"}})]
+        (is (zero? (:exit r)) (:err r))
+        (is (str/includes? (:out r) "PR already open")))
+      (let [body (slurp (str (fs/path sandbox "gh.log.body-gobel")))]
+        (is (str/includes? body "READY WITH FOLLOW-UPS"))
+        (is (not (str/includes? body "No verdict yet")))))))
+
 (deftest release-lines-reach-the-person-who-merges-and-nothing-else-changes
   ;; GobelCutover's escalation.md held fifteen bullets over a PR that changed
   ;; one URL literal. Six of them were release preconditions — rotate this

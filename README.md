@@ -244,7 +244,9 @@ A role with three repos hands off three times. `handoffd` records each one in th
 
 ## Shipping
 
-`swarmkhazad ship <task-id>` is the only thing here that leaves the machine, and every guard on it is about that.
+The branch does not wait for `ship`. **Every `git_handoff` publishes**: it pushes `sk/<task-id>` to origin and opens a draft PR on it if there is not one already, before the handoff is queued, and a push that fails refuses the handoff. That is a precondition for three things that come after it — the next role reviews a branch, the cloud runner clones from *origin* and comments its findings on the PR, and a branch that lives only in a worktree is one `close --reclaim` from gone. All three failures are silent: the task looks finished until somebody goes looking for the change. The early PR says `No verdict yet` in its body; `ship` rewrites that body once there is one.
+
+`swarmkhazad ship <task-id>` is the only thing here that leaves the machine on a HUMAN's say-so, and every guard on it is about that.
 
 It **requires the summary** — `swarmkhazad summary <id>`, or the portal's "Ready to merge?" button. That is where a person reads a verdict, so requiring it means nothing ships unread. The **merge order comes from that summary's `## Merge order` section**, never from a second inference: two things working an order out will disagree at the worst moment, and the summarizer is the one that has read every diff. An order that skips a repo with commits is a refusal, not a guess.
 
@@ -252,7 +254,7 @@ Then it prints the plan — repo, branch, base, the GitHub repo it resolved, the
 
 The account comes from an owner→account map read off `remote.origin.url` (`MithraAI → allen-mithra`, default `allen-mithra`, `SWARMKHAZAD_GH_ACCOUNT` overrides). `config --get`, not `git remote get-url`, because get-url applies `url.<x>.insteadOf` and a checkout that mirrors GitHub would report no owner at all and silently take the default. The token is fetched per command with `gh auth token -u <account>`; `gh auth switch` is never called, because rewriting the operator's global gh state to push one branch is not a thing a tool should do.
 
-Per repo, in order: push `sk/<task-id>` with an explicit refspec (checked against the source's default branch first — never main), then open a **draft** PR whose body carries the summary's verdict and that repo's own goal lines. What was opened is recorded in `state/pr/<repo>.json`, and the card moves to its own `in-review` lane: a shipped task and a finished task are different states.
+Per repo, in order: push `sk/<task-id>` with an explicit refspec (checked against the source's default branch first — never main), then open a **draft** PR whose body carries the summary's verdict and that repo's own goal lines — or, when a handoff already opened one, rewrite that PR's body with the verdict instead of leaving it saying `No verdict yet`. What was opened is recorded in `state/pr/<repo>.json`, and the card moves to its own `in-review` lane: a shipped task and a finished task are different states.
 
 ### What comes back
 

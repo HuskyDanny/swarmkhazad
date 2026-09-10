@@ -208,7 +208,13 @@
        (remove str/blank?)
        (map #(str/replace % #"^-\s*" ""))))
 
-(defn body-for [ctx plan summary]
+(defn body-for
+  "The PR body. `summary` may be nil: the first push happens at a role's
+   handoff, long before anyone has asked for a verdict, and the PR has to exist
+   by then — the cloud runner clones the branch and comments its findings on
+   the PR, so a task with no PR has nowhere for its answers to come back to.
+   `ship` sets the body again once there IS a verdict."
+  [ctx plan summary]
   (let [verdict (some #(when (str/starts-with? (str/trim %) "READY") (str/trim %))
                       (str/split-lines (str (summary-section (:body summary) "Verdict"))))
         goals (->> (str/split-lines (goal-text ctx))
@@ -216,7 +222,11 @@
                    (filter #(or (empty? (:repos %)) (some #{(:repo plan)} (:repos %)))))
         release (release-lines ctx)]
     (str "Opened by swarmkhazad for task `" (:task-id ctx) "`, branch `" (:branch plan) "`.\n\n"
-         (when verdict (str "**Summary verdict:** " verdict "\n\n"))
+         (if verdict
+           (str "**Summary verdict:** " verdict "\n\n")
+           (str "**No verdict yet** — the swarm is still working. This is a draft so the branch has "
+                "somewhere to be reviewed against, and so the cloud runner has a place to comment "
+                "its findings.\n\n"))
          "## Goals this repo carries\n"
          (if (seq goals)
            (str/join "\n" (for [g goals] (str "- [" (if (:ticked g) "x" " ") "] "
@@ -292,6 +302,19 @@
         (str/trim (:out r)))
       (finally (fs/delete-if-exists body-file)))))
 
+(defn set-pr-body!
+  "Rewrite an open PR's body. Best-effort: the PR exists and the branch is
+   pushed either way, and failing the whole ship over a body edit would be a
+   worse trade than a stale description."
+  [{:keys [source account]} number body]
+  (let [body-file (fs/create-temp-file {:prefix "swarmkhazad-pr." :suffix ".md"})]
+    (spit (str body-file) body)
+    (try
+      (zero? (:exit (process/sh {:continue true :dir (str source)
+                                 :extra-env (cond-> {} (gh-token account) (assoc "GH_TOKEN" (gh-token account)))}
+                                "gh" "pr" "edit" (str number) "--body-file" (str body-file))))
+      (finally (fs/delete-if-exists body-file)))))
+
 (defn record! [ctx plan url]
   (let [dir (fs/path (:state-dir ctx) "pr")]
     (fs/create-dirs dir)
@@ -301,6 +324,25 @@
                                             :at (str (java.time.Instant/now)))
                                      {:pretty true})
                "\n"))))
+
+(defn publish!
+  "One repo: branch at the remote, draft PR open on it, both recorded. Returns
+   {:url :opened?}.
+
+   The whole of what `ship` does per repo, and the whole of what a role's
+   handoff needs, because they are the same thing at two moments. A branch that
+   lives only in a worktree is one `close --reclaim` from gone, and a PR that
+   does not exist yet is a return channel the cloud runner cannot use — so the
+   first handoff opens it, and ship rewrites the body once there is a verdict."
+  [ctx plan title body]
+  (when-not (:pushed? plan) (push! plan))
+  (if-let [pr (existing-pr plan)]
+    (do (set-pr-body! plan (:number pr) body)
+        (record! ctx plan (:url pr))
+        {:url (:url pr) :opened? false})
+    (let [url (open-pr! plan title body)]
+      (record! ctx plan url)
+      {:url url :opened? true})))
 
 ;; -------------------------------------------------------------------- main
 
@@ -355,17 +397,11 @@
                     (println (format "  %-16s %s → %s  as %s  (%d commit(s))" repo branch base account commits))))
               (confirm! plans))
             (doseq [plan plans]
-              (if (:pushed? plan)
-                (println (format "already pushed  %-16s %s" (:repo plan) (:branch plan)))
-                (do (push! plan)
-                    (println (format "pushed          %-16s %s" (:repo plan) (:branch plan)))))
-              (let [pr (existing-pr plan)
-                    url (if pr
-                          (do (println (format "PR already open %-16s %s" (:repo plan) (:url pr))) (:url pr))
-                          (let [u (open-pr! plan (title ctx) (body-for ctx plan summary))]
-                            (println (format "draft PR        %-16s %s" (:repo plan) u))
-                            u))]
-                (record! ctx plan url)))
+              (println (format (if (:pushed? plan) "already pushed  %-16s %s" "pushing         %-16s %s")
+                               (:repo plan) (:branch plan)))
+              (let [{:keys [url opened?]} (publish! ctx plan (title ctx) (body-for ctx plan summary))]
+                (println (format (if opened? "draft PR        %-16s %s" "PR already open %-16s %s")
+                                 (:repo plan) url))))
             ;; Only once every repo is up: a half-shipped task is still the
             ;; last role's, and the lane is what says whose it is.
             (if (board-lib/card-lane ctx id)
