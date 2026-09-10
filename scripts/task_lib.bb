@@ -208,6 +208,14 @@
      ;; apart from escalation.md because the portal counts asks, and a finding
      ;; counted as an ask reads as a problem nobody is solving.
      :finding-file (fs/path task-dir "finding.md")
+     ;; What must be true AROUND the merge — a secret rotated, a config set, a
+     ;; deploy watched — as opposed to anything wrong with the diff. Separate
+     ;; because the two are read by different people at different moments and
+     ;; only one of them is a reason not to merge. GobelCutover's escalation.md
+     ;; held fifteen bullets, six of them release preconditions and none about
+     ;; the PR's code; every one of them counted toward an Attention badge over
+     ;; a change of one URL literal.
+     :release-file (fs/path task-dir "release.md")
      :evidence-dir (fs/path task-dir "evidence")
      ;; The second bar source, and the only one a role may write: metrics.md is
      ;; locked at open, this is not. See run_evidence.bb's header.
@@ -964,7 +972,7 @@
   (doseq [k [:worktrees-dir :mail-dir :tmp-dir :state-dir :prompts-dir
              :evidence-dir :board-dir :daemon-dir :sessions-dir]]
     (fs/create-dirs (get ctx k)))
-  (doseq [k [:decision-file :gotcha-file :escalation-file :finding-file]]
+  (doseq [k [:decision-file :gotcha-file :escalation-file :finding-file :release-file]]
     (when-not (fs/exists? (get ctx k))
       (spit (str (get ctx k)) ""))))
 

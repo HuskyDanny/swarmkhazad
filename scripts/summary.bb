@@ -168,6 +168,12 @@
      ;; lines were findings; a verdict that cannot see them is reading half the
      ;; task's own notes.
      (section "finding.md — what they established that nobody asked for" (read-file (:finding-file ctx) file-budget))
+     ;; The lines that belong in `Before merge` and `After merge` rather than in
+     ;; the verdict. Without this file the verdict was inventing those two
+     ;; sections from the diff while the roles' own release preconditions sat in
+     ;; escalation.md, where they read as reasons not to merge.
+     (section "release.md — what must be true around the merge, written by the roles"
+              (read-file (:release-file ctx) file-budget))
      (section "evidence — each bar's own output" (evidence-section ctx))
      ;; One diff per repo, not per session: roles sharing a repo share its
      ;; worktree, so a per-session loop would print the same diff twice.
@@ -181,8 +187,9 @@
    "and you merge nothing; you tell a tired reader what they would have found "
    "by reading everything themselves.\n\n"
    "You are given a task's contract (goal.md, metrics.md), what its roles "
-   "decided and tripped over, what they escalated, the evidence each bar "
-   "produced, and the diff from each role's worktree.\n\n"
+   "decided and tripped over, what they escalated, what they say must happen "
+   "around the merge, the evidence each bar produced, and the diff from each "
+   "role's worktree.\n\n"
    "Answer in markdown, in exactly these sections:\n\n"
    "## Verdict\n"
    "One line, starting with one of: READY TO MERGE / READY WITH FOLLOW-UPS / "
@@ -209,7 +216,10 @@
    "do here. If you think one is wrong, that is a NEEDS A DECISION verdict with "
    "the reason, not a finding.\n"
    "- Treat gotcha.md as known. Do not report something the roles already wrote "
-   "down and worked around.\n\n"
+   "down and worked around.\n"
+   "- A release.md line is not a finding. It is work that happens around this "
+   "change, and it has its own two sections below — repeating it here turns a "
+   "deploy checklist into a list of things wrong with the PR.\n\n"
    "## Per repo\n"
    "One line per repo you were given a diff for, `<repo>: <verdict> — <why>`, "
    "using the same verdict words as above. A repo whose diff is empty says "
@@ -235,6 +245,14 @@
    "migration to apply, a deploy to watch, a rollback if it goes wrong — and "
    "what a healthy result looks like so the reader knows when to stop watching. "
    "If none are needed, say `none` rather than inventing one.\n\n"
+   "release.md is the roles' own answer to those last two sections. Every line "
+   "of it belongs in `Before merge` or `After merge`, whichever the line says, "
+   "and none of it belongs in `Findings` or in the verdict: a secret still to "
+   "rotate, an env var still to set, a deploy still to watch are things that "
+   "happen AROUND this change, not things wrong with it. A task whose goals are "
+   "met and whose release.md is long is READY TO MERGE with a checklist, never "
+   "NOT READY. Say what carries the risk in `Risk`, and keep the ordering a "
+   "release line demands — rotate before deploy, deploy before verify.\n\n"
    "Rules: be specific and short. Cite file:line where you can. Say `I cannot "
    "tell from what I was given` rather than guessing — a confident wrong answer "
    "here gets something merged. Never claim a command was run; only the "

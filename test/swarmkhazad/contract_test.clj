@@ -118,6 +118,8 @@
         (is (denied? (edit task "Edit" (str task "/decision.md")))
             "the bullet files are note.bb's to write — the tag and the format come from it")
         (is (denied? (edit task "Write" (str task "/finding.md"))))
+        (is (denied? (edit task "Write" (str task "/release.md")))
+            "release.md is note.bb's too — it reaches the PR body, so its shape is parsed")
         (is (allowed? (edit task "Write" (str task "/draft-implement.md")))
             "a role's own write-up is its own to edit")
         (is (allowed? (edit task "Edit" (str sandbox "/elsewhere/goal.md"))) "a goal.md outside the task is not ours")
@@ -139,6 +141,7 @@
         (doseq [cmd ["printf -- '- **x** — y\\n' >> decision.md"
                      "chmod 644 escalation.md"
                      (str "echo x > " task "/finding.md")
+                     (str "echo x > " task "/release.md")
                      (str "python3 -c \"open('" task "/gotcha.md','a').write('x')\"")]]
           (is (denied? (bash task task cmd)) cmd))
         (is (str/includes? (get-in (:json (bash task task "printf x >> decision.md"))

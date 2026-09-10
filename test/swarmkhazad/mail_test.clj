@@ -294,7 +294,8 @@
                                (remove str/blank?) vec))]
         (testing "one bullet per file, in the shape the portal and the summarizer split on"
           (doseq [[kind file] [["decision" "decision.md"] ["gotcha" "gotcha.md"]
-                               ["escalation" "escalation.md"] ["finding" "finding.md"]]]
+                               ["escalation" "escalation.md"] ["finding" "finding.md"]
+                               ["release" "release.md"]]]
             (is (zero? (:exit (note kind (str kind "-claim") (str kind "-why")))))
             (is (= [(str "- **" kind "-claim** — " kind "-why")] (lines file)) file)))
         (testing "a one-repo task gets no tag — there is nothing to disambiguate"

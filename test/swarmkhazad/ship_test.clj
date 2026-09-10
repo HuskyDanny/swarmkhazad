@@ -206,6 +206,42 @@
       (testing "the card is in its own lane: shipped and finished are different states"
         (is (str/includes? (slurp (str (fs/path dir "state" "board" "tasks.tsv"))) "\tin-review\t"))))))
 
+(deftest release-lines-reach-the-person-who-merges-and-nothing-else-changes
+  ;; GobelCutover's escalation.md held fifteen bullets over a PR that changed
+  ;; one URL literal. Six of them were release preconditions — rotate this
+  ;; secret first, set that env var before it goes live, keep the rotate-to-
+  ;; deploy window short — and not one was about the diff. On the Attention
+  ;; list they read as fifteen reasons not to merge. Their real reader is
+  ;; whoever presses the button, and the PR body is where that person stands.
+  (with-shipped-task
+    (fn [{:keys [dir sandbox ship summary!]}]
+      (summary! order-summary)
+      (write! (fs/path dir "release.md")
+              (str "- [gobel] **rotate `gobel/upstreams/superset-token` to the prod signing key first** "
+                   "— merging ahead of it 401s every superset call\n"
+                   "- **set KB_AUTHKIT_DOMAIN before this goes live** "
+                   "— unset, build_auth() returns None and the listener serves unauthenticated writes\n"))
+      (is (zero? (:exit (ship {:in "yes\n"}))))
+      (let [body (slurp (str (fs/path sandbox "gh.log.body-gobel")))]
+        (testing "each line is a checkbox in its own section, claim and why intact"
+          (is (str/includes? body "## Before this merges"))
+          (is (str/includes? body "- [ ] [gobel] **rotate `gobel/upstreams/superset-token` to the prod signing key first** — merging ahead of it 401s every superset call"))
+          (is (str/includes? body "- [ ] **set KB_AUTHKIT_DOMAIN before this goes live**")))
+        (testing "and it says what the section is, because these are not review comments"
+          (is (str/includes? body "Not review comments")))
+        (testing "the goals section is untouched — the two answer different questions"
+          (is (str/includes? body "repoint DEFAULT_UPSTREAMS"))
+          (is (str/includes? body "swarmkhazad never merges")))))))
+
+(deftest a-task-with-no-release-lines-gets-no-checklist
+  ;; An empty section reads as a checklist somebody forgot to fill in.
+  (with-shipped-task
+    (fn [{:keys [sandbox ship summary!]}]
+      (summary! order-summary)
+      (is (zero? (:exit (ship {:in "yes\n"}))))
+      (let [body (slurp (str (fs/path sandbox "gh.log.body-gobel")))]
+        (is (not (str/includes? body "Before this merges")))))))
+
 (deftest a-failure-stops-the-run-where-it-failed
   (with-shipped-task
     (fn [{:keys [dir ship remote-branches summary! gh-calls]}]
