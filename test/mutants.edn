@@ -428,4 +428,40 @@
   :old "      (throw (ex-info (str/join \"\\n\\n\" faults) {:exit 1})))))"
   :new "      (throw (ex-info (first faults) {:exit 1})))))"
   :killed-by "a-bar-that-cannot-be-measured-is-refused-at-the-door"
-  :why "only the first fault is reported, so an operator fixing metrics.md learns about the second one by opening the task again"}]
+  :why "only the first fault is reported, so an operator fixing metrics.md learns about the second one by opening the task again"}
+
+ ;; ------------------------------------- release.md, and who it is for
+ {:file "scripts/note.bb"
+  :ns "mail"
+  :old "   \"release\" :release-file})"
+  :new "   \"release\" :escalation-file})"
+  :killed-by "note-bb-writes-the-bullet-so-every-reader-can-parse-it"
+  :why "a release line lands in escalation.md again, where it counts as an ask — GobelCutover's six deploy steps reading as six reasons not to merge"}
+
+ {:file "scripts/summary.bb"
+  :ns "base"
+  :old "     (section \"release.md — what must be true around the merge, written by the roles\"\n              (read-file (:release-file ctx) file-budget))"
+  :new "     \"\""
+  :killed-by "a-release-line-reaches-the-merge-verdict-as-a-checklist-not-a-finding"
+  :why "the merge verdict invents `Before merge` and `After merge` from the diff while the roles' own preconditions sit in a file it was never shown"}
+
+ {:file "scripts/summary.bb"
+  :ns "base"
+  :old "   \"release.md is the roles' own answer to those last two sections. Every line \""
+  :new "   \"\""
+  :killed-by "a-release-line-reaches-the-merge-verdict-as-a-checklist-not-a-finding"
+  :why "release.md is in front of the model with the same Findings rules it applies to escalations, so a deploy checklist is weighed as things wrong with the change"}
+
+ {:file "scripts/ship.bb"
+  :ns "ship"
+  :old "         (when (seq release)"
+  :new "         (when (seq nil)"
+  :killed-by "release-lines-reach-the-person-who-merges-and-nothing-else-changes"
+  :why "the checklist never reaches the PR body, which is the one place the person pressing the button is standing"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal-test"
+  :old "                           [\"release.md — what must be true around the merge, not about the diff\" :release-file]"
+  :new "                           [\"release.md\" :decision-file]"
+  :killed-by "the-task-page-is-a-view-of-the-folder-and-the-index-lists-it"
+  :why "release.md is written and rendered nowhere — a precondition recorded and invisible, which is the worst place for one"}]

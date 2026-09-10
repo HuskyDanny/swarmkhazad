@@ -51,7 +51,7 @@ input=$(cat 2>/dev/null) || exit 0
 event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null) || exit 0
 
 TRUTH=(goal.md metrics.md)
-MINE=(decision.md gotcha.md finding.md escalation.md)
+MINE=(decision.md gotcha.md finding.md escalation.md release.md)
 # Locked like the truth, injected like neither. `repos` is the task's SCOPE —
 # which checkouts it runs in — and `ship` reads it after the swarm has been
 # running for hours to decide which branches to push and open PRs from
@@ -73,7 +73,7 @@ session_start() {
 
   ctx="TASK CONTRACT · $task_id · $task_dir${role:+ · role $role}
 goal.md · metrics.md                      the truth, read-only (chmod 444). Goal = one checkbox per outcome; Not-goal = settled, do not reopen; Hints = paths. metrics.md = the bars: quantitative with its measure command, qualitative with its judge.
-decision.md · gotcha.md · finding.md · escalation.md   yours, written by \`note.bb <kind> '<claim>' '<why>'\` — decision (a fork you resolved), gotcha (what cost you time), finding (what you established; NOT an ask), escalation (what only a human can clear). Editing them directly is denied.
+decision.md · gotcha.md · finding.md · escalation.md · release.md   yours, written by \`note.bb <kind> '<claim>' '<why>'\` — decision (a fork you resolved), gotcha (what cost you time), finding (what you established; NOT an ask), escalation (what only a human can clear, an ASK that blocks the swarm), release (what must be true AROUND the merge — a secret to rotate, a config to set, a deploy to watch — which blocks nothing here). Editing them directly is denied.
 draft-${role:-<role>}.md                       your full write-up, in the task folder, before you hand off; the handoff names it.
 Done is judged by whoever set the bar, never by you: you never tick a box in goal.md. A bar you cannot meet is an escalation.md line, never an edit to the bar.
 Nothing in the folder restates the commit or the diff; detail lives there."
@@ -206,7 +206,7 @@ task_file() {
 }
 
 TRUTH_FILES='goal.md metrics.md'
-NOTE_FILES='decision.md gotcha.md finding.md escalation.md'
+NOTE_FILES='decision.md gotcha.md finding.md escalation.md release.md'
 SCOPE_FILES='repos'
 
 truth_path() { task_file "$1" "$2" "$TRUTH_FILES"; }
@@ -306,7 +306,7 @@ pre_tool_use() {
       cwd_real=$(cd "$cwd" 2>/dev/null && pwd -P) || cwd_real=""
       case "$bare" in
         *goal.md*|*metrics.md*|*decision.md*|*gotcha.md*|*finding.md*|*escalation.md*|\
-        *"$task_dir"*|*SWARMKHAZAD_TASK_DIR*) ;;
+        *release.md*|*"$task_dir"*|*SWARMKHAZAD_TASK_DIR*) ;;
         *) [ "$cwd_real" = "$TASK_REAL" ] || exit 0 ;;
       esac
       # A `cd` changes what every relative path after it means, and the hook
@@ -331,7 +331,7 @@ pre_tool_use() {
               [ -n "$cd_cand" ] || continue
               case "$(basename -- "$cd_cand")" in
                 goal.md|metrics.md) hit_kind="truth"; matched=1 ;;
-                decision.md|gotcha.md|finding.md|escalation.md) hit_kind="note"; matched=1 ;;
+                decision.md|gotcha.md|finding.md|escalation.md|release.md) hit_kind="note"; matched=1 ;;
                 *) continue ;;
               esac
               # A redirect at it is a write, whatever verb the line uses. The
@@ -379,7 +379,7 @@ pre_tool_use() {
           *'$('*|*'`'*)
             case "$bare" in
               *goal.md*|*metrics.md*|*decision.md*|*gotcha.md*|*finding.md*|\
-              *escalation.md*|*"$task_dir"*|*SWARMKHAZAD_TASK_DIR*)
+              *escalation.md*|*release.md*|*"$task_dir"*|*SWARMKHAZAD_TASK_DIR*)
                 matched=1; hit_kind="truth" ;;
             esac ;;
         esac
@@ -491,7 +491,7 @@ pre_tool_use() {
         deny "repos is the task's scope, fixed when the swarm opened (chmod 444). The sessions running now were spawned from it and ship reads it to decide which branches to push, so changing it here would not add a session — it would push a branch nobody worked. A checkout this task needs and does not have is an escalation.md line." "Bash" "$cmd"
       fi
       if [ "$hit_kind" = "note" ]; then
-        deny "decision.md, gotcha.md, finding.md and escalation.md are append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding> '<claim>' '<why>'" "Bash" "$cmd"
+        deny "decision.md, gotcha.md, finding.md, escalation.md and release.md are append-only and written by note.bb, which stamps the repo tag and the bullet format every reader parses. Run: note.bb <decision|gotcha|escalation|finding|release> '<claim>' '<why>'" "Bash" "$cmd"
       fi
       # Name the rule that actually fired. This message used to describe an
       # edit attempt whatever the command was, so a role that ran `ls -la` or

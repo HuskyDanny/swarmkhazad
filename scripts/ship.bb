@@ -193,12 +193,28 @@
                not-empty)
       (:task-id ctx)))
 
+(defn release-lines
+  "release.md's bullets, claim and why intact.
+
+   In the PR body because that is where the person who merges is standing.
+   These are not review comments and not defects — they are what has to be true
+   around the merge, and until now they were escalations, which put a deploy
+   checklist on the Attention list of a task that was finished."
+  [ctx]
+  (->> (str/split-lines (if (fs/regular-file? (:release-file ctx))
+                          (slurp (str (:release-file ctx)))
+                          ""))
+       (map str/trim)
+       (remove str/blank?)
+       (map #(str/replace % #"^-\s*" ""))))
+
 (defn body-for [ctx plan summary]
   (let [verdict (some #(when (str/starts-with? (str/trim %) "READY") (str/trim %))
                       (str/split-lines (str (summary-section (:body summary) "Verdict"))))
         goals (->> (str/split-lines (goal-text ctx))
                    (keep task-lib/goal-line)
-                   (filter #(or (empty? (:repos %)) (some #{(:repo plan)} (:repos %)))))]
+                   (filter #(or (empty? (:repos %)) (some #{(:repo plan)} (:repos %)))))
+        release (release-lines ctx)]
     (str "Opened by swarmkhazad for task `" (:task-id ctx) "`, branch `" (:branch plan) "`.\n\n"
          (when verdict (str "**Summary verdict:** " verdict "\n\n"))
          "## Goals this repo carries\n"
@@ -206,6 +222,11 @@
            (str/join "\n" (for [g goals] (str "- [" (if (:ticked g) "x" " ") "] "
                                               (when (:role g) (str (:role g) " — ")) (:text g))))
            "(none tagged for this repo)")
+         (when (seq release)
+           (str "\n\n## Before this merges\n"
+                "Not review comments — what the roles found has to be true around the merge.\n"
+                "Order matters where a line says so.\n\n"
+                (str/join "\n" (for [l release] (str "- [ ] " l)))))
          "\n\nThe full verdict, the evidence and the decision log are in the task folder:\n`"
          (:task-dir ctx) "`\n\nDraft on purpose: swarmkhazad never merges.\n")))
 

@@ -165,7 +165,14 @@
 
    finding.md is deliberately NOT here. A finding is something the swarm worked
    out, not something waiting on anyone — counted as an ask it reads as a
-   problem nobody is solving, which is how one task showed 22."
+   problem nobody is solving, which is how one task showed 22.
+
+   release.md is not here either, for the opposite reason: its lines DO need a
+   human, but not this one and not now. They are what the person deploying has
+   to do, so they reach that person through the summary and the PR body.
+   Counted here they read as reasons not to merge — GobelCutover's six of
+   fifteen — and the tick box would then be the only way to make a finished
+   task look finished."
   [ctx]
   (let [esc (nonblank-lines (text (:escalation-file ctx)))
         failed (when (fs/directory? (:mail-dir ctx))
@@ -1264,6 +1271,10 @@
                     [:div.muted.pane-line (:last-line c)]])])])]
           (for [[title k] [["decision.md" :decision-file] ["gotcha.md" :gotcha-file]
                            ["finding.md — what the swarm worked out, not an ask" :finding-file]
+                           ;; Between the findings and the asks, which is what
+                           ;; it is: settled work that lands on somebody else's
+                           ;; desk at deploy time rather than on this task's.
+                           ["release.md — what must be true around the merge, not about the diff" :release-file]
                            ["escalation.md" :escalation-file]]]
             [:section [:h2 title]
              (let [ls (nonblank-lines (text (get ctx k)))]

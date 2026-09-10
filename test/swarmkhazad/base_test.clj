@@ -382,6 +382,42 @@
       (is (str/includes? (ex-message e) "no role will measure"))
       (is (str/includes? (ex-message e) "unclosed backtick")))))
 
+(deftest a-release-line-reaches-the-merge-verdict-as-a-checklist-not-a-finding
+  ;; The verdict was inventing `Before merge` and `After merge` out of the diff
+  ;; while the roles' own release preconditions sat in escalation.md, where the
+  ;; same instructions tell it to weigh them as things wrong with the change.
+  (let [d (fs/create-temp-dir {:prefix "sk-release-"})
+        ctx (merge {:task-id "t" :task-dir d
+                    :state-dir (fs/path d "state") :evidence-dir (fs/path d "evidence")
+                    ;; No worktrees, so no diff sections — the notes are what
+                    ;; this test is about.
+                    :sessions-tsv (fs/path d "state" "sessions.tsv")
+                    :roles-tsv (fs/path d "state" "roles.tsv")}
+                   (into {} (for [f ["goal.md" "metrics.md" "repro.md" "decision.md"
+                                     "gotcha.md" "escalation.md" "finding.md" "release.md"]]
+                              [(keyword (str (str/replace f #"\.md$" "") "-file")) (fs/path d f)])))]
+    (try
+      (fs/create-dirs (:state-dir ctx))
+      (spit (str (:goal-file ctx)) "# t\n## Goal\n- [ ] a thing\n")
+      (spit (str (:release-file ctx))
+            "- **rotate the token before the deploy** — merging ahead of it 401s every call\n")
+      (let [doc (summary/gather ctx)]
+        (is (str/includes? doc "## release.md"))
+        (is (str/includes? doc "rotate the token before the deploy")
+            "a release line the verdict never sees is a checklist item nobody gets"))
+      (finally (fs/delete-tree d))))
+
+  (testing "and the instructions say where its lines go, and where they do not"
+    ;; Without this the model has release.md in front of it and the same
+    ;; `Findings` rules it applies to escalations, which is how six deploy
+    ;; steps became six reasons not to merge.
+    (let [p summary/system-prompt]
+      (is (str/includes? p "release.md is the roles' own answer"))
+      (is (str/includes? p "`Before merge` or `After merge`"))
+      (is (str/includes? p "A release.md line is not a finding"))
+      (is (str/includes? p "READY TO MERGE with a checklist, never")
+          "a task whose goals are met and whose checklist is long is ready, with a list"))))
+
 (deftest a-crossed-off-escalation-is-not-an-open-ask
   ;; escalation.md is append-only, so a wrong bullet can only be followed by
   ;; another retracting it. Measured: the file opened with `probe — probe`, and

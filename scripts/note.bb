@@ -6,6 +6,7 @@
 ;;   gotcha      something that cost you time and would cost the next one too.
 ;;   escalation  something only a human can clear. This is an ASK.
 ;;   finding     something you established that nobody asked for. NOT an ask.
+;;   release     what must be true around the merge, not about the diff.
 ;;
 ;; Two things this does that appending by hand does not.
 ;;
@@ -22,6 +23,18 @@
 ;; ten of its 22 escalation lines were things the swarm had worked out and
 ;; written down, not things waiting on a human — and they counted toward an
 ;; Attention badge that then read as 22 problems.
+;;
+;; `release` exists for the same reason and cuts the other way. GobelCutover's
+;; escalation.md held fifteen bullets. Six were release preconditions — rotate
+;; this secret before the deploy, set that env var, watch this window — and NOT
+;; ONE was about the PR's code, which changed a single URL literal. As
+;; escalations they read as fifteen problems blocking a merge; as release
+;; lines they are a checklist for the person who deploys it. Same facts, two
+;; readers, two moments, and only one of them is a reason not to merge.
+;;
+;; The test between them is WHO IS BLOCKED. An escalation blocks the swarm: it
+;; cannot finish the work until a human clears it. A release line blocks
+;; nothing here — the work is done and this is what happens next.
 
 (ns note
   (:require [babashka.fs :as fs]
@@ -34,7 +47,8 @@
   {"decision" :decision-file
    "gotcha" :gotcha-file
    "escalation" :escalation-file
-   "finding" :finding-file})
+   "finding" :finding-file
+   "release" :release-file})
 
 (def ^{:doc
        "Where a retraction's reason is recorded. `retract` says a bullet was
@@ -67,7 +81,7 @@
     (count hits)))
 
 (def usage-text
-  (str "Usage: note.bb <decision|gotcha|escalation|finding> <claim> <why>\n"
+  (str "Usage: note.bb <decision|gotcha|escalation|finding|release> <claim> <why>\n"
        "       note.bb resolved <match> <how>\n"
        "       note.bb retract  <match> <why>\n"
        "\n"
@@ -75,6 +89,12 @@
        "  gotcha      something that cost you time and would cost the next one\n"
        "  escalation  something only a human can clear (an ask)\n"
        "  finding     something you established that nobody asked for (not an ask)\n"
+       "  release     what must be true AROUND the merge — a secret to rotate, a\n"
+       "              config to set, a deploy to watch, an ordering to respect.\n"
+       "              Not about the diff, so it never blocks the PR: it reaches\n"
+       "              the person who deploys, through the summary and the PR\n"
+       "              body. The test against `escalation` is who is blocked — an\n"
+       "              escalation stops the swarm, a release line stops nothing.\n"
        "  resolved    an escalation you have since cleared yourself — <match> is\n"
        "              any text from the bullet, <how> is what you did about it.\n"
        "              Crosses it off Attention and records the how as a finding.\n"

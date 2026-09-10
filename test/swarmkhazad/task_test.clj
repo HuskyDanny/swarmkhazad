@@ -161,12 +161,12 @@
           (doseq [session ["implement_fixture" "review_fixture" "review_other"]
                   sub ["outbox/tmp" "sent" "failed" "inbox/new" "inbox/in_process" "inbox/completed"]]
             (is (fs/directory? (fs/path dir "mail" session sub)) (str session "/" sub))))
-        (testing "the four bullet files exist and are empty; nothing clones into the task folder"
-          (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md"]]
+        (testing "the five bullet files exist and are empty; nothing clones into the task folder"
+          (doseq [f ["decision.md" "gotcha.md" "finding.md" "escalation.md" "release.md"]]
             (is (= "" (slurp (str (fs/path dir f))))))
           (is (= #{"plugin"
                    "decision.md" "escalation.md" "evidence" "finding.md" "goal.md" "gotcha.md"
-                   "mail" "metrics.md" "prompts" "repos" "roles" "state" "tmp" "worktrees"}
+                   "mail" "metrics.md" "prompts" "release.md" "repos" "roles" "state" "tmp" "worktrees"}
                  (set (map fs/file-name (fs/list-dir dir))))
               "one entry, not three — a plugin root is read for hooks/, commands/ and .mcp.json, so it gets its own directory rather than sharing the task folder's namespace"))
         (testing "prepare is idempotent, and a re-prepare keeps a commit the role made"
