@@ -66,6 +66,22 @@
       (str/replace #"^-+|-+$" "")
       (as-> s (if (str/blank? s) "bar" s))))
 
+(def command-measure-re
+  "A measure that IS a command: one backticked span and, after it, nothing but
+   an optional `→ <expected>`.
+
+   Anchored, and that is the whole point. Taking the FIRST backtick span
+   anywhere in the measure read prose that merely QUOTED something as a shell
+   command and ran it. GobelCutover, RAN: `tools/list`, `update_chart` and a
+   Secrets Manager path each exited 127 with `command not found`, and a fourth
+   ran the two characters ` → `. Four of that task's eight bars were reported
+   as failing, none of them had ever been measured, and the operator saw eight
+   red bars over a PR that changed one URL literal.
+
+   Across every task on this machine the tightened rule reclassified eight
+   bars, and all eight were prose quoting an identifier. None was a command."
+  #"(?s)^`([^`]+)`\s*(?:→.*)?$")
+
 (defn parse-bar
   "`- <name> [@<repo>…] — bar: <threshold> — measure: `<command>` …`
    → {:name :repos :threshold :measure :command}.
@@ -75,11 +91,13 @@
    `kubectl get endpoints` is nobody's repo — and is measured wherever the
    session that runs it happens to stand.
 
-   `:command` is the backticked part and is nil when the measure is prose. Such
-   a bar is still a bar — someone has to run it and write the evidence — so it
-   is returned rather than dropped. Dropping it made two of a brief's seven bars
-   vanish from the page while sitting in metrics.md, which is the worst place
-   for an acceptance criterion to be: recorded, and invisible.
+   `:command` is set only when the measure IS a command — see
+   `command-measure-re` — and is nil when it is prose, including prose that
+   quotes a command-shaped thing. Such a bar is still a bar — someone has to
+   run it and write the evidence — so it is returned rather than dropped.
+   Dropping it made two of a brief's seven bars vanish from the page while
+   sitting in metrics.md, which is the worst place for an acceptance criterion
+   to be: recorded, and invisible.
 
    `ticket:`, `origin:` and `branch:` are the same `— key: value` shape and are
    read by the @cloud tier only. They exist for the investigation lane, whose
@@ -106,7 +124,7 @@
        :ticket (get fields "ticket")
        :origin (get fields "origin")
        :branch (get fields "branch")
-       :command (some->> measure (re-find #"`([^`]+)`") second)})))
+       :command (some->> measure str/trim (re-find command-measure-re) second)})))
 
 (defn substitute [command ctx]
   (-> command
@@ -185,6 +203,31 @@
    changes."
   [bar]
   (str/starts-with? (str/triml (str (:measure bar))) cloud-marker))
+
+(defn runnable?
+  "A bar `measure-all!` will act on by itself: it dispatches a cloud bar and
+   runs a commanded one, and leaves everything else to whoever reads the prose.
+
+   The pair, not `:command` alone. A cloud bar's measure opens with `@cloud`,
+   so it is not a command and never had one — and the gate that asks whether
+   anybody will measure the declared bars has to count it, or a task can
+   declare a cloud bar with no role to dispatch it and open anyway."
+  [bar]
+  (or (cloud-bar? bar) (some? (:command bar))))
+
+(defn unclosed-quote?
+  "True when a bar's own fields hold an odd number of backticks, so a span
+   opens and never closes.
+
+   Live, on GobelCutover: `- No secret in the diff — bar: `git diff
+   origin/main... \\ — measure: grep -cE '…'` → `0``. The em dash inside the
+   backticked span split the line one field early, so `bar:` ended mid-span and
+   `measure:` began mid-span. Both halves parse — into a threshold that is half
+   a command and a measure whose only closed span is the two characters ` → `,
+   which is what ran. Neither field means anything, and nothing said so."
+  [bar]
+  (boolean (some #(odd? (count (filter #{\`} (str %))))
+                 [(:measure bar) (:threshold bar)])))
 
 (defn cloud-brief
   "What the runner is told. Repo, branch and the return channel are passed
