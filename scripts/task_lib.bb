@@ -410,6 +410,15 @@
   (doseq [{:keys [path branch]} repos]
     (when-not (git-checkout? path)
       (throw (ex-info (format "repos: %s is not a git checkout" path) {})))
+    ;; A checkout with no commits is a git checkout and fails everything after
+    ;; this: every base the open path computes resolves through HEAD, and on an
+    ;; unborn branch `rev-parse --abbrev-ref HEAD` exits non-zero with git's
+    ;; revision-versus-path usage hint. RAN: a freshly `git init`-ed source left
+    ;; `open` dead with `'git <command> [<revision>...] -- [<file>...]'` as its
+    ;; last line — the one line the portal card showed. Name the cause here,
+    ;; while the operator still has the path in front of them.
+    (when-not (git-ok? path "rev-parse" "--verify" "--quiet" "HEAD")
+      (throw (ex-info (format "repos: %s has no commits — commit something before opening a task on it" path) {})))
     ;; A named branch that does not exist would silently start the task from
     ;; HEAD — the operator asked for one base and would get another.
     (when (and branch (not (has-branch? path branch)))

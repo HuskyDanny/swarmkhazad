@@ -366,6 +366,14 @@
           (let [id (str "t-repo-" (str/replace label #"[^a-z]" ""))
                 err (prepare-fails h label id "a claude\n" repos-text)]
             (is (str/includes? err needle) (str label ": " err)))))
+      (testing "a checkout with no commits cannot host a worktree — refused by cause, not by git's usage hint"
+        ;; RAN: `git init` + no commit, and `open` died leaving
+        ;; `'git <command> [<revision>...] -- [<file>...]'` as its last line.
+        (let [unborn (str (fs/path sandbox "src" "unborn"))]
+          (fs/create-dirs unborn)
+          (git unborn "init" "-q" "-b" "main")
+          (is (str/includes? (prepare-fails h "no commits" "t-unborn" "a claude\n" (str unborn "\n"))
+                             "has no commits"))))
       (testing "two checkouts with the same basename would share one worktree name — refused"
         (let [twin (str (fs/path sandbox "other" "fixture"))]
           (make-source-repo! twin)
