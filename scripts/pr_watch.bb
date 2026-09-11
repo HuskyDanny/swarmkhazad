@@ -426,11 +426,31 @@
           [(str "settled    every PR is " (str/join "/" (distinct (vals states)))
                 " — the card is done")])))))
 
+(defn discover!
+  "Ask ship to write down any PR a repo already has that nothing recorded.
+
+   Here rather than on the portal's button, so that nobody has to press
+   anything: this is the one place both callers go through, the daemon's own
+   60s loop included, and a PR that only appears when someone thinks to ask is
+   a PR whose review comments never became work.
+
+   Lazy about the cost of that. `ship` is loaded only when a repo is missing
+   its record, so once every repo has one — the ordinary state of a task whose
+   handoffs published — this costs a directory check and nothing else."
+  [ctx]
+  (when (some (fn [{:keys [name]}]
+                (not (fs/regular-file? (fs/path (pr-dir ctx) (str name ".json")))))
+              (try (task-lib/parse-repos ctx) (catch Exception _ nil)))
+    (load-file (str (fs/path script-dir "ship.bb")))
+    ((resolve 'ship/discover!) ctx)))
+
 (defn poll!
   "Every shipped PR, once. Never throws: this runs inside handoffd's loop, and
    a GitHub outage must not take the daemon down with it."
   [ctx]
-  (let [rows (shipped ctx)
+  (let [found (try (discover! ctx)
+                   (catch Exception e [(str "pr discovery: " (.getMessage e))]))
+        rows (shipped ctx)
         states (atom {})
         out (vec (mapcat (fn [row]
                            (try
@@ -439,7 +459,9 @@
                                (poll-repo! ctx row pr))
                              (catch Exception e [(str "pr " (:repo row) ": " (.getMessage e))])))
                          rows))]
-    (into out (when (= (count @states) (count rows)) (settle! ctx @states)))))
+    (-> (vec found)
+        (into out)
+        (into (when (= (count @states) (count rows)) (settle! ctx @states))))))
 
 (defn -main [& args]
   (when (some #{"--help" "-h"} args) (print usage-text) (System/exit 0))

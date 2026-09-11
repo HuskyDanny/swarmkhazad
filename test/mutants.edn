@@ -508,4 +508,26 @@
   :old "  (-> (str item) str/lower-case (str/replace #\"[^a-z0-9]+\" \" \") str/trim))"
   :new "  (str item))"
   :killed-by "one-goal-line-is-escalated-once-however-often-it-is-graded"
-  :why "the same goal line worded twice is two items, so a trailing full stop is enough to write it again"}]
+  :why "the same goal line worded twice is two items, so a trailing full stop is enough to write it again"}
+
+ ;; ------------------------------------------ a PR nobody recorded is still this task's
+ {:file "scripts/pr_watch.bb"
+  :ns "ship"
+  :old "  (let [found (try (discover! ctx)"
+  :new "  (let [found (try nil"
+  :killed-by "a-pr-nothing-recorded-is-found-rather-than-invisible"
+  :why "a PR opened by hand, or by a task older than publishing handoffs, stays invisible — the page says nothing about a pull request that is sitting there"}
+
+ {:file "scripts/ship.bb"
+  :ns "ship"
+  :old "                     pr (when (and slug at-origin) (find-pr plan \"all\"))]"
+  :new "                     pr (when (and slug at-origin) (find-pr plan \"open\"))]"
+  :killed-by "a-pr-nothing-recorded-is-found-rather-than-invisible"
+  :why "the merged PR a finished task most wants to show is the one state this would not ask about"}
+
+ {:file "scripts/ship.bb"
+  :ns "ship"
+  :old "                     pr (when (and slug at-origin) (find-pr plan \"all\"))]"
+  :new "                     pr (when slug (find-pr plan \"all\"))]"
+  :killed-by "a-pr-nothing-recorded-is-found-rather-than-invisible"
+  :why "the daemon asks GitHub about every repo every 60s for the whole early life of a task, to be told a branch that never left the machine has no pull request"}]

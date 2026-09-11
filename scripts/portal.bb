@@ -1212,17 +1212,27 @@
                        " " [:span.muted (:at e)]
                        (when (seq (:tail e)) [:pre (:tail e)])]
                       [:span.status.pending "no evidence yet"])]])]]]
-          (when-let [prs (seq (pr-watch/shipped ctx))]
-            [:section
-             [:h2 "In review"]
-             [:ul.plain
-              (for [p prs]
-                [:li [:span.muted (:repo p) " "] [:a.doc {:href (:url p)} (:url p)]
-                 [:span.muted " as " (:account p)]])]
-             [:form {:method "post" :action (str "/tasks/" id "/pr")}
-              [:button {:type "submit"} "Check now"]
-              [:span.muted " handoffd asks every 60s; this asks now. New review comments and "
-               "failing checks become handoffs to whoever last committed in that repo."]]])
+          ;; Rendered whenever the task has repos, not only once a PR is
+          ;; recorded: with no PR this is the page that has to say so, and the
+          ;; button is how a PR opened outside the swarm gets found. A section
+          ;; that appears only when there is already something to list cannot
+          ;; be the place you go to ask.
+          (let [prs (seq (pr-watch/shipped ctx))]
+            (when (or prs (fs/regular-file? (:repos-file ctx)))
+              [:section
+               [:h2 "In review"]
+               (if prs
+                 [:ul.plain
+                  (for [p prs]
+                    [:li [:span.muted (:repo p) " "] [:a.doc {:href (:url p)} (:url p)]
+                     [:span.muted " as " (:account p)]])]
+                 [:p.muted "No pull request yet. A role's first handoff pushes its branch and opens "
+                  "a draft on it — until then there is nothing to review against. Check now also "
+                  "asks GitHub whether one was opened some other way."])
+               [:form {:method "post" :action (str "/tasks/" id "/pr")}
+                [:button {:type "submit"} "Check now"]
+                [:span.muted " handoffd asks every 60s; this asks now. New review comments and "
+                 "failing checks become handoffs to whoever last committed in that repo."]]]))
           (let [t (telemetry/task-totals id)]
             [:section [:h2 "Telemetry"
                        (when t [:span.muted " · " (format "$%.4f" (:total-cost t)) " this task"])]

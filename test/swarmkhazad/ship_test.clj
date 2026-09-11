@@ -728,6 +728,49 @@
       (is (str/includes? (slurp (str (fs/path dir "state" "daemon" "handoffd.log"))) "pr handoff")
           "and said so in its own log"))))
 
+(defn pr-record [dir repo]
+  (let [f (fs/path dir "state" "pr" (str repo ".json"))]
+    (when (fs/regular-file? f) (json/parse-string (slurp (str f)) true))))
+
+(deftest a-pr-nothing-recorded-is-found-rather-than-invisible
+  ;; Nothing here ever ships. The branch is pushed by hand and the PR on it was
+  ;; opened by somebody else — the shape of a task that ran before handoffs
+  ;; published one, and of any PR a person opened themselves. Every part of
+  ;; swarmkhazad that could show it reads the record instead of GitHub, so the
+  ;; task page said nothing about a pull request that was sitting there.
+  (with-shipped-task
+    (fn [{:keys [dir poll gh-calls graphql! remote-branches]}]
+      (is (nil? (pr-record dir "gobel")) "nothing recorded: the state this is about")
+      (git (fs/path dir "worktrees" "gobel") "push" "-q" "origin" "sk/t-ship")
+      (graphql! nil quiet-pr)
+      (let [r (poll {"GH_STUB_EXISTING" "https://github.com/MithraAI/gobel/pull/32"})]
+        (is (zero? (:exit r)) (:err r))
+        (is (str/includes? (:out r) "found      gobel sk/t-ship already has")
+            "and it says which repo and which branch, not just that something happened"))
+      (let [m (pr-record dir "gobel")]
+        (is (= "https://github.com/MithraAI/gobel/pull/32" (:url m)))
+        (is (= "sk/t-ship" (:branch m)))
+        (is (= "allen-mithra" (:account m))
+            "the account the checkout's owner maps to — the poller needs it to ask again")
+        (is (str/ends-with? (str (:source m)) "/src/gobel")
+            "and the checkout, because gh reads its repo from the directory it runs in"))
+      (is (some #(str/includes? % "pr list --head sk/t-ship --state all") (gh-calls))
+          "--state all, not open: a merged PR is exactly what a finished task should show")
+      (testing "it writes down what is true at the remote and does nothing else"
+        (is (nil? (pr-record dir "cirdan")))
+        (is (= ["main"] (remote-branches "cirdan"))
+            "a branch that has not been pushed is not pushed here — this is not a second way out of the machine")
+        (is (empty? (filter #(str/includes? % "cirdan pr list") (gh-calls)))
+            "and GitHub is not even asked about it: a branch that never left cannot have a PR, and the daemon asks every 60s")
+        (is (empty? (filter #(str/includes? % "pr create") (gh-calls)))
+            "nothing was opened"))
+      (testing "asking twice records nothing twice and stops asking GitHub"
+        (let [before (count (filter #(str/includes? % "pr list") (gh-calls)))
+              r (poll {"GH_STUB_EXISTING" "https://github.com/MithraAI/gobel/pull/32"})]
+          (is (not (str/includes? (:out r) "found ")))
+          (is (= before (count (filter #(str/includes? % "pr list") (gh-calls))))
+              "a repo with a record is never asked about again"))))))
+
 (deftest push-refuses-any-branch-that-is-not-the-task-branch
   ;; `task-branch` always answers `sk/<task-id>`, so no ctx-driven run can put a
   ;; wrong branch in front of this guard — and a guard nothing can reach is a
