@@ -281,10 +281,18 @@
       (fail! (str "push failed for " repo "\n" (str/trim (:err r)))))
     (str/trim (str (:err r) (:out r)))))
 
-(defn existing-pr [{:keys [source branch account]}]
+(defn find-pr
+  "The pull request on this branch, or nil.
+
+   `state` is gh's, and the two callers ask different questions with it.
+   `publish!` asks \"open\", because a merged PR is not one to reuse: the branch
+   has moved on past it and the next push needs a new one. Discovery asks
+   \"all\", because a merged PR is exactly what a finished task's page should
+   show."
+  [{:keys [source branch account]} state]
   (let [r (process/sh {:continue true :dir (str source)
                        :extra-env (cond-> {} (gh-token account) (assoc "GH_TOKEN" (gh-token account)))}
-                      "gh" "pr" "list" "--head" branch "--state" "open" "--json" "number,url" "--limit" "1")]
+                      "gh" "pr" "list" "--head" branch "--state" state "--json" "number,url" "--limit" "1")]
     (when (zero? (:exit r))
       (first (try (json/parse-string (str/trim (:out r)) true) (catch Exception _ nil))))))
 
@@ -325,6 +333,47 @@
                                      {:pretty true})
                "\n"))))
 
+(defn discover!
+  "Record the pull request a repo's task branch already has, for the repos with
+   no record. Returns one line per PR found.
+
+   The record is written by `publish!`, and everything downstream reads the
+   record rather than GitHub — the task page lists from it, the poller turns
+   review comments into handoffs from it. So a PR opened any other way does not
+   exist as far as swarmkhazad is concerned: a task that ran before handoffs
+   published one, or a person who opened it by hand, leaves a page that says
+   nothing about a pull request that is sitting there.
+
+   Nothing is pushed and nothing is opened here — this only writes down what is
+   already true at the remote. A repo with no branch, no GitHub origin or no PR
+   is skipped in silence, which is the ordinary case for most of a task's life.
+
+   The last of those is why the branch has to be at origin before GitHub is
+   asked at all: a poll runs every 60s from the daemon, and a task spends its
+   early hours with a branch that has never left the machine and therefore
+   cannot have a pull request. Asking anyway would be a keychain read and a
+   round trip a minute to be told so. The cost of the check is that a merged PR
+   whose branch was deleted upstream AND pruned locally is no longer found —
+   worth it against a question asked all day to be answered no."
+  [ctx]
+  (let [branch (task-lib/task-branch ctx)]
+    (vec (for [{:keys [name path]} (try (task-lib/parse-repos ctx) (catch Exception _ nil))
+               :when (not (fs/regular-file? (fs/path (:state-dir ctx) "pr" (str name ".json"))))
+               :let [slug (origin-slug (git-out path "config" "--get" "remote.origin.url"))
+                     at-origin (git-out path "rev-parse" "--verify" "--quiet"
+                                        (str "refs/remotes/origin/" branch))
+                     plan {:repo name
+                           :source path
+                           :branch branch
+                           :base (task-lib/source-default-branch path)
+                           :head (git-out path "rev-parse" branch)
+                           :slug slug
+                           :account (account-for (:owner slug) path)}
+                     pr (when (and slug at-origin) (find-pr plan "all"))]
+               :when pr]
+           (do (record! ctx plan (:url pr))
+               (str "found      " name " " branch " already has " (:url pr)))))))
+
 (defn publish!
   "One repo: branch at the remote, draft PR open on it, both recorded. Returns
    {:url :opened?}.
@@ -336,7 +385,7 @@
    first handoff opens it, and ship rewrites the body once there is a verdict."
   [ctx plan title body]
   (when-not (:pushed? plan) (push! plan))
-  (if-let [pr (existing-pr plan)]
+  (if-let [pr (find-pr plan "open")]
     (do (set-pr-body! plan (:number pr) body)
         (record! ctx plan (:url pr))
         {:url (:url pr) :opened? false})

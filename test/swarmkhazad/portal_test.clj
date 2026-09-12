@@ -201,6 +201,13 @@
                   "never in Attention: it blocks the deploy, not the task")
               (is (str/includes? body "Attention <span class=\"status unmet\">4</span>")
                   "the count is unchanged — adding a release line must not make a finished task look unfinished"))
+            (testing "a task with no PR says so, and offers the button that would find one"
+              ;; The section used to render only once a PR was recorded, so the
+              ;; page a person opens looking for the PR was the one page that
+              ;; never mentions pull requests at all — and the button that asks
+              ;; GitHub was behind the very condition it exists to satisfy.
+              (is (str/includes? body "No pull request yet"))
+              (is (str/includes? body "action=\"/tasks/t-portal/pr\"")))
             (testing "bullets, drafts, role cards"
               (is (str/includes? body "PATH is rebuilt by tmux"))
               (is (str/includes? body "href=\"/tasks/t-portal/doc?path=draft-implement.md\""))
