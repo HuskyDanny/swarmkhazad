@@ -173,10 +173,16 @@
               (is (not (str/includes? body "<pre></pre>"))
                   "a measure that printed nothing gets no empty output box"))
             (testing "a background open that died is surfaced, not left in a log nobody reads"
-              (write! (fs/path dir "state" "portal-open.log") "swarmkhazad: role a: repo /nope is not a git checkout\n")
+              ;; Multi-line on purpose: git puts the cause first and a usage
+              ;; hint last, and the card used to show only the last line.
+              (write! (fs/path dir "state" "portal-open.log")
+                      (str "swarmkhazad: role a: repo /nope is not a git checkout\n"
+                           "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\n"
+                           "'git <command> [<revision>...] -- [<file>...]'\n"))
               (let [b (:body (request env :get (str "/tasks/" id)))]
                 (is (str/includes? b "the swarm never started"))
-                (is (str/includes? b "/nope is not a git checkout")))
+                (is (str/includes? b "/nope is not a git checkout")
+                    "the CAUSE, not just git's usage hint on the last line"))
               (fs/delete (fs/path dir "state" "portal-open.log")))
             (testing "attention lists everything a human must see"
               (is (str/includes? body "needs Allen"))

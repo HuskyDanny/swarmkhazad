@@ -183,6 +183,13 @@
         ;; kickstart runs `open` in the background; when it dies, its output is
         ;; the only record, and nothing rendered it. A task that never reached a
         ;; tmux socket but left a log is a failed open, not a quiet one.
+        ;;
+        ;; Every line of it, not the last. git writes multi-line errors with the
+        ;; cause first and a usage hint last, so `last` rendered a source with no
+        ;; commits as `'git <command> [<revision>...] -- [<file>...]'` — the one
+        ;; line that says nothing, on the one surface a human reads. The
+        ;; <summary> truncates to the first words either way, so the cause leads
+        ;; and the rest stays in the item.
         open-log (when-not (opened? ctx) (text (fs/path (:state-dir ctx) "portal-open.log")))]
     (vec (concat
           (map (fn [l] {:kind "escalation" :text (str/replace l #"^- " "")}) esc)
@@ -191,7 +198,8 @@
           (map (fn [r] {:kind "judge down" :text (str "role " r ": the goal judge was unavailable at its last stop")}) down)
           (when dead [{:kind "daemon" :text "handoffd is not running; mail is not being delivered"}])
           (when-not (str/blank? open-log)
-            [{:kind "open failed" :text (str "the swarm never started; `open` left: " (last (nonblank-lines open-log)))}])))))
+            [{:kind "open failed" :text (str "the swarm never started; `open` left: "
+                                             (str/join " " (nonblank-lines open-log)))}])))))
 
 ;; The cross-off store lives in task_lib: a role that fixes what it escalated
 ;; crosses the item off with note.bb, so the portal is no longer its only
