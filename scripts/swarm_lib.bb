@@ -88,11 +88,29 @@
     (into {} (for [[h r] resolved] [h (:path r)]))))
 
 (defn write-shims!
-  "Install scripts/shim.sh as <task>/bin/<harness> for every known harness, and
-   the vendor table beside the shim's other inputs under state/."
+  "Install scripts/shim.sh as <task>/bin/<harness> for every harness THIS task
+   declared, and the vendor table beside the shim's other inputs under state/.
+
+   The list comes from state/harnesses.tsv, written by resolve-harnesses! a few
+   lines earlier, so a shim exists if and only if a row does. Installing one for
+   every known agent instead is what broke a swarm whose roles are all lanes:
+   <task>/bin leads PATH, so bin/claude shadowed the real binary for the whole
+   session, and cc_auto — which execs a bare `claude` on its last line — died
+   127 on a shim with no row to exec. Every role launched and none survived it.
+   Tasks that happened to declare one `claude` role filled the row by accident
+   and hid the bug.
+
+   Not installing it is the fix rather than back-filling the row: the shim is
+   for a harness the swarm launches, and a lane's inner claude is already
+   configured by the lane. Running it through the shim a second time would
+   re-apply a model flag and, for an `anthropic` vendor, unset the
+   ANTHROPIC_BASE_URL the lane's own router had just exported."
   [ctx]
   (fs/create-dirs (:bin-dir ctx))
-  (doseq [h task-lib/known-agents]
+  (doseq [h (->> (slurp (str (fs/path (:state-dir ctx) "harnesses.tsv")))
+                 str/split-lines
+                 (remove str/blank?)
+                 (map #(first (str/split % #"\t"))))]
     (let [target (fs/path (:bin-dir ctx) h)]
       (fs/copy (fs/path script-dir "shim.sh") target {:replace-existing true})
       (fs/set-posix-file-permissions target "rwxr-xr-x")))

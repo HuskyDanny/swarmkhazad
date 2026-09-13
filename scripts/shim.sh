@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# swarmkhazad harness shim — installed by `open` as <task>/bin/{claude,codex,grok,copilot}.
+# swarmkhazad harness shim — installed by `open` as <task>/bin/<harness>, for
+# each harness the task's roles declare and no others: <task>/bin leads PATH, so
+# a shim with no row in state/harnesses.tsv would shadow a real binary of that
+# name with a guaranteed exit 127.
 #
 # A session's pane launches `<task>/bin/<harness>`; this file branches on it
 # in $SWARMKHAZAD_SESSION, applies that session's model configuration (one row of
