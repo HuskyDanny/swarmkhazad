@@ -49,11 +49,36 @@ if printf ' %s ' "$@" | grep -q ' -p '; then
   exit 0
 fi
 
+# A real harness owns its terminal for as long as it runs and reads what is
+# typed into it; that is the whole point of the wake-up. This stub used to
+# ignore stdin, so a nudge typed into its pane sat unread in the tty buffer
+# until the script exited, and bash then ran it as a command — the fixture
+# reproduced the bug it stands in for, and a passing run left `command not
+# found` in the pane just like a failing one.
+#
+# Read in the FOREGROUND. A `( while read ... ) &` drainer looks tidier and does
+# nothing at all: a background process group reading the terminal takes SIGTTIN
+# and stops, so the file stays empty and the text still falls through to bash
+# (RAN — that was the first attempt at this).
+#
+# Twice, because this role usually finds its mail on the first poll and the
+# nudge lands after that: once inside the wait loop, and once at the end, so a
+# line typed during the role's own work is still consumed by the process rather
+# than inherited by the shell. What it reads goes to a file, the only artifact
+# that can say WHO took the line — pane scrollback shows the text either way.
+: > "$T/tmp/wake-$R.txt"
+drain() {
+  while read -r -t "${1:-1}" typed; do
+    printf '%s\n' "$typed" >> "$T/tmp/wake-$R.txt"
+  done
+  return 0
+}
+
 wait_task() {
   for _ in $(seq 90); do
     out=$(ready_for_next.bb 2>&1)
     if printf '%s' "$out" | grep -q '^TASK:'; then printf '%s\n' "$out"; return 0; fi
-    sleep 1
+    drain 1
   done
   echo "NO TASK ARRIVED for $R: $out" >&2
   return 1
@@ -81,4 +106,7 @@ By b." || exit 1
     swarm_handoff.bb "$T/tmp/b-draft.txt" > "$T/tmp/b-handoff.txt" 2>&1 || { cat "$T/tmp/b-handoff.txt" >&2; exit 1; }
     ;;
 esac
+# The wake usually arrives while the role is doing its work above, not while it
+# waits. Consume it before exiting, or the shell that regains the pane runs it.
+drain 3
 echo "STUB DONE $R" > "$T/tmp/done-$R"
