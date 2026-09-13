@@ -1188,7 +1188,15 @@
           (is (str/includes? (:body r) "Tick the box")))
         (is (fs/directory? dir)))
 
-      (testing "ticked, but the branch is not on origin: the refusal reaches the page"
+      ;; A commit of the task branch's own, which is what the refusal is about.
+      ;; A branch that has added nothing sits where origin/main sits and there is
+      ;; nothing to lose by removing it.
+      (write! (fs/path dir "worktrees" "fixture" "work.txt") "a day of work nobody else has\n")
+      (git (fs/path dir "worktrees" "fixture") "add" "work.txt")
+      (git (fs/path dir "worktrees" "fixture")
+           "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "unpushed")
+
+      (testing "ticked, but the branch holds commits origin has not seen: the refusal reaches the page"
         (let [r (request env :post (str "/tasks/" id "/delete") {:body "sure=on"})]
           (is (= 400 (:status r)))
           (is (str/includes? (:body r) "origin has never seen"))

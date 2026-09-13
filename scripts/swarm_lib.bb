@@ -824,11 +824,27 @@
     (doall (pmap #(smoke-role! ctx sessions %) one-each))))
 
 (defn pushed?
-  "Whether the source already has this branch on its remote, at the same commit.
+  "Whether origin already holds this branch's commits — under this branch's own
+   name, or under any other ref origin has.
 
    The one question worth asking before deleting a worktree: work that is on
    origin can be got back, and work that is not cannot. A task that shipped
    answers yes for every repo, which is the case task.md §10 describes.
+
+   The test used to be that `origin/<branch>` existed AT THE SAME COMMIT, and
+   that answered no for tasks that had shipped and merged — which is every task
+   this is supposed to clean up after. A squash merge, a rebase merge, or a PR
+   merged from a differently named head all leave `origin/<branch>` stale or
+   absent while every commit sits safely on `origin/main`. RAN, the lens task:
+   0 commits that origin did not already have, `origin/sk/lens` four behind the
+   local branch, and a worktree kept anyway until someone reached for `--force`
+   — so the 6.4G this function exists to reclaim stayed on disk exactly when it
+   was safe to take. `--contains` asks what the sentence above means: is this
+   tip reachable from something at origin.
+
+   Scoped to `refs/remotes/origin/`, because a branch that lives only on a fork
+   is a different answer and the docstring above promises this one is about
+   origin.
 
    A branch that is no longer in this checkout answers yes too, because there is
    nothing left to lose. That case is reached now that the question is asked
@@ -837,13 +853,12 @@
    is not there exits non-zero and `task-lib/git` throws, so without this a
    second `close --reclaim` died where it used to report \"already gone\"."
   [source branch]
-  (let [remote (str "refs/remotes/origin/" branch)
-        resolves? (fn [ref]
+  (let [resolves? (fn [ref]
                     (task-lib/git-ok? source "rev-parse" "--verify" "--quiet" (str ref "^{commit}")))]
     (boolean (or (not (resolves? branch))
-                 (and (resolves? remote)
-                      (= (task-lib/git source "rev-parse" (str remote "^{commit}"))
-                         (task-lib/git source "rev-parse" (str branch "^{commit}"))))))))
+                 (seq (task-lib/git source "for-each-ref" "--contains" branch
+                                    "--count=1" "--format=%(refname)"
+                                    "refs/remotes/origin/"))))))
 
 (defn unpushed-repos
   "The repos whose task branch still holds commits origin has never seen.

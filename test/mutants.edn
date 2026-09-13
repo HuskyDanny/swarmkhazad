@@ -530,4 +530,12 @@
   :old "                     pr (when (and slug at-origin) (find-pr plan \"all\"))]"
   :new "                     pr (when slug (find-pr plan \"all\"))]"
   :killed-by "a-pr-nothing-recorded-is-found-rather-than-invisible"
-  :why "the daemon asks GitHub about every repo every 60s for the whole early life of a task, to be told a branch that never left the machine has no pull request"}]
+  :why "the daemon asks GitHub about every repo every 60s for the whole early life of a task, to be told a branch that never left the machine has no pull request"}
+
+ ;; ------------------------------------------- reclaiming the disk a merged task left
+ {:file "scripts/swarm_lib.bb"
+  :ns "ship"
+  :old "                                    \"refs/remotes/origin/\"))))))"
+  :new "                                    (str \"refs/remotes/origin/\" branch)))))))"
+  :killed-by "a-merged-branch-is-reclaimed-even-though-its-own-remote-ref-is-gone"
+  :why "every merged task keeps its checkouts — a squash merge or a renamed head leaves origin/<branch> stale, so the 6.4G this reclaim exists for needs --force"}]
