@@ -203,11 +203,18 @@
               (is (re-find (re-pattern (str "(?m)^OK +" role " ")) out) (str role ": " out))
               (is (str/includes? (slurp (str (fs/path dir "tmp" (str "smoke-" role ".out")))) "HANDOFF QUEUED") "the stub ran swarm_handoff.bb"))
             (is (empty? (fs/glob (fs/path dir "mail") "**/outbox/*.handoff")) "smoke notes are removed so a later open does not deliver them"))
-          (testing "the shims and the vendor table exist; harnesses.tsv points at the recorded real binary"
-            (doseq [h ["claude" "codex" "grok" "copilot"]]
-              (is (fs/executable? (fs/path dir "bin" h)) h))
+          (testing "the shim and the vendor table exist; harnesses.tsv points at the recorded real binary"
+            (is (fs/executable? (fs/path dir "bin" "claude")))
             (is (fs/regular-file? (fs/path dir "state" "vendors.tsv")))
             (is (str/includes? (slurp (str (fs/path dir "state" "harnesses.tsv"))) "stubbin/claude")))
+          ;; <task>/bin leads PATH for the whole session, so a shim for a
+          ;; harness this task never declared has no row to exec and shadows
+          ;; the real binary of that name with a guaranteed exit 127 — which is
+          ;; how an all-lane swarm died before anything ran. Every role here is
+          ;; `claude`, so `claude` is the only name that may appear.
+          (testing "no shim is installed for a harness this task did not declare"
+            (doseq [h ["codex" "grok" "copilot" "cc_auto" "cc_full" "cc_control"]]
+              (is (not (fs/exists? (fs/path dir "bin" h))) h)))
           (testing "an anthropic role gets no vendor env, but does get telemetry tags"
             (let [e (env-map (fs/path dir "tmp" "launch-plain.env"))]
               (is (nil? (get e "ANTHROPIC_BASE_URL")) "the parent shell's routing was dropped")
