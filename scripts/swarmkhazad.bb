@@ -189,7 +189,25 @@
     (println "tmux socket:" (:tmux-socket ctx))
     (doseq [{:keys [session harness model worktree-path]} (:sessions ctx)]
       (println (str "  " (task-lib/session-name session) "  " harness " model=" model "  " worktree-path)))
-    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>_<repo>"))))
+    (println (str "attach: tmux -S " (:tmux-socket ctx) " attach -t sk-<role>_<repo>"))
+    ;; Say whether the harnesses are still there before saying how to attach to
+    ;; them. Every line above is printed whether they launched or died the same
+    ;; second, which is how a task once reported eight healthy sessions that
+    ;; were eight shell prompts.
+    (let [failed (swarm-lib/failed-launches! ctx (:sessions ctx))]
+      (when (seq failed)
+        (binding [*out* *err*]
+          (doseq [[s status] failed]
+            (println (str "EXITED " status "  " (task-lib/session-name s)
+                          "  — see `tmux -S " (:tmux-socket ctx)
+                          " capture-pane -p -t " (task-lib/session-name s) "`")))
+          (println (str (count failed) " of " (count (:sessions ctx))
+                        " sessions' harnesses exited non-zero at launch."))
+          ;; All of them means the swarm did not start, whatever the lines above
+          ;; say. Some of them is still a working swarm, so it reports and exits
+          ;; zero rather than making a partial launch unopenable.
+          (when (= (count failed) (count (:sessions ctx)))
+            (throw (ex-info "no session came up" {:exit 1}))))))))
 
 (defn open-cmd!
   "`open <task-id>`, or `open --linear <KEY> [--repo <path>]...`, which scaffolds

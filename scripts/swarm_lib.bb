@@ -461,7 +461,19 @@
        "export SWARMKHAZAD_TASK_DIR=" (sq (:task-dir ctx)) "\n"
        "export PATH=" (sq (str (:bin-dir ctx))) ":" (sq (str script-dir)) ":\"$PATH\"\n"
        "cd " (sq (:worktree-path row)) " || exit 1\n"
-       "exec " (str/join " " (map sq (harness-argv ctx row (shim-path ctx (:harness row)) prompt :interactive nil))) "\n"))
+       ;; Record the harness's exit status instead of `exec`ing over this shell.
+       ;;
+       ;; From outside the pane, a harness that finished its work and one that
+       ;; died on a shim exit 127 look identical: an interactive shell at a
+       ;; prompt. Nothing anywhere recorded which had happened — in the run that
+       ;; motivated this, the only trace of eight 127s was tmux scrollback,
+       ;; bounded by pane-history-limit and gone with the session. This is the
+       ;; one line that turns `the pane is a shell now` into `the harness exited
+       ;; N at this time`, and it costs one shell process per session.
+       "status=" (sq (str (fs/path (:sessions-dir ctx) (:session row) "exit"))) "\n"
+       "mkdir -p \"$(dirname \"$status\")\"\n"
+       (str/join " " (map sq (harness-argv ctx row (shim-path ctx (:harness row)) prompt :interactive nil))) "\n"
+       "printf '%s\\n' \"$?\" > \"$status\"\n"))
 
 (defn launch-session!
   "Write prompts/<session>.launch.sh and type `bash <path>` into its pane.
@@ -768,6 +780,31 @@
     (start-handoffd! ctx)
     (assoc ctx :roles roles :repos repos :sessions sessions
            :commands (mapv #(launch-session! ctx sessions %) sessions))))
+
+(def launch-settle-ms
+  "How long a harness gets before open asks what happened to it. Past the
+   generated launch script and into the harness itself; a slow one is still
+   starting at that point and has written no exit status, which is what `fine`
+   looks like here."
+  (or (some-> (System/getenv "SWARMKHAZAD_LAUNCH_SETTLE_MS") parse-long) 8000))
+
+(defn failed-launches!
+  "Let the harnesses settle, then return [session status] for every one that has
+   already exited non-zero.
+
+   Asking the PANE cannot answer this. A pane holding a shell prompt is a
+   harness that died at launch and a harness that finished its work, equally —
+   and the suite's own two-role pipeline finishes in under the settle window, so
+   a pane probe calls a successful run dead. The launch script writes the exit
+   status; a session that is still working has not written one, and one that
+   exited 0 did what it was asked."
+  [ctx sessions]
+  (Thread/sleep launch-settle-ms)
+  (vec (for [row sessions
+             :let [f (fs/path (:sessions-dir ctx) (:session row) "exit")
+                   status (when (fs/regular-file? f) (str/trim (slurp (str f))))]
+             :when (and status (not= "0" status))]
+         [(:session row) status])))
 
 ;; ---------------------------------------------------------------- smoke
 
