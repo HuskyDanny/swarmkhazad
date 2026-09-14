@@ -326,6 +326,43 @@
        "| mcp run stays up 60s, no traceback | run it in the built image, bounded wait |\n"
        "| the Service has endpoints | `kubectl -n superset get endpoints superset-mcp` |\n"))
 
+(deftest the-open-log-keeps-both-streams-whole
+  ;; The log is the only record of a background `open`, and the attention list
+  ;; renders it when a swarm never started. It used to be written by handing the
+  ;; SAME File to :out and :err, which hold independent offsets — each stream
+  ;; starts at 0 and the shorter one lands on top of the longer.
+  ;;
+  ;; The lines lost are the ones worth having. Parseemailfix's log begins at
+  ;; `swarm open: Parseemailfix` and carries no `swarmkhazad: <harness> -> <path>`
+  ;; line, though resolve-harnesses! prints one per harness unconditionally: the
+  ;; success report on stdout overwrote the head of stderr, so which binary each
+  ;; role got, and which wrapper shims were skipped, was gone.
+  (load-file (str (fs/path scripts "portal.bb")))
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-openlog."})
+        log (fs/path sandbox "portal-open.log")
+        ;; stderr long and first, stdout short and last: the shape that loses
+        ;; bytes. Equal-length lines would pass under the old code too.
+        child ["bash" "-c" (str "for i in 1 2 3 4 5 6; do echo \"ERRLINE-$i-padpadpadpadpadpadpadpad\" >&2; done;"
+                                " echo OUT-short")]]
+    (try
+      @((resolve 'portal/open-log-process!) log child)
+      (Thread/sleep 300)
+      (let [text (slurp (str log))]
+        (doseq [i (range 1 7)]
+          (is (str/includes? text (str "ERRLINE-" i "-padpadpadpadpadpadpadpad"))
+              (str "stderr line " i " survived whole: " (pr-str text))))
+        (is (str/includes? text "OUT-short") "and stdout is there too")
+        (is (not (str/starts-with? text "OUT-short"))
+            "stdout did not land at offset 0 on top of stderr"))
+      (testing "a second open is this open's log, not both of them"
+        @((resolve 'portal/open-log-process!) log ["bash" "-c" "echo SECOND-RUN"])
+        (Thread/sleep 300)
+        (let [text (slurp (str log))]
+          (is (str/includes? text "SECOND-RUN"))
+          (is (not (str/includes? text "ERRLINE-1")) "the previous run's log was truncated, not appended to")))
+      (finally
+        (fs/delete-tree sandbox)))))
+
 (deftest one-pasted-block-becomes-the-goal-the-not-goals-and-the-bars
   (load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
   (load-file (str (fs/path repo-root "scripts" "project_lib.bb")))

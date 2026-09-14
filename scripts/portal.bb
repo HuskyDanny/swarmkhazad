@@ -159,6 +159,28 @@
             (and (seq p) (fs/exists? p)))
           (catch Exception _ false)))))
 
+(defn open-log-process!
+  "Start `open` in the background with both its streams landing in one log.
+
+   Appending rather than handing the same File to :out and :err. Two streams
+   writing one File hold INDEPENDENT offsets, so each starts at 0 and the
+   shorter one lands on top of the longer. RAN, a child writing six padded
+   stderr lines and one short stdout line: the file began
+   `OUT-short\npadpadpad...` — the first ten bytes of stderr's first line gone.
+   Field evidence for the same thing: Parseemailfix's portal-open.log begins at
+   `swarm open: Parseemailfix` and carries no `swarmkhazad: <harness> -> <path>`
+   line, although resolve-harnesses! prints one per harness unconditionally, so
+   which binary each role got — and which wrapper shims were skipped — was
+   overwritten by the success report. Those lines are the whole reason the log
+   exists: they are what the attention list shows when a swarm never started.
+
+   Truncated first, so the file is still THIS open's log rather than every open
+   the task has ever had."
+  [log argv]
+  (fs/delete-if-exists log)
+  (process/process argv {:out :append :out-file (fs/file log)
+                         :err :append :err-file (fs/file log)}))
+
 (defn attention
   "What needs a human: escalation lines, failed mail, denials, a down judge, a
    dead daemon.
@@ -528,8 +550,8 @@
             ;; the bound, and this file is the task's own answer inside it.
             (spit (str (:repos-file ctx)) (task-lib/repos-text picked))
             (fs/create-dirs (:state-dir ctx))
-            (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
-              (process/process ["bb" cli "open" id] {:out log :err log}))
+            (let [log (fs/path (:state-dir ctx) "portal-open.log")]
+              (open-log-process! log ["bb" cli "open" id]))
             {:ok id}))))))
 
 ;; ---------------------------------------------------------------- html
@@ -1506,8 +1528,8 @@
        (if-let [ctx (ctx-for id)]
          (do
            (fs/create-dirs (:state-dir ctx))
-           (let [log (fs/file (fs/path (:state-dir ctx) "portal-open.log"))]
-             (process/process ["bb" cli "open" id] {:out log :err log}))
+           (let [log (fs/path (:state-dir ctx) "portal-open.log")]
+             (open-log-process! log ["bb" cli "open" id]))
            {:status 303 :headers {"Location" (str "/tasks/" id)} :body ""})
          (not-found)))
      ;; Synchronous, unlike resume's spawn-and-redirect: the whole point is the
