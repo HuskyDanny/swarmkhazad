@@ -30,6 +30,14 @@ if printf ' %s ' "$@" | grep -q ' --json-schema '; then
 fi
 
 printf '%s\n' "$@" > "$T/tmp/launch-$R.argv"
+
+# The Parseemailfix shape: a harness that records its launch and then dies,
+# leaving a live tmux session around a shell prompt. Every surface reported
+# health for eight of these.
+if [ -n "${SWARMKHAZAD_STUB_DIE:-}" ]; then
+  echo "stub-claude: dying at launch, as a shim exit 127 does" >&2
+  exit 127
+fi
 env | grep -E '^(ANTHROPIC_|OTEL_|CLAUDE_CODE_|API_TIMEOUT)' | sort > "$T/tmp/launch-$R.env"
 
 # `-p` = the smoke: behave like a print-mode session that read goal.md and sent

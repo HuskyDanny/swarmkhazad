@@ -356,7 +356,7 @@
         _ (spit (str prompt) "PROMPT-TEXT")
         ctx {:task-id "t" :task-dir "/tmp/t" :goal-file "/tmp/t/goal.md" :metrics-file "/tmp/t/metrics.md"
              :hooks-dir (fs/path scratch "hooks") :bin-dir "/tmp/t/bin" :prompts-dir "/tmp/t/prompts"
-             :plugin-dir "/tmp/t/plugin"}
+             :plugin-dir "/tmp/t/plugin" :sessions-dir "/tmp/t/state/sessions"}
         row (fn [h] {:session "r" :role "r" :repo "fixture" :harness h
                      :worktree-path "/tmp/t/worktrees/fixture" :extra-args "--flag va'lue"})
         argv (fn [h mode] ((resolve 'swarm-lib/harness-argv) ctx (row h) (str "/bin/" h) prompt mode "SMOKE"))
@@ -400,8 +400,16 @@
           (is (start-with (last a)))))
       (testing "the launch script single-quotes every token, so a quote in an arg survives the shell"
         (let [line ((resolve 'swarm-lib/launch-script) ctx (row "claude") prompt)]
-          (is (str/includes? line "exec 'env' 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1' '/tmp/t/bin/claude'"))
-          (is (str/includes? line "'--flag' 'va'\"'\"'lue' '--' 'You are role r"))))
+          (is (str/includes? line "\n'env' 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1' '/tmp/t/bin/claude'"))
+          (is (str/includes? line "'--flag' 'va'\"'\"'lue' '--' 'You are role r"))
+          ;; Not `exec`: the script has to outlive the harness by one command to
+          ;; record how it exited. Without that, a harness that died at launch
+          ;; and one that finished its work are the same thing from outside —
+          ;; an interactive shell at a prompt — and open cannot tell an operator
+          ;; which happened.
+          (is (str/includes? line "status='/tmp/t/state/sessions/r/exit'"))
+          (is (str/includes? line "printf '%s\\n' \"$?\" > \"$status\""))
+          (is (not (str/includes? line "exec '")) "exec would discard the harness's exit status")))
       (testing "a role's own tool set reaches the argv, and the variadic flag is followed by a flag"
         ;; --disallowedTools consumes words until the next --prefixed token, so
         ;; its POSITION is the load-bearing part: emitted after `extra` it

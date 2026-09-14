@@ -180,6 +180,18 @@
         denials (count (nonblank-lines (text (fs/path (:state-dir ctx) "denials.jsonl"))))
         down (for [[role v] (verdicts ctx) :when (:down v)] role)
         dead (and (opened? ctx) (false? (daemon-alive? ctx)))
+        ;; The list is supposed to answer "what needs a human", and a role that
+        ;; stopped running is the plainest possible answer. It had no item kind
+        ;; for one: `dead` above is about the DAEMON, and in the run that
+        ;; motivated this handoffd was alive and writing `delivered` lines into
+        ;; eight panes whose agents had exited. Both clauses read healthy and
+        ;; the list produced nothing.
+        stopped (when (opened? ctx)
+                  ;; read-sessions-tsv rather than `sessions`, which is defined
+                  ;; below this.
+                  (for [row (task-lib/read-sessions-tsv ctx)
+                        :when (not (handoff-lib/session-alive? ctx (:session row)))]
+                    (:session row)))
         ;; kickstart runs `open` in the background; when it dies, its output is
         ;; the only record, and nothing rendered it. A task that never reached a
         ;; tmux socket but left a log is a failed open, not a quiet one.
@@ -197,6 +209,7 @@
           (when (pos? denials) [{:kind "denials" :text (str denials " tool call(s) denied by the contract hook — state/denials.jsonl")}])
           (map (fn [r] {:kind "judge down" :text (str "role " r ": the goal judge was unavailable at its last stop")}) down)
           (when dead [{:kind "daemon" :text "handoffd is not running; mail is not being delivered"}])
+          (map (fn [r] {:kind "session" :text (str r ": no agent is running in its pane")}) stopped)
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: "
                                              (str/join " " (nonblank-lines open-log)))}])))))
@@ -305,6 +318,11 @@
        :verdict (get vs name)
        :sent (count-files (fs/path mail "sent"))
        :inbox (+ (count-files (fs/path mail "inbox" "new")) (count-files (fs/path mail "inbox" "in_process")))
+       ;; Not derived from the pane text. Every other field here is populated
+       ;; identically for a dead pane — :last-line on a dead session shows a zsh
+       ;; prompt, which renders like any other line of scrollback — so the card
+       ;; read healthy for eight dead agents for 36 minutes.
+       :alive (handoff-lib/session-alive? ctx name)
        :last-line (last (nonblank-lines (pane-text ctx name)))})))
 
 (defn session-summary
@@ -1282,6 +1300,8 @@
                    [:div.card
                     [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:repo c)] [:span.chev "›"]]
                     [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
+                    (when-not (:alive c)
+                      [:div [:span.status.unmet "no agent running in its pane"]])
                     [:div "judge: " (if-let [v (:verdict c)]
                                       [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
                                       [:span.status.pending "no verdict"])]

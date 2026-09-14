@@ -330,6 +330,53 @@
                     "kill-server")
         (fs/delete-tree sandbox)))))
 
+(deftest open-says-so-when-a-harness-dies-at-launch
+  ;; The Parseemailfix shape, end to end. Eight sessions launched, every harness
+  ;; exited 127 one second later, and `open` printed its ordinary success report
+  ;; — session lines, then the attach hint — over the top of eight shell
+  ;; prompts. tmux said the sessions existed, the portal said the task was open,
+  ;; handoffd said `delivered`. It took capture-pane on a named session to find
+  ;; out, 36 minutes later.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-deadopen."})
+        home (str (fs/path sandbox "home"))
+        src (str (fs/path sandbox "src" "fixture"))
+        stubdir (str (fs/path sandbox "stubbin"))
+        env {"SWARMKHAZAD_HOME" home
+             "PATH" (str stubdir ":" (System/getenv "PATH"))
+             "SWARMKHAZAD_OTLP_ENDPOINT" "http://127.0.0.1:1/opentelemetry"
+             ;; The real 25s would be 25s of nothing happening: this harness is
+             ;; dead before the first probe and never recovers.
+             "SWARMKHAZAD_LAUNCH_SETTLE_MS" "4000"
+             "SWARMKHAZAD_STUB_DIE" "1"}
+        id "t-deadopen"
+        dir (fs/path home "tasks" id)]
+    (try
+      (make-source-repo! src)
+      (fs/create-dirs stubdir)
+      (fs/copy stub (fs/path stubdir "claude"))
+      (fs/set-posix-file-permissions (fs/path stubdir "claude") "rwxr-xr-x")
+      (run {:env env} cli "new" id "--repo" src)
+      (spit (str (fs/path dir "roles")) "implement claude task\n")
+      (spit (str (fs/path dir "repos")) (str src "\n"))
+      (spit (str (fs/path dir "goal.md")) "# t-deadopen\n\n## Goal\n- [ ] a bar — measure: `true`\n")
+      (let [r (run {:env env :ok? false} cli "open" id)
+            out (str (:out r) (:err r))]
+        (testing "the harness really did run and really did die"
+          (is (fs/regular-file? (fs/path dir "tmp" "launch-implement.argv"))
+              "the stub never launched, so this test is not exercising what it claims"))
+        (testing "open names the session whose harness died, and the status it died with"
+          (is (str/includes? out "EXITED 127  sk-implement") out)
+          (is (str/includes? out "1 of 1 sessions' harnesses exited non-zero at launch") out))
+        (testing "the status is on disk, not only in the scrollback that dies with the pane"
+          (is (= "127" (str/trim (slurp (str (fs/path dir "state" "sessions" "implement" "exit")))))))
+        (testing "every session dead means the swarm did not start, whatever the session lines above say"
+          (is (not (zero? (:exit r))) "open exited zero on a swarm where nothing is running")))
+      (finally
+        (process/sh {:continue true} "tmux" "-S"
+                    (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
+                    "kill-server")
+        (fs/delete-tree sandbox)))))
+
 (deftest typing-into-a-pane-with-no-agent-in-it-is-refused
   ;; The e2e above proves a wake reaches a LIVE agent. It cannot prove the other
   ;; half, because its panes are always alive by the time the nudge fires — so
