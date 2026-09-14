@@ -23,6 +23,17 @@ if [ -z "$real" ] || [ ! -x "$real" ]; then
   echo "swarmkhazad shim: no executable for '$harness' in $task_dir/state/harnesses.tsv" >&2
   exit 127
 fi
+# Never exec another copy of this file. The row is normally written by
+# resolve-harness, which refuses one of ours — but a hand-edited harnesses.tsv
+# reaches here too, and the failure it produces is the worst kind: this script
+# would read the SAME row again and exec it again, appending one `--model <id>`
+# per pass, printing nothing at all until the argv hits E2BIG (RAN, bounded at
+# 5s: 366 copies, 8182 bytes, zero output). One grep turns a silent spin into a
+# line that says what to fix.
+if head -c 256 "$real" 2>/dev/null | grep -q 'swarmkhazad harness shim'; then
+  echo "swarmkhazad shim: '$harness' resolves to another swarmkhazad shim ($real) in $task_dir/state/harnesses.tsv — that execs itself forever. Point the row at the real binary." >&2
+  exit 127
+fi
 # sessions.tsv columns are task-lib's sessions-tsv-columns; :model is the
 # seventh and the session id is the first (both pinned by shim_test).
 declared="$(awk -F'\t' -v r="$session" '$1==r {print $7}' "$task_dir/state/sessions.tsv")"

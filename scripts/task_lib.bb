@@ -635,9 +635,44 @@
    and the choice is printed at open."
   ["/cmux-cli-shims/" ".app/Contents/"])
 
+(def own-shim-marker
+  "The string scripts/shim.sh carries in its header. A candidate holding it IS
+   one of our shims, whatever it is called and wherever it was copied to."
+  "swarmkhazad harness shim")
+
+(defn own-shim?
+  "Whether a candidate is a copy of scripts/shim.sh — a <task>/bin/<harness>.
+
+   Resolving one is worse than resolving nothing. The shim execs the path its
+   task's harnesses.tsv names, so a task whose row points at another task's shim
+   execs a shim that reads the SAME row and execs it again: an exec loop that
+   appends one `--model <id>` per pass and never prints a byte. RAN, bounded at
+   5s: still running, 0 bytes of output, 366 copies of `--model` and an argv of
+   8182 bytes on its way to E2BIG. The pane shows nothing — strictly worse than
+   the exit 127 it replaces, because none of the shim's own error paths run.
+
+   It is reachable without anyone doing anything strange: swarm_lib puts
+   `<task>/bin` first on every pane's PATH, so an `open`, an ask.bb or a
+   run_evidence.bb dispatch from inside a pane resolves against it. RAN with
+   only that one directory prepended: resolve-harness returned that task's shim
+   as `:path`, with `:skipped []` — not even reported.
+
+   By CONTENT, not by path. A path test would have to know where the
+   swarmkhazad home is, and would miss a task folder moved or copied anywhere
+   else; the header travels with the file. Only the first bytes are read, so a
+   real harness binary is not slurped to answer this."
+  [path]
+  (try
+    (with-open [r (java.io.FileReader. (str path))]
+      (let [buf (char-array 256)
+            n (.read r buf 0 256)]
+        (and (pos? n) (str/includes? (String. buf 0 n) own-shim-marker))))
+    (catch Exception _ false)))
+
 (defn wrapper-shim? [path]
   (let [real (str (try (fs/real-path path) (catch Exception _ path)))]
-    (boolean (some #(str/includes? real %) wrapper-shim-markers))))
+    (boolean (or (some #(str/includes? real %) wrapper-shim-markers)
+                 (own-shim? path)))))
 
 (defn harness-candidates
   "Every executable of that name on PATH, in PATH order."
@@ -656,7 +691,17 @@
    {:path ... :skipped [...]} or nil."
   [harness]
   (if-let [pinned (not-empty (or (System/getenv (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness))) ""))]
-    {:path pinned :skipped [] :pinned true}
+    ;; A pin wins over every candidate on PATH, but not over the exec loop. The
+    ;; pin exists to name the REAL binary when PATH only offers wrappers, so a
+    ;; pin at one of our own shims is the one thing it cannot mean — and taking
+    ;; it produces the silent loop rather than the wrong-binary error a pin is
+    ;; allowed to produce.
+    (if (own-shim? pinned)
+      (throw (ex-info (str "SWARMKHAZAD_HARNESS_" (str/upper-case harness) " points at a swarmkhazad shim ("
+                           pinned "), which execs whatever harnesses.tsv names — including itself. "
+                           "Pin the real binary instead.")
+                      {:harness harness :pinned pinned}))
+      {:path pinned :skipped [] :pinned true})
     ;; A lane is a script at a known path, not a name on PATH — the operator
     ;; reaches it through a shell alias, and an alias is not a file a child
     ;; process can exec.

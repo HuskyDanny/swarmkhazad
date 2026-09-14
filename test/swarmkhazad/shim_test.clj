@@ -135,6 +135,81 @@
       (finally
         (fs/delete-tree sandbox)))))
 
+(deftest one-of-our-own-shims-on-path-is-skipped-not-pinned
+  ;; swarm_lib puts `<task>/bin` first on every pane's PATH, so anything run
+  ;; from inside a pane — `open`, ask.bb, a run_evidence dispatch — resolves
+  ;; against a directory full of shims. Resolving one is worse than resolving
+  ;; nothing: the shim execs whatever its task's harnesses.tsv names, so a task
+  ;; whose row points at a shim execs a shim that reads the same row and execs
+  ;; it again, appending one `--model <id>` per pass. RAN, bounded at 5s: still
+  ;; running, ZERO bytes of output, 366 copies of `--model`, an 8182-byte argv
+  ;; on its way to E2BIG. Nothing prints, because none of the shim's own error
+  ;; paths are reached.
+  ;;
+  ;; Detected by the header the file carries, not by where it sits: a path test
+  ;; would have to know the swarmkhazad home and would miss a task folder
+  ;; copied elsewhere.
+  (load-file (str (fs/path repo-root "scripts" "swarm_lib.bb")))
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-ownshim."})
+        bindir (fs/path sandbox "task" "bin")
+        realdir (fs/path sandbox "bin")]
+    (try
+      (fs/create-dirs bindir)
+      (fs/create-dirs realdir)
+      ;; The real thing, not a hand-written lookalike: if shim.sh's header ever
+      ;; stops carrying the marker, this test has to notice.
+      (fs/copy (fs/path repo-root "scripts" "shim.sh") (fs/path bindir "claude"))
+      (fs/set-posix-file-permissions (fs/path bindir "claude") "rwxr-xr-x")
+      (executable! (fs/path realdir "claude") "#!/bin/bash\necho real\n")
+      (let [wrapper? (resolve 'task-lib/wrapper-shim?)]
+        (is (@wrapper? (str (fs/path bindir "claude"))) "a copy of scripts/shim.sh is one of ours")
+        (is (not (@wrapper? (str (fs/path realdir "claude")))) "an ordinary script is not")
+        (is (not (@wrapper? (str (fs/path repo-root "bb.edn"))))
+            "and neither is a file that merely sits in this repo"))
+      (let [out (:out (process/sh {:continue true
+                                   :extra-env {"PATH" (str bindir ":" realdir)}
+                                   :dir repo-root}
+                                  "bb" "-e"
+                                  (str "(load-file \"scripts/swarm_lib.bb\")"
+                                       "(prn (task-lib/resolve-harness \"claude\"))")))]
+        (is (str/includes? out (str (fs/path realdir "claude")))
+            "the real binary is chosen over the shim that came first on PATH")
+        (is (str/includes? out (str (fs/path bindir "claude")))
+            "and the shim is REPORTED as skipped, not silently passed over"))
+      ;; A pin wins over every candidate on PATH, which is the whole point of
+      ;; it — so it skipped the wrapper test entirely and was the one way left
+      ;; to reach the loop through resolve-harness.
+      (let [r (process/sh {:continue true
+                           :extra-env {"PATH" (str realdir)
+                                       "SWARMKHAZAD_HARNESS_CLAUDE" (str (fs/path bindir "claude"))}
+                           :dir repo-root}
+                          "bb" "-e"
+                          (str "(load-file \"scripts/swarm_lib.bb\")"
+                               "(prn (task-lib/resolve-harness \"claude\"))"))]
+        (is (not (zero? (:exit r))) "a pin at one of our shims is refused, not honoured")
+        (is (str/includes? (str (:out r) (:err r)) "points at a swarmkhazad shim")
+            "and the message says what is wrong with it"))
+      ;; The last door in: a row written by something other than
+      ;; resolve-harness — a hand-edited harnesses.tsv, or a task folder from
+      ;; before this check existed.
+      (testing "the shim refuses to exec another shim, whatever put the row there"
+        (let [task (fs/path sandbox "task")]
+          (fs/create-dirs (fs/path task "state"))
+          (spit (str (fs/path task "state" "harnesses.tsv"))
+                (str "claude\t" (fs/path bindir "claude") "\n"))
+          (spit (str (fs/path task "state" "sessions.tsv"))
+                "r\tr\trepo\t/tmp\tclaude\ttask\tanthropic:x\t\n")
+          (let [r (process/sh {:continue true
+                               :extra-env {"SWARMKHAZAD_TASK_DIR" (str task)
+                                           "SWARMKHAZAD_SESSION" "r"
+                                           "SWARMKHAZAD_TASK_ID" "t"}}
+                              (str (fs/path bindir "claude")))]
+            (is (= 127 (:exit r)) "it exits rather than spinning")
+            (is (str/includes? (str (:err r)) "resolves to another swarmkhazad shim")
+                "with a line naming the row to fix — the loop itself prints nothing at all"))))
+      (finally
+        (fs/delete-tree sandbox)))))
+
 (deftest a-task-in-a-project-labels-its-metrics-with-it
   ;; The dimensions a dashboard can group by are exactly the ones the shim
   ;; writes, so a missing one is a question nobody can ask afterwards — and it
