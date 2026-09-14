@@ -218,7 +218,21 @@
             branch (str "sk/" id)]
         (is (fs/directory? worktree) "prepare made the worktree this test is about to delete")
 
-        (testing "it refuses while the branch is not on origin, and touches nothing"
+        (testing "a branch that has added nothing is not work at risk"
+          ;; It sits exactly where origin/main does. The refusal used to fire
+          ;; here anyway, because it asked whether `refs/remotes/origin/<branch>`
+          ;; existed rather than whether anything would be lost — which is why a
+          ;; merged task, whose branch origin no longer carries under its own
+          ;; name, could not be cleaned up without `--force`.
+          (is (str/includes? (:out (run {:env env :ok? false} cli "close" id "--reclaim"))
+                             "worktree removed"))
+          (run {:env env} cli "prepare" id))
+
+        (write! (fs/path worktree "work.txt") "a day of work nobody else has\n")
+        (git worktree "add" "work.txt")
+        (git worktree "-c" "user.email=t@e" "-c" "user.name=T" "commit" "-q" "-m" "unpushed")
+
+        (testing "it refuses while the branch holds commits origin has not seen, and touches nothing"
           ;; The whole point of the refusal: the branch name is written in the
           ;; task folder, so removing the folder is what makes local-only
           ;; commits unfindable. Same rule and same override as reclaim.

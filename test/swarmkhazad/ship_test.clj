@@ -432,7 +432,12 @@
         ;; The push does not go through gh, so this reads the remote instead:
         ;; main is untouched and the only new ref is the task branch.
         (is (= ["main" "sk/t-ship"] (remote-branches "gobel")))
-        (is (not-any? #(str/includes? % "merge") (gh-calls)) "and no merge was ever asked for")))))
+        ;; The ARGUMENTS, not the whole logged line: the stub prefixes each
+        ;; call with the directory it ran in, and this suite runs from whatever
+        ;; the checkout is called. A worktree named `reclaim-merged` made this
+        ;; assertion fail on its own directory name.
+        (is (not-any? #(str/includes? (str/join " " (rest (str/split % #" "))) "merge") (gh-calls))
+            "and no merge was ever asked for")))))
 
 (deftest the-two-contracts-that-live-in-two-files
   ;; Both of these are couplings a sandbox run cannot see: they hold between
@@ -1022,6 +1027,37 @@
           (let [r (close "--reclaim")]
             (is (zero? (:exit r)))
             (is (str/includes? (:out r) "already gone"))))))))
+
+(deftest a-merged-branch-is-reclaimed-even-though-its-own-remote-ref-is-gone
+  ;; The shape every merged pull request leaves behind, and the one the old test
+  ;; above never reached: the commits are on main at the remote and the branch
+  ;; they arrived on is deleted. A squash merge and a PR merged from a renamed
+  ;; head look the same from here.
+  ;;
+  ;; Asking whether `origin/<branch>` exists at the same commit answers NO to
+  ;; all three, so a task that shipped — the only kind there is anything to
+  ;; reclaim from — kept its checkouts until somebody reached for `--force`.
+  ;; RAN in the field: the lens task, 0 commits origin did not already have,
+  ;; worktree kept.
+  (with-shipped-task
+    (fn [{:keys [dir sandbox env] :as h}]
+      (ship! h)
+      (let [src (str (fs/path sandbox "src" "gobel"))
+            bare (str (fs/path sandbox "remotes" "gobel.git"))
+            wt (fs/path dir "worktrees" "gobel")
+            tip (git src "rev-parse" "sk/t-ship")]
+        (git bare "update-ref" "refs/heads/main" tip)
+        (git src "push" "-q" "origin" "--delete" "sk/t-ship")
+        (git src "fetch" "-q" "--prune" "origin")
+        (is (not (str/includes? (git bare "for-each-ref" "--format=%(refname:short)" "refs/heads/")
+                                "sk/t-ship"))
+            "the branch is gone from the remote, which is what a merge does to it")
+        (let [r (run {:env env :ok? false} cli "close" "t-ship" "--reclaim")]
+          (is (zero? (:exit r)) (:err r))
+          (is (str/includes? (:out r) "gobel: worktree removed")
+              "named, because cirdan's line says the same and its branch never left")
+          (is (not (fs/directory? wt))
+              "nothing is lost by removing it — every commit is on origin, under main"))))))
 
 (deftest close-without-reclaim-removes-nothing
   (with-shipped-task
