@@ -214,6 +214,35 @@
               ;; GitHub was behind the very condition it exists to satisfy.
               (is (str/includes? body "No pull request yet"))
               (is (str/includes? body "action=\"/tasks/t-portal/pr\"")))
+            (testing "the branch and every repo's PR are in the header"
+              ;; Both facts were already on the page and neither was where a
+              ;; reader looks: the PR sat four scrolls down in "In review", and
+              ;; the branch — written into every PR record — was never rendered
+              ;; anywhere. Sliced at "Ready to merge?" so these assert the
+              ;; header, not merely the page.
+              (let [head (subs body 0 (str/index-of body "Ready to merge?"))]
+                (is (str/includes? head "<code>sk/t-portal</code>")
+                    "one branch name for the whole task, however many repos it has")
+                (is (str/includes? head "fixture <span class=\"status pending\">no PR</span>")
+                    "a repo the task runs is listed before it ships — listing only the shipped ones makes a two-repo task look like a one-repo task already in review"))
+              (write! (fs/path dir "state" "pr" "fixture.json")
+                      "{\"repo\":\"fixture\",\"branch\":\"sk/t-portal\",\"state\":\"OPEN\",\"url\":\"https://github.com/acme/fixture/pull/7\"}\n")
+              ;; A repo dropped from `repos` after its PR opened has no session
+              ;; and still has a PR. Nothing else on the page would say so.
+              (write! (fs/path dir "state" "pr" "gone.json")
+                      "{\"repo\":\"gone\",\"branch\":\"sk/t-portal\",\"state\":\"MERGED\",\"url\":\"https://github.com/acme/gone/pull/3\"}\n")
+              (let [b (:body (request env :get (str "/tasks/" id)))
+                    head (subs b 0 (str/index-of b "Ready to merge?"))]
+                (is (str/includes? head "href=\"https://github.com/acme/fixture/pull/7\""))
+                (is (str/includes? head "fixture #7"))
+                (is (str/includes? head "pending\">open")
+                    "an open PR is not a green tick — the state comes from the poll, not from the record existing")
+                (is (str/includes? head "gone #3 <span class=\"status met\">merged</span>")
+                    "a repo with no session but a record is still listed, and merged reads green")
+                (is (not (str/includes? head "no PR"))
+                    "and the repo that shipped stops saying it has not"))
+              (fs/delete (fs/path dir "state" "pr" "fixture.json"))
+              (fs/delete (fs/path dir "state" "pr" "gone.json")))
             (testing "bullets, drafts, role cards"
               (is (str/includes? body "PATH is rebuilt by tmux"))
               (is (str/includes? body "href=\"/tasks/t-portal/doc?path=draft-implement.md\""))

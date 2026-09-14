@@ -1144,6 +1144,28 @@
            [:div.row.head
             [:div.grow [:div.name "Board"]
              [:div.muted "goal.md and metrics.md are read-only here — the checkboxes show the judge's latest verdicts, never an edit"]]
+            ;; The branch and the PRs, in the header. Both were on the page
+            ;; already — the PR four scrolls down in "In review", the branch
+            ;; recorded on every PR but rendered nowhere at all — and they are
+            ;; the two things a reader opens this page to click through to.
+            ;;
+            ;; Every repo the task runs, not every repo that shipped: a task is
+            ;; as many repos as it has sessions, and listing only the ones with
+            ;; a PR makes a two-repo task look like a one-repo task that is
+            ;; already in review. The repo list comes from sessions.tsv rather
+            ;; than `parse-repos`, which costs a rev-parse and a canonicalize
+            ;; per repo on every render. A PR for a repo since dropped from
+            ;; `repos` still shows — it is open, and nothing else on the page
+            ;; would say so.
+            [:span.muted [:code (task-lib/task-branch ctx)]]
+            (let [prs (into {} (map (juxt :repo identity) (pr-watch/shipped ctx)))]
+              (for [repo (distinct (concat (keep :repo (sessions ctx)) (keys prs)))]
+                (if-let [p (get prs repo)]
+                  [:a.doc {:href (:url p)}
+                   (str repo " #" (last (str/split (:url p) #"/")) " ")
+                   [:span.status {:class (case (:state p) "MERGED" "met" "CLOSED" "unmet" "pending")}
+                    (str/lower-case (or (:state p) "open"))]]
+                  [:span.muted repo " " [:span.status.pending "no PR"]])))
             [:a.doc {:href (str "/tasks/" id "/doc?path=goal.md")} "goal.md"]
             [:a.doc {:href (str "/tasks/" id "/doc?path=metrics.md")} "metrics.md"]
             [:span.lane {:class (when (= "done" l) "done")} (lane-label ctx)]]]
