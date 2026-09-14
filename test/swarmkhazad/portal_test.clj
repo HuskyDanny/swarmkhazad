@@ -673,6 +673,26 @@
 
           (testing "a role this task never declared is not a pane to type into"
             (is (= 404 (:status (post "nobody" "do=send&text=x")))))
+
+          ;; The badge said "live session", in green, for eight panes whose
+          ;; agents had exited — because :live meant `capture-pane returned
+          ;; text`, and a zsh prompt is text. The pane cannot answer this: a
+          ;; prompt is also what a harness that finished its work leaves. The
+          ;; exit file the launch script writes can, and does.
+          (testing "a pane whose harness has exited does not read as a live session"
+            (let [before (:body (request env :get (str "/tasks/" id) {:query "pane=implement"}))]
+              (is (str/includes? before "live session") "with no exit file it is live, as before")
+              (is (str/includes? before "say something to implement")
+                  "and the box for typing into it is offered"))
+            (write! (fs/path dir "state" "sessions" "implement" "exit") "127\n")
+            (let [after (:body (request env :get (str "/tasks/" id) {:query "pane=implement"}))]
+              (is (str/includes? after "no agent running — its harness exited 127")
+                  "the badge says what happened, and names the status")
+              (is (not (str/includes? after ">live session<"))
+                  "and does not also claim the session is live")
+              (is (not (str/includes? after "say something to implement"))
+                  "the box for typing into it is withdrawn — the text would go to the shell"))
+            (fs/delete (fs/path dir "state" "sessions" "implement" "exit")))
           (finally (tmux "kill-server"))))
       (finally
         (fs/delete-tree sandbox)))))

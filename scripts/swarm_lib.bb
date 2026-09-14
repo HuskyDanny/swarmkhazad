@@ -472,6 +472,11 @@
        ;; N at this time`, and it costs one shell process per session.
        "status=" (sq (str (fs/path (:sessions-dir ctx) (:session row) "exit"))) "\n"
        "mkdir -p \"$(dirname \"$status\")\"\n"
+       ;; Removed before the harness runs, so its presence always means THIS
+       ;; run's harness has exited. Without that, a relaunched pane carries the
+       ;; previous run's status while the new agent works, and every surface
+       ;; reading the file calls a running agent dead.
+       "rm -f \"$status\"\n"
        (str/join " " (map sq (harness-argv ctx row (shim-path ctx (:harness row)) prompt :interactive nil))) "\n"
        "printf '%s\\n' \"$?\" > \"$status\"\n"))
 

@@ -309,6 +309,15 @@
                              text))
                  out)))))))
 
+(defn harness-exit
+  "The status this session's harness exited with, or nil while it is running.
+
+   Written by the generated launch script, which removes it before starting the
+   harness — so it is this run's answer, not a previous one's."
+  [ctx session]
+  (let [f (fs/path (:sessions-dir ctx) session "exit")]
+    (when (fs/regular-file? f) (not-empty (str/trim (slurp (str f)))))))
+
 (defn pane-view
   "The pane, and where it came from: the running tmux session, the capture taken
    when the task closed, or nothing yet. A closed task still has a terminal to
@@ -322,7 +331,24 @@
   ([ctx role {:keys [ansi]}]
    (let [live (try (handoff-lib/capture-pane ctx role :ansi (boolean ansi)) (catch Exception _ nil))
          archived (text (fs/path (:sessions-dir ctx) role "pane.txt"))]
-     {:state (cond (not-empty live) :live archived :archived :else :none)
+     {:state (cond
+               ;; `there is text in the pane` was the old test for :live, and a
+               ;; dead pane's zsh prompt is text — so the badge read "live
+               ;; session" in green for eight panes whose agents had exited, and
+               ;; offered the box for typing into them. The pane cannot answer
+               ;; this question: a shell prompt is what a harness that finished
+               ;; its work leaves behind too.
+               ;;
+               ;; The exit file can. The launch script removes it before running
+               ;; the harness and writes it after, so its presence means this
+               ;; pane's harness has exited and its contents say how. A file
+               ;; read, not a subprocess — cheaper than the capture this
+               ;; function was already careful about.
+               (and (not-empty live) (harness-exit ctx role)) :exited
+               (not-empty live) :live
+               archived :archived
+               :else :none)
+      :exit (harness-exit ctx role)
       :text (str/join "\n" (take-last pane-tail-lines
                                       (str/split-lines (or (not-empty live) archived ""))))})))
 
@@ -345,6 +371,7 @@
        ;; prompt, which renders like any other line of scrollback — so the card
        ;; read healthy for eight dead agents for 36 minutes.
        :alive (handoff-lib/session-alive? ctx name)
+       :exit (harness-exit ctx name)
        :last-line (last (nonblank-lines (pane-text ctx name)))})))
 
 (defn session-summary
@@ -1134,7 +1161,11 @@
        (list
         [:div.railhead
          [:span.status {:class (case state :live "met" :archived "pending" "unmet")}
-          (case state :live "live session" :archived "session closed — archived pane" "no pane yet")]
+          (case state
+            :live "live session"
+            :exited (str "no agent running — its harness exited " (:exit view))
+            :archived "session closed — archived pane"
+            "no pane yet")]
          [:a.doc {:href (str "/tasks/" id "/roles/" watching)} "full screen ›"]]
         [:pre#pane.term {:data-task id :data-role watching}
          (ansi->hiccup (:text view))]
@@ -1345,7 +1376,10 @@
                     [:div.card-top [:a {:href (str "/tasks/" id "/roles/" (:session c))} (:repo c)] [:span.chev "›"]]
                     [:div.muted (:harness c) " · " (:model c) " · " (:mode c)]
                     (when-not (:alive c)
-                      [:div [:span.status.unmet "no agent running in its pane"]])
+                      [:div [:span.status.unmet
+                             (if-let [x (:exit c)]
+                               (str "no agent running — its harness exited " x)
+                               "no agent running in its pane")]])
                     [:div "judge: " (if-let [v (:verdict c)]
                                       [:span.status {:class (if (:met v) "met" "unmet")} (if (:met v) "met" (str "unmet: " (str/join "; " (:unmet v))))]
                                       [:span.status.pending "no verdict"])]
