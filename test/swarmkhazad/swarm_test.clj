@@ -144,17 +144,35 @@
               ;; contains "You have new handoff mail" AND "command not found:
               ;; You" — one capture satisfying the assertion and disproving the
               ;; thing it exists to prove. That is how a run shipped with all
-              ;; eight agents dead and a green suite. Assert the failure's
-              ;; identity too: the pane must carry the notice and must NOT carry
-              ;; the shell's rejection of it.
+              ;; eight agents dead and a green suite.
+              ;;
+              ;; The answer is NOT to also assert the pane holds no "command not
+              ;; found". That reads as the identity check this file's rules ask
+              ;; for, and it is unsound: tmux writes to the tty, and whatever
+              ;; the foreground process has not consumed by the time it exits is
+              ;; inherited by the shell that regains the pane. So a nudge that
+              ;; WAS delivered to a living agent can still surface as a failed
+              ;; command afterwards, purely on when the stub finished. It was
+              ;; flaky for exactly that reason — one failure in a full run, two
+              ;; clean runs after it — and a case that fails for a reason other
+              ;; than the defect is worse than no case at all.
+              ;;
+              ;; What the pane cannot answer, the file can: the stub writes what
+              ;; it reads off its own stdin, so the artifact exists only if the
+              ;; PROCESS took the line. That is asserted below and is not racy —
+              ;; it either read it or it did not.
+              ;;
+              ;; Nothing is lost by dropping the unsound one. The mutant it was
+              ;; meant to catch — deleting the liveness gate in type-into-pane!
+              ;; — is killed by typing-into-a-pane-with-no-agent-in-it-is-refused,
+              ;; which builds a pane that is genuinely idle rather than hoping
+              ;; this one becomes idle at the right moment.
               (doseq [role ["a" "b"]]
                 (let [pane (fn [] (:out (process/sh {:continue true} "tmux" "-S" socket
                                                     "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-")))
                       woke? (fn [] (str/includes? (pane) "You have new handoff mail"))]
                   (wait-until (str "wake-up in sk-" role) 15000 woke?)
                   (is (woke?) (str "wake-up in sk-" role))
-                  (is (not (str/includes? (pane) "command not found"))
-                      (str "sk-" role ": the wake-up was executed by the shell, not read by the agent"))
                   ;; The assertion that cannot be satisfied by the wrong reader.
                   ;; The stub writes what it read off its own stdin, so this
                   ;; file exists only if the PROCESS in the pane took the line.
