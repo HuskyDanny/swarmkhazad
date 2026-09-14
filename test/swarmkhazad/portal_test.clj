@@ -679,6 +679,29 @@
           ;; text`, and a zsh prompt is text. The pane cannot answer this: a
           ;; prompt is also what a harness that finished its work leaves. The
           ;; exit file the launch script writes can, and does.
+          ;; `close --reclaim` has always existed and has always been safe. What
+          ;; never existed was anything that says when to reach for it: reap
+          ;; only fires on tasks whose FOLDER is gone, so a folder kept for its
+          ;; notes keeps its checkouts alive with it. MEASURED 2026-09-14: 12
+          ;; task folders holding 5.5G, 8 of them finished days earlier with
+          ;; zero agents running and live worktrees — 2.5G nobody would have
+          ;; asked for back, one of them a single 2.1G checkout.
+          (testing "a task with no agent left anywhere says what it is still holding"
+            (let [live-body (:body (request env :get (str "/tasks/" id)))]
+              (is (not (str/includes? live-body "gives the disk back"))
+                  "not while an agent is running — this is a finished task's line, not a nag"))
+            ;; cat -v is the only session; stopping it stops the task.
+            (tmux "kill-session" "-t" "sk-implement")
+            (Thread/sleep 400)
+            (let [b (:body (request env :get (str "/tasks/" id)))]
+              (is (str/includes? b "no agent is running in any pane")
+                  "the whole task, said once — not one line per dead session")
+              (is (str/includes? b "worktree(s) are still checked out"))
+              (is (str/includes? b (str "swarmkhazad close " id " --reclaim"))
+                  "and the exact command, because the point is to be actionable"))
+            (tmux "new-session" "-d" "-s" "sk-implement" "cat -v")
+            (Thread/sleep 500))
+
           (testing "a pane whose harness has exited does not read as a live session"
             (let [before (:body (request env :get (str "/tasks/" id) {:query "pane=implement"}))]
               (is (str/includes? before "live session") "with no exit file it is live, as before")

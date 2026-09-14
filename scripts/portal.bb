@@ -208,12 +208,33 @@
         ;; motivated this handoffd was alive and writing `delivered` lines into
         ;; eight panes whose agents had exited. Both clauses read healthy and
         ;; the list produced nothing.
-        stopped (when (opened? ctx)
-                  ;; read-sessions-tsv rather than `sessions`, which is defined
-                  ;; below this.
-                  (for [row (task-lib/read-sessions-tsv ctx)
-                        :when (not (handoff-lib/session-alive? ctx (:session row)))]
-                    (:session row)))
+        declared (when (opened? ctx)
+                   ;; read-sessions-tsv rather than `sessions`, which is defined
+                   ;; below this.
+                   (task-lib/read-sessions-tsv ctx))
+        stopped (for [row declared
+                      :when (not (handoff-lib/session-alive? ctx (:session row)))]
+                  (:session row))
+        ;; Every pane stopped and the checkouts still on disk: the task is over
+        ;; and nothing will reclaim it. `close --reclaim` is the tool and it has
+        ;; always existed — safe, pushed?-gated, --force to override — but
+        ;; nothing ever says when to reach for it, and reap is no help because
+        ;; it only fires on tasks whose FOLDER is already gone. So a folder kept
+        ;; for its notes keeps its checkouts alive with it, and a checkout that
+        ;; built anything is mostly untracked build output.
+        ;;
+        ;; MEASURED, this machine, 2026-09-14: 12 task folders holding 5.5G, of
+        ;; which 8 finished between Sep 7 and Sep 11 have zero agents running
+        ;; and live worktrees — 2.5G nobody was going to ask for back. One of
+        ;; them is a single 2.1G checkout.
+        ;;
+        ;; It counts worktree directories rather than measuring them: this
+        ;; renders on a page that polls every five seconds, and `du` on a 2.1G
+        ;; checkout is not something to do on a request. reclaim reports the
+        ;; space when it gives it back.
+        over? (and (seq declared) (= (count stopped) (count declared)))
+        held (when (and over? (fs/directory? (:worktrees-dir ctx)))
+               (count (filter fs/directory? (fs/list-dir (:worktrees-dir ctx)))))
         ;; kickstart runs `open` in the background; when it dies, its output is
         ;; the only record, and nothing rendered it. A task that never reached a
         ;; tmux socket but left a log is a failed open, not a quiet one.
@@ -231,7 +252,17 @@
           (when (pos? denials) [{:kind "denials" :text (str denials " tool call(s) denied by the contract hook — state/denials.jsonl")}])
           (map (fn [r] {:kind "judge down" :text (str "role " r ": the goal judge was unavailable at its last stop")}) down)
           (when dead [{:kind "daemon" :text "handoffd is not running; mail is not being delivered"}])
-          (map (fn [r] {:kind "session" :text (str r ": no agent is running in its pane")}) stopped)
+          ;; One line when the whole task has stopped, a line per role when only
+          ;; some have. Eight roles that all died at launch is ONE thing that
+          ;; happened, and eight items for it push everything else off the list
+          ;; — the surface exists to be read at a glance.
+          (if over?
+            [{:kind "finished"
+              :text (str "no agent is running in any pane"
+                         (when (and held (pos? held))
+                           (str ", and " held " worktree(s) are still checked out — `swarmkhazad close "
+                                (:task-id ctx) " --reclaim` gives the disk back")))}]
+            (map (fn [r] {:kind "session" :text (str r ": no agent is running in its pane")}) stopped))
           (when-not (str/blank? open-log)
             [{:kind "open failed" :text (str "the swarm never started; `open` left: "
                                              (str/join " " (nonblank-lines open-log)))}])))))
