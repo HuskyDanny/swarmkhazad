@@ -27,7 +27,15 @@
    enough that a task waiting days costs nothing and fast enough that a review
    comment does not sit unread over lunch. The portal's button skips the wait."
   60000)
-(def wake-message "You have new handoff mail. If idle, run ready_for_next.bb.")
+(def wake-message
+  ;; The absolute path, not the bare filename. scripts/ is on PATH only inside
+  ;; the generated launch script (swarm_lib.bb's `export PATH=`), which lives in
+  ;; the bash process that execs the harness — the pane's own interactive shell
+  ;; never had it. So a human who attaches, reads this line and types what it
+  ;; says gets a second `command not found`, in exactly the situation where they
+  ;; are already debugging (RAN: `zsh -ic 'which ready_for_next.bb'` -> not found).
+  (str "You have new handoff mail. If idle, run "
+       (fs/path script-dir "ready_for_next.bb") "."))
 (def stopping (atom false))
 
 (defn now [] (handoff-lib/timestamp))
@@ -91,12 +99,53 @@
 (defn should-stop? [ctx]
   (or @stopping (fs/exists? (stop-file ctx)) (orphaned? ctx)))
 
+(def unwoken
+  "Roles whose wake-up could not be delivered, retried by retry-unwoken! once
+   their pane has an agent in it. Bounded by the number of roles in the task."
+  (atom #{}))
+
 (defn notify!
   "Type the wake-up into the recipient's pane. Best-effort: a role whose session
-   is gone still gets its inbox file; only the nudge is lost."
+   is gone still gets its inbox file; only the nudge is lost.
+
+   A dead recipient is logged under its own word. The mail is still delivered —
+   a role that is not running is not a reason to bounce a handoff — but the log
+   has to stop reading `delivered` for a handoff nobody woke up to receive. In
+   the run that motivated this, handoffd wrote two `delivered` lines 4.8s after
+   open, into panes whose agents had already exited 127, and no `wake-failed`
+   line anywhere: the wake-up was typed at a zsh prompt, which answered
+   `command not found` and returned exit 0, so every signal said success."
   [ctx role]
-  (when-not (handoff-lib/type-into-pane! ctx role wake-message)
-    (log! ctx "wake-failed" role)))
+  (cond
+    (not (handoff-lib/session-alive? ctx role))
+    (do (swap! unwoken conj role)
+        (log! ctx "dead-recipient" role "no agent is running in its pane; mail delivered, nobody woken"))
+
+    (not (handoff-lib/type-into-pane! ctx role wake-message))
+    (do (swap! unwoken conj role)
+        (log! ctx "wake-failed" role))
+
+    :else (swap! unwoken disj role)))
+
+(defn retry-unwoken!
+  "Wake a role whose nudge was refused, once its pane has an agent in it again.
+
+   A wake races the harness it is meant to reach. `open` delivers the New Task
+   note seconds after booting the sessions, and a harness takes longer than that
+   to own its pane, so the first nudge of a task routinely arrives while the
+   pane is still a shell prompt. That used to be invisible: the text was typed
+   at the prompt, zsh answered `command not found`, send-keys returned 0 and
+   handoffd logged `delivered`. Refusing it instead makes the race visible, and
+   a visible race still has to be finished — the mail is in the inbox and the
+   role is waiting to be told.
+
+   Only roles whose wake actually failed, so an agent that IS running is never
+   re-nudged, however long its mail sits unread."
+  [ctx]
+  (doseq [role @unwoken :when (handoff-lib/session-alive? ctx role)]
+    (when (handoff-lib/type-into-pane! ctx role wake-message)
+      (swap! unwoken disj role)
+      (log! ctx "woken-late" role "its pane had no agent when the mail arrived"))))
 
 (defn fail! [ctx path reason]
   (let [failed-dir (fs/path (fs/parent (fs/parent path)) "failed")
@@ -264,6 +313,7 @@
   (try
     (while (not (should-stop? ctx))
       (poll-once! ctx)
+      (retry-unwoken! ctx)
       (try (poll-prs! ctx)
            ;; A GitHub outage must not take the delivery daemon down with it.
            (catch Exception e (log! ctx "pr-poll-failed" (.getMessage e))))

@@ -263,6 +263,63 @@
                                  "-t" (task-lib/session-name session)]
                                 args))))))
 
+(defn pane-command
+  "The name of the foreground process in a role's pane, or nil if the session is
+   gone. For a human-readable answer only — see session-alive? for the test."
+  [ctx session]
+  (when-let [socket (tmux-socket ctx)]
+    (let [r (process/sh {:continue true} "tmux" "-S" socket "display-message"
+                        "-p" "-t" (task-lib/session-name session)
+                        "#{pane_current_command}")]
+      (when (zero? (:exit r)) (not-empty (str/trim (:out r)))))))
+
+(def shell-commands
+  "Names that mean `a prompt`, used only as the tie-breaker below."
+  #{"zsh" "bash" "sh" "fish" "dash" "ksh" "tcsh" "csh" "login"})
+
+(defn session-alive?
+  "Whether an agent still holds the pane, as opposed to a tmux session that
+   exists around a shell prompt.
+
+   Everything that asked `is this role running?` asked a proxy that stays true
+   after the agent dies — the socket file exists, the session is listed,
+   capture-pane returns text, sessions.tsv has a row. A dead pane satisfies all
+   four, which is how a task ran for 36 minutes with all eight agents dead and
+   every surface reporting health (task Parseemailfix, 2026-09-13).
+
+   Two signals, because a pane has two shapes. `open` creates every session bare
+   and types the launch command in (swarm_lib.bb's new-session takes no
+   command), so the pane's root process is the interactive shell and the
+   question is whether anything is running UNDER it: the foreground process
+   group differs from the pane's root pid exactly when something is. A pane
+   created WITH a command — which the portal's own tests do — has no shell at
+   all, so its root is already the foreground group and the pid test alone would
+   call it dead; there the name of that root process settles it.
+
+   The pid test leads because a name says nothing. RAN: a live claude pane
+   reports `2.1.270`, its own version, not `claude` and not `node`, while the
+   suite's stub harness is a bash script and reports `bash` — the same string an
+   idle prompt reports. The pid test separates those two; the name test only
+   ever sees a pane whose root is in the foreground, where `bash` really does
+   mean a prompt.
+
+   Unknown counts as not alive. If the pane cannot be read there is no basis for
+   typing into it, and every caller reports the refusal rather than swallowing it."
+  [ctx session]
+  (boolean
+   (when-let [socket (tmux-socket ctx)]
+     (let [pid (process/sh {:continue true} "tmux" "-S" socket "display-message"
+                           "-p" "-t" (task-lib/session-name session) "#{pane_pid}")]
+       (when (zero? (:exit pid))
+         (when-let [root (not-empty (str/trim (:out pid)))]
+           (let [fg (process/sh {:continue true} "ps" "-o" "tpgid=" "-p" root)
+                 tpgid (when (zero? (:exit fg)) (not-empty (str/trim (:out fg))))]
+             (cond
+               (nil? tpgid) false
+               (not= tpgid root) true
+               :else (when-let [c (pane-command ctx session)]
+                       (not (shell-commands c)))))))))))
+
 (defn type-into-pane!
   "Type text into a role's pane and submit it — the only way to reach an agent
    that is already running, since it owns the terminal.
@@ -272,18 +329,28 @@
    spare newline in a box that took the first is harmless. The pauses are what
    makes it land in a TUI that redraws between keystrokes.
 
-   Best-effort. A role whose session is gone returns false, and the caller
-   decides whether that matters — handoffd logs it and moves on, because the
-   inbox file is delivered either way."
+   Refuses a pane with no agent in it. `-l` keeps tmux from reading the text as
+   a key name; it does NOT keep a shell from reading it as a command, and the
+   C-m that follows is Enter. So the same call that nudges a running agent runs
+   the text as a shell command once the agent has exited — RAN: typing
+   `please rerun the tests > /tmp/proof.txt` into a pane at a zsh prompt printed
+   `command not found: please` AND created the file, so the shell performed the
+   redirection. The portal offers this as a free-text box, which made an
+   operator's plain-English nudge an arbitrary command in the role's worktree.
+
+   Best-effort in both directions. A role whose session is gone, or whose agent
+   has exited, returns false, and the caller decides whether that matters —
+   handoffd logs it and moves on, because the inbox file is delivered either way."
   [ctx session text]
   (boolean
    (when (seq (or text ""))
-     (when (tmux-send! ctx session ["-l" text])
-       (Thread/sleep 150)
-       (tmux-send! ctx session ["C-m"])
-       (Thread/sleep 50)
-       (tmux-send! ctx session ["C-j"])
-       true))))
+     (when (session-alive? ctx session)
+       (when (tmux-send! ctx session ["-l" text])
+         (Thread/sleep 150)
+         (tmux-send! ctx session ["C-m"])
+         (Thread/sleep 50)
+         (tmux-send! ctx session ["C-j"])
+         true)))))
 
 (defn press-key!
   "Send one tmux key name — Escape to interrupt the turn a role is in the middle

@@ -1413,8 +1413,17 @@
      ;; Typing into a pane is what an attached operator already does, and the
      ;; attach command is printed beside the box — this route is that reach,
      ;; not a new one. The text is passed as one argv element to `tmux
-     ;; send-keys -l`, never through a shell, so it is typed and never run; the
-     ;; role must be one this task declared, like every other role route here.
+     ;; send-keys -l`, so tmux does not read it as a key name, and the role must
+     ;; be one this task declared, like every other role route here.
+     ;;
+     ;; It is NOT true that the text can never be run. `-l` bypasses tmux's key
+     ;; parsing, not the shell: the C-m that follows is Enter, so a pane whose
+     ;; agent has exited executes it. RAN: `please rerun the tests > /tmp/p.txt`
+     ;; typed into a pane at a zsh prompt printed `command not found: please`
+     ;; and created the file. An operator's plain-English nudge routinely
+     ;; contains `>`, `|`, `&&` or backticks. type-into-pane! now refuses a pane
+     ;; with no agent in it, and the route below says so instead of redirecting
+     ;; to a page that looks like it worked.
      (when-let [[_ id] (and (= :post method) (re-matches #"/tasks/([^/]+)/attention" uri))]
        (if-let [ctx (ctx-for id)]
          (let [params (parse-form (if (string? body) body (some-> body slurp)))
@@ -1488,11 +1497,26 @@
      (when-let [[_ id role] (and (= :post method) (re-matches #"/tasks/([^/]+)/roles/([^/]+)/keys" uri))]
        (let [ctx (ctx-for id)]
          (if (and ctx (some #{role} (map :session (sessions ctx))))
-           (let [params (parse-form (if (string? body) body (some-> body slurp)))]
-             (if (= "stop" (get params "do"))
-               (handoff-lib/press-key! ctx role "Escape")
-               (handoff-lib/type-into-pane! ctx role (get params "text")))
-             {:status 303 :headers {"Location" (str "/tasks/" id "?pane=" role)} :body ""})
+           (let [params (parse-form (if (string? body) body (some-> body slurp)))
+                 stop? (= "stop" (get params "do"))]
+             ;; Escape is a key name, not text — tmux delivers it as a keypress
+             ;; and a shell cannot execute a keypress, so stopping a role is
+             ;; safe on a dead pane and stays ungated.
+             (if stop?
+               (do (handoff-lib/press-key! ctx role "Escape")
+                   {:status 303 :headers {"Location" (str "/tasks/" id "?pane=" role)} :body ""})
+               ;; An empty box is a no-op, not a dead pane: type-into-pane!
+               ;; returns false for both, so blank text is answered before the
+               ;; liveness question is asked. Sending nothing must not submit a
+               ;; bare newline into a running agent's input box either.
+               (if (or (str/blank? (get params "text"))
+                       (handoff-lib/type-into-pane! ctx role (get params "text")))
+                 {:status 303 :headers {"Location" (str "/tasks/" id "?pane=" role)} :body ""}
+                 (plain 409 (str "Not sent: no agent is running in " role "'s pane"
+                                 " (its foreground process is "
+                                 (pr-str (handoff-lib/pane-command ctx role))
+                                 ").\n\nText typed into a pane whose agent has exited is executed"
+                                 " by the shell, so it was refused rather than run.\n")))))
            (not-found))))
      (not-found))))
 

@@ -138,13 +138,34 @@
               ;; and the suite failed on a wake-up that landed a moment later.
               ;; Wait for it, bounded, then assert — a timeout still fails, and
               ;; fails saying which pane never woke.
+              ;; The substring alone proves nothing about WHO read it. When the
+              ;; nudge lands at a shell prompt instead of an agent, zsh echoes
+              ;; the command line it is about to fail on, so the same capture
+              ;; contains "You have new handoff mail" AND "command not found:
+              ;; You" — one capture satisfying the assertion and disproving the
+              ;; thing it exists to prove. That is how a run shipped with all
+              ;; eight agents dead and a green suite. Assert the failure's
+              ;; identity too: the pane must carry the notice and must NOT carry
+              ;; the shell's rejection of it.
               (doseq [role ["a" "b"]]
-                (let [woke? (fn [] (str/includes?
-                                    (:out (process/sh {:continue true} "tmux" "-S" socket
-                                                      "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-"))
-                                    "You have new handoff mail"))]
+                (let [pane (fn [] (:out (process/sh {:continue true} "tmux" "-S" socket
+                                                    "capture-pane" "-p" "-t" (str "sk-" role) "-S" "-")))
+                      woke? (fn [] (str/includes? (pane) "You have new handoff mail"))]
                   (wait-until (str "wake-up in sk-" role) 15000 woke?)
-                  (is (woke?) (str "wake-up in sk-" role)))))
+                  (is (woke?) (str "wake-up in sk-" role))
+                  (is (not (str/includes? (pane) "command not found"))
+                      (str "sk-" role ": the wake-up was executed by the shell, not read by the agent"))
+                  ;; The assertion that cannot be satisfied by the wrong reader.
+                  ;; The stub writes what it read off its own stdin, so this
+                  ;; file exists only if the PROCESS in the pane took the line.
+                  (let [got (fs/path dir "tmp" (str "wake-" role ".txt"))]
+                    (wait-until (str "sk-" role " consumed the wake-up") 10000
+                                #(and (fs/regular-file? got)
+                                      (str/includes? (slurp (str got)) "You have new handoff mail")))
+                    (is (fs/regular-file? got)
+                        (str "sk-" role ": the agent process never read the wake-up off its stdin"))
+                    (is (str/includes? (if (fs/regular-file? got) (slurp (str got)) "") "You have new handoff mail")
+                        (str "sk-" role ": the agent read something, but not the wake-up"))))))
             (testing "b's terminal broadcast is non-forwarding and landed in a's inbox/new"
               (let [sent (headers (first (handoffs (fs/path dir "mail" "b" "sent"))))
                     arrived (handoffs (fs/path dir "mail" "a" "inbox" "new"))]
@@ -307,6 +328,58 @@
         (process/sh {:continue true} "tmux" "-S"
                     (str "/tmp/swarmkhazad-" (System/getProperty "user.name") "/" id ".sock")
                     "kill-server")
+        (fs/delete-tree sandbox)))))
+
+(deftest typing-into-a-pane-with-no-agent-in-it-is-refused
+  ;; The e2e above proves a wake reaches a LIVE agent. It cannot prove the other
+  ;; half, because its panes are always alive by the time the nudge fires — so
+  ;; removing the liveness gate leaves that test green. This is the case that
+  ;; kills that mutant.
+  ;;
+  ;; What makes it worth a test of its own: `send-keys -l` stops tmux reading
+  ;; the text as a key name, not a shell reading it as a command, and the C-m
+  ;; after it is Enter. A pane whose agent has exited therefore EXECUTES what
+  ;; was typed — that is how a plain-English nudge through the portal's send box
+  ;; became an arbitrary command in the role's worktree, and how handoffd's
+  ;; wake-up produced `command not found: You` in eight panes of a live task.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-alive."})
+        socket (str (fs/path sandbox "t.sock"))
+        ctx {:task-dir (str sandbox)
+             :state-dir (str (fs/path sandbox "state"))
+             :tmux-socket-file (str (fs/path sandbox "state" "tmux-socket"))}
+        proof (str (fs/path sandbox "executed-by-the-shell.txt"))
+        tmux (fn [& args] (apply process/sh {:continue true} (concat ["tmux" "-S" socket] args)))
+        pane (fn [s] (:out (tmux "capture-pane" "-p" "-t" (str "sk-" s) "-S" "-")))]
+    (try
+      (fs/create-dirs (fs/path sandbox "state"))
+      (spit (str (fs/path sandbox "state" "tmux-socket")) (str socket "\n"))
+      (load-file (str (fs/path repo-root "scripts" "handoff_lib.bb")))
+      ;; Bare sessions and a command typed in, because that is what open does
+      ;; (swarm_lib's new-session takes no command) and the two layouts do not
+      ;; look the same to the test.
+      (tmux "new-session" "-d" "-s" "sk-dead" "-c" (str sandbox))
+      (tmux "new-session" "-d" "-s" "sk-live" "-c" (str sandbox))
+      (Thread/sleep 400)
+      (tmux "send-keys" "-t" "sk-live" "-l" "sleep 30")
+      (tmux "send-keys" "-t" "sk-live" "C-m")
+      (Thread/sleep 1200)
+      (testing "a pane sitting at a prompt is not alive, and one running anything is"
+        (is (false? ((resolve 'handoff-lib/session-alive?) ctx "dead")))
+        (is (true? ((resolve 'handoff-lib/session-alive?) ctx "live"))))
+      (testing "typing into the dead pane is refused, and the shell never sees the text"
+        (let [text (str "please rerun the tests > " proof)]
+          (is (false? ((resolve 'handoff-lib/type-into-pane!) ctx "dead" text)))
+          (Thread/sleep 900)
+          ;; The redirection is the proof: a shell that merely displayed the
+          ;; line could not have created the file.
+          (is (not (fs/exists? proof))
+              "the text was executed by the shell instead of being refused")
+          (is (not (str/includes? (pane "dead") "please rerun"))
+              "the text was typed into a pane with no agent to read it")))
+      (testing "a live pane still takes typing — the gate refuses the dead case only"
+        (is (true? ((resolve 'handoff-lib/type-into-pane!) ctx "live" "hello agent"))))
+      (finally
+        (tmux "kill-server")
         (fs/delete-tree sandbox)))))
 
 (deftest open-refuses-a-missing-harness
