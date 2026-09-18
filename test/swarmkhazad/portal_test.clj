@@ -1433,3 +1433,93 @@
         ;; was shelled, so there is no process behind it.
         (settle-open! "t-one")
         (fs/delete-tree sandbox)))))
+
+(deftest a-task-picks-a-subset-of-its-projects-roles
+  ;; The sibling of the checkouts above, and the same failure one axis over.
+  ;; Every task ran the project's whole lineup, because the lineup could only
+  ;; be chosen on the project and the project is shared by every task in it —
+  ;; so a one-line typo fix opened every stage the project declared, paid for
+  ;; a context each and waited for a handoff each. The routing was always per
+  ;; task: `roles` is a file in the task folder and `role-header` reads the
+  ;; next role out of it. Nothing chose.
+  (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-portal-roles."})
+        home (str (fs/path sandbox "home"))
+        a (str (fs/path sandbox "src" "alpha"))
+        env {"SWARMKHAZAD_HOME" home
+             "SWARMKHAZAD_REPO_ROOTS" (str (fs/path sandbox "src"))}
+        project "p-roles"
+        ;; implement → review → run, the order the project declares.
+        lineup (str "{:name \"" project "\" :roles [{:role \"implement\" :harness \"claude\" :model \"anthropic\"}"
+                    " {:role \"review\" :harness \"claude\" :model \"anthropic\"}"
+                    " {:role \"run\" :harness \"claude\" :model \"anthropic\"}]}")
+        brief (fn [& lines] (java.net.URLEncoder/encode (str/join "\n" lines) "UTF-8"))]
+    (try
+      (make-source-repo! a)
+
+      (testing "the pick is the project's lineup when the form names none"
+        (is (= ["implement" "review" "run"]
+               (mapv :role (:roles (eval-in-portal env (str "(portal/task-roles " lineup " {})")))))))
+
+      (testing "a subset is the subset, in the PROJECT's order and not the pick's"
+        ;; The roles file's order is the swimlane's columns, the next-role chain
+        ;; each session is told at boot, and the order the judge grades in. A
+        ;; task that reordered it would make the board describe a flow the
+        ;; swarm does not run.
+        (is (= ["implement" "run"]
+               (mapv :role (:roles (eval-in-portal
+                                    env (str "(portal/task-roles " lineup
+                                             " {\"role:run\" \"on\" \"role:implement\" \"on\"})")))))))
+
+      (testing "a role the project does not list is refused, not added"
+        (let [r (eval-in-portal env (str "(portal/task-roles " lineup " {\"role:hardener\" \"on\"})"))]
+          (is (str/includes? (:error r) (str "not a role in project " project)))
+          (is (str/includes? (:error r) "hardener") "and says which one")
+          (is (str/includes? (:error r) "implement, review, run") "and what the lineup actually is")))
+
+      (testing "the review page shows the project's roles, every box ticked"
+        (request env :post "/projects" {:body (str "name=" project "&repo%3A" a "=on"
+                                                   "&role%3Aimplement=on&role%3Areview=on&role%3Arun=on")})
+        (let [body (:body (request env :post (str "/projects/" project "/review")
+                                   {:body (str "brief=" (brief "## Goal" "- [ ] implement — a thing"))}))]
+          (is (str/includes? body "checked=\"checked\" name=\"role:implement\""))
+          (is (str/includes? body "checked=\"checked\" name=\"role:run\"")
+              "the default is the lineup a task got before this field existed")))
+
+      (testing "and the pick is what lands in the task's roles file"
+        ;; The assertion that closes the loop: everything above only proves
+        ;; task-roles COMPUTES the subset. A mutant writing the project's whole
+        ;; lineup here — the line this change replaced — passes all of it.
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=t-two&role%3Aimplement=on&role%3Arun=on&brief="
+                                     (brief "## Goal" "- [ ] implement — a thing"))})
+              declared (->> (str/split-lines (slurp (str (fs/path home "tasks" "t-two" "roles"))))
+                            (remove #(or (str/blank? %) (str/starts-with? (str/trim %) "#")))
+                            (mapv #(first (str/split (str/trim %) #"\s+"))))]
+          (is (= 303 (:status r)))
+          (is (= ["implement" "run"] declared)
+              "the two that were ticked, in the project's order, and not the one that was not")))
+
+      (testing "a lineup with nobody to measure the bars is refused before the brief is written"
+        ;; `open` refuses this too and that refusal stays. Saying it here is
+        ;; about WHEN: past this button goal.md exists and is chmod 444, so the
+        ;; same answer from `open` costs an unlock to fix a box one click away.
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=t-nobars&role%3Aimplement=on&brief="
+                                     (brief "## Goal" "- [ ] implement — a thing"
+                                            "## Bars" "- repo tests — bar: exits 0 — measure: `echo hi`"))})]
+          (is (= 400 (:status r)))
+          (is (str/includes? (:body r) "repo tests") "and names the bar nobody would measure")
+          (is (not (fs/exists? (fs/path home "tasks" "t-nobars")))
+              "refused before the CLI is shelled, so there is nothing to clean up")))
+
+      (testing "and the same lineup is fine when no bar carries a command"
+        ;; (c) would have been wrong: a task with no bars may drop the runner.
+        (let [r (request env :post (str "/projects/" project "/tasks")
+                         {:body (str "task-id=t-nobar2&role%3Aimplement=on&brief="
+                                     (brief "## Goal" "- [ ] implement — a thing"))})]
+          (is (= 303 (:status r)))))
+
+      (finally
+        (settle-open! "t-two")
+        (settle-open! "t-nobar2")
+        (fs/delete-tree sandbox)))))

@@ -154,6 +154,27 @@
           (is (contains? got "--investigate"))
           (is (contains? got "--project"))))
 
+      (testing "a role subset is passed as the narrowing it is"
+        ;; The reason the flag exists at all. `open --linear` scaffolds AND
+        ;; launches in one call, so unlike `new` there is no moment in which
+        ;; anything could edit the roles file — an unattended caller that can
+        ;; narrow the checkouts and not the lineup runs every stage of every
+        ;; project on every ticket.
+        (mcp [(call 1 {:issue_key "MITH-3437" :project "duo" :roles ["implement" "run"]})])
+        (let [got (vec (str/split-lines (slurp argv)))]
+          (is (= ["--role" "implement" "--role" "run"] (take-last 4 got)))
+          (is (some #{"--project"} got) "and the project is still there")))
+
+      (testing "a role the project does not list is refused before anything is spawned"
+        (fs/delete-if-exists argv)
+        (let [r (first (:responses (mcp [(call 1 {:issue_key "MITH-3437" :project "duo"
+                                                  :roles ["hardener"]})])))]
+          (is (true? (get-in r [:result :isError])))
+          (is (str/includes? (tool-text r) "not a role in project duo"))
+          (is (str/includes? (tool-text r) "hardener") "and says which one")
+          (is (not (fs/exists? argv))
+              "a name a model got wrong must not reach a fetch and a worktree per repo")))
+
       (testing "an unusable repo is refused before anything is spawned"
         (fs/delete-if-exists argv)
         (let [r (first (:responses (mcp [(call 1 {:issue_key "MITH-3437" :project "duo"
@@ -184,7 +205,37 @@
         (let [r (cli "new" "t-narrow" "--project" "duo" "--repo" b)]
           (is (zero? (:exit r)) (:err r))
           (is (= [b] (repos-of home "t-narrow")))
-          (is (= 3 (count (roles-of home "t-narrow"))) "the lineup is not narrowed with it")))
+          (is (= 3 (count (roles-of home "t-narrow")))
+              "and only the checkouts — the two axes narrow separately")))
+
+      (testing "--role narrows the lineup, in the project's order and not the flag's"
+        (let [r (cli "new" "t-roles" "--project" "duo" "--role" "run" "--role" "implement")]
+          (is (zero? (:exit r)) (:err r))
+          (is (= ["implement" "run"]
+                 (mapv #(first (str/split % #"\s+")) (roles-of home "t-roles")))
+              "review is skipped; the two that were named run in the order the project declares")
+          (is (= [a b] (repos-of home "t-roles"))
+              "and the checkouts are untouched by it")))
+
+      (testing "a role the project does not list is refused, not added"
+        (let [r (cli "new" "t-badrole" "--project" "duo" "--role" "hardener")]
+          (is (= 1 (:exit r)))
+          (is (str/includes? (:err r) "not a role in project duo"))
+          (is (str/includes? (:err r) "hardener") "and says which one")
+          (is (str/includes? (:err r) "implement, review, run") "and what the lineup actually is")
+          (is (not (fs/exists? (fs/path home "tasks" "t-badrole")))
+              "and leaves no half-scaffolded folder behind")))
+
+      (testing "the goal's role prefix names a role the task actually has"
+        ;; The scaffold template used to say nothing about the lineup, and the
+        ;; Linear lane hardcoded `implement` whatever the roles were — so every
+        ;; --investigate ticket carried a goal owned by a role that task does
+        ;; not have. After the parser fold such a line is not dead, but it is
+        ;; still a lie about who owns it.
+        (let [_ (cli "new" "t-lead" "--project" "duo" "--role" "run")
+              goal (slurp (str (fs/path home "tasks" "t-lead" "goal.md")))]
+          (is (str/includes? goal "This task's roles: run.")
+              "the template names the lineup, because a word here that is not one of them is not a role at all")))
 
       (testing "--investigate keeps the project but takes the investigation pair"
         ;; A lane and a scope are different questions. The project cannot mean

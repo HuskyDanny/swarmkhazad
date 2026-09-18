@@ -345,7 +345,7 @@
   [session]
   (let [ctx (task-lib/ctx-from-env)
         row (task-lib/session-row ctx session)
-        known (task-lib/role-names ctx)
+        known (task-lib/declared-roles ctx)
         goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
         split (goals-for-session known goals-md (or (:role row) session) (:repo row))]
     {:ctx ctx

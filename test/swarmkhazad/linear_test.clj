@@ -140,12 +140,21 @@
       (run {} "close" "mith-3437"))))
 
 (deftest the-goal-skeleton-is-built-without-any-network
-  (let [goal-md (fn [issue]
+  (let [goal-md (fn [issue & [lead]]
                   (:out (process/sh {:dir repo-root}
                                     "bb" "-e" (str "(load-file \"" scripts "/linear_intake.bb\") "
-                                                   "(print (linear-intake/goal-md \"t-1\" " (pr-str issue) "))"))))]
+                                                   "(print (linear-intake/goal-md \"t-1\" " (pr-str issue)
+                                                   " " (pr-str lead) "))"))))]
     (testing "a description that is only whitespace still reads as absent"
       (is (str/includes? (goal-md (assoc real-issue :description "   \n  ")) "(the issue has no description)")))
     (testing "acceptance lines are trimmed but not otherwise touched"
-      (is (str/includes? (goal-md (assoc real-issue :acceptance ["  keeps its **markdown**  "]))
-                         "- [ ] implement — keeps its **markdown**\n")))))
+      (is (str/includes? (goal-md (assoc real-issue :acceptance ["  keeps its **markdown**  "]) "implement")
+                         "- [ ] implement — keeps its **markdown**\n")))
+    (testing "the prefix is the task's own first role, not the word `implement`"
+      ;; An --investigate ticket's roles are `investigate` and `run`. Hardcoded,
+      ;; the prefix named a role that task does not have on every line of it.
+      (is (str/includes? (goal-md (assoc real-issue :acceptance ["the cause is named"]) "investigate")
+                         "- [ ] investigate — the cause is named\n")))
+    (testing "and a lineup that cannot be read falls back rather than writing a blank owner"
+      (is (str/includes? (goal-md (assoc real-issue :acceptance ["a thing"]) nil)
+                         "- [ ] implement — a thing\n")))))
