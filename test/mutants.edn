@@ -538,4 +538,26 @@
   :old "                                    \"refs/remotes/origin/\"))))))"
   :new "                                    (str \"refs/remotes/origin/\" branch)))))))"
   :killed-by "a-merged-branch-is-reclaimed-even-though-its-own-remote-ref-is-gone"
-  :why "every merged task keeps its checkouts — a squash merge or a renamed head leaves origin/<branch> stale, so the 6.4G this reclaim exists for needs --force"}]
+  :why "every merged task keeps its checkouts — a squash merge or a renamed head leaves origin/<branch> stale, so the 6.4G this reclaim exists for needs --force"}
+
+ ;; ------------------------------------------- which word in a goal line is a role
+ {:file "scripts/task_lib.bb"
+  :ns "task"
+  :old "          role (some #{(first words)} known-roles)"
+  :new "          role (first words)"
+  :killed-by "a-word-in-the-role-slot-is-a-role-only-if-the-lineup-names-one"
+  :why "any word before the dash owns the line again, so `- [ ] gobel — …` is owned by a role that does not exist and no session ever grades it"}
+
+ {:file "scripts/task_lib.bb"
+  :ns "task"
+  :old "                         (str (str/join \" \" words) \" — \" body)))})))"
+  :new "                         body))})))"
+  :killed-by "a-word-in-the-role-slot-is-a-role-only-if-the-lineup-names-one"
+  :why "a word rejected as a role is dropped instead of kept, and the portal and the PR body — which render :role and :text and nothing else — lose it from the sentence"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal"
+  :old "          (let [goals (goal-lines (task-lib/role-names ctx) (text (:goal-file ctx)))"
+  :new "          (let [goals (goal-lines [] (text (:goal-file ctx)))"
+  :killed-by "the-task-page-is-a-view-of-the-folder-and-the-index-lists-it"
+  :why "the page parses goal lines against a lineup the grader does not share, so every line reads as everyone's on the portal and as one role's in the verdict — the exact disagreement the shared parser exists to prevent"}]

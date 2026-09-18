@@ -84,10 +84,10 @@
    A line is this session's when it names no role or names this role, AND tags
    no repo or tags this repo. Both defaults are the same one: a line that never
    said belongs to everyone, which is what a single-repo task writes."
-  [goals-md role repo]
+  [known-roles goals-md role repo]
   (let [lines (str/split-lines (or goals-md ""))
-        box? #(some? (task-lib/goal-line %))
-        mine? (fn [l] (when-let [g (task-lib/goal-line l)]
+        box? #(some? (task-lib/goal-line known-roles %))
+        mine? (fn [l] (when-let [g (task-lib/goal-line known-roles l)]
                         (and (or (nil? (:role g)) (= role (:role g)))
                              (or (empty? (:repos g)) (boolean (some #{repo} (:repos g)))))))
         [mine others] [(filter #(and (box? %) (mine? %)) lines)
@@ -345,14 +345,15 @@
   [session]
   (let [ctx (task-lib/ctx-from-env)
         row (task-lib/session-row ctx session)
+        known (task-lib/role-names ctx)
         goals-md (if (fs/regular-file? (:goal-file ctx)) (slurp (str (:goal-file ctx))) "")
-        split (goals-for-session goals-md (or (:role row) session) (:repo row))]
+        split (goals-for-session known goals-md (or (:role row) session) (:repo row))]
     {:ctx ctx
      :row row
      :worktree (:worktree-path row)
      ;; The roles named by the lines this session does NOT own. Kept so the
      ;; verdict can be held to the partition instead of merely being shown it.
-     :other-roles (set (keep #(:role (task-lib/goal-line %)) (:others split)))
+     :other-roles (set (keep #(:role (task-lib/goal-line known %)) (:others split)))
      :goals (str (:whole split)
                  (when (seq (:others split))
                    (str "\n\n## Not yours — other roles own these; do not grade them\n"

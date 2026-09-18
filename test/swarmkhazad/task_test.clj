@@ -9,6 +9,11 @@
 (def repo-root (str (fs/cwd)))
 (def cli (str (fs/path repo-root "scripts" "swarmkhazad.bb")))
 
+;; Loaded at the top level, not inside a deftest: `load-file` runs at runtime
+;; while the symbols below are resolved at analysis time, so an in-test load
+;; fails with "Unable to resolve symbol" before it ever executes.
+(load-file (str (fs/path repo-root "scripts" "task_lib.bb")))
+
 (defn run
   "Run a command; throw with output unless ok? is false."
   [{:keys [dir env ok?]} & args]
@@ -600,4 +605,50 @@
           (let [r (run {:env env :ok? false} cli "prepare" "t-nothing")]
             (is (not= 0 (:exit r)))
             (is (str/includes? (:err r) "missing repos"))))))))
+
+(deftest a-word-in-the-role-slot-is-a-role-only-if-the-lineup-names-one
+  ;; Measured across the twelve tasks in one ~/.swarmkhazad: six held a
+  ;; checkbox whose first word was not a role — `Also`, `Cause:`, `The`, `G1`,
+  ;; a backticked path — and task `gobel` had three reading `- [ ] gobel — …`,
+  ;; a repo name written without its `@`. Every one named an owner that does
+  ;; not exist, so no session matched the line, no verdict could name it, and
+  ;; it could neither block a handoff nor be ticked. The word is prose, and
+  ;; the line belongs to everyone, which is what a line naming no role has
+  ;; always meant here.
+  (let [roles ["implement" "review"]
+        line #(task-lib/goal-line roles %)]
+
+    (testing "a word the lineup names owns the line, and leaves the text"
+      (is (= {:ticked false :role "implement" :repos [] :text "the route returns 200"}
+             (line "- [ ] implement — the route returns 200"))))
+
+    (testing "a word it does not name owns nothing"
+      (is (= {:ticked false :role nil :repos [] :text "gobel — the exporter is wired"}
+             (line "- [ ] gobel — the exporter is wired"))
+          "a repo name written without its @ — the case this came from")
+      (is (= {:ticked false :role nil :repos [] :text "Cause: — the token had expired"}
+             (line "- [ ] Cause: — the token had expired"))
+          "and prose that merely happens to sit before the dash"))
+
+    (testing "and it stays in the sentence — :role and :text are all the portal and the PR body render"
+      (is (= "The daemon — it restarts" (:text (line "- [ ] The daemon — it restarts")))))
+
+    (testing "@tags name repos whether or not a role precedes them"
+      (is (= {:ticked false :role "review" :repos ["gobel" "cirdan"] :text "read both"}
+             (line "- [ ] review @gobel @cirdan — read both")))
+      (is (= {:ticked false :role nil :repos ["gobel"] :text "read it"}
+             (line "- [ ] @gobel — read it"))
+          "a head of nothing but tags leaves no prose to fold back in"))
+
+    (testing "a line with no dash names no role and never did"
+      (is (= {:ticked false :role nil :repos [] :text "make it work"}
+             (line "- [ ] make it work"))))
+
+    (testing "the checkbox is read either way"
+      (is (:ticked (line "- [x] implement — done")))
+      (is (:ticked (line "- [X] nobody — done"))))
+
+    (testing "an empty lineup owns nothing, rather than owning everything"
+      ;; What the portal hands in for a task scaffolded but not yet prepared.
+      (is (nil? (:role (task-lib/goal-line [] "- [ ] implement — the route returns 200")))))))
 

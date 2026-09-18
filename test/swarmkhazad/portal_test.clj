@@ -154,7 +154,13 @@
             (is (re-find #"<input disabled=\"disabled\" type=\"checkbox\" /> <span class=\"muted\">implement — </span>the route returns 200 <span class=\"status pending\">pending" body)
                 "no verdict names it, and review's met does not carry the line while implement's and run's are unmet → pending, unchecked")
             (is (re-find #"tests green <span class=\"status unmet\">unmet: implement" body))
-            (is (re-find #"<input checked=\"checked\" disabled=\"disabled\" type=\"checkbox\" /> <span class=\"muted\">control — </span>already ticked <span class=\"status ticked\">ticked" body))
+            ;; `control` is not one of this task's roles, so it is not a role
+            ;; at all: the word stays in the sentence and no role span is drawn.
+            ;; The line is still checked and still `ticked`, which is what this
+            ;; case is about — the file's `[x]` reaches the page.
+            (is (re-find #"<input checked=\"checked\" disabled=\"disabled\" type=\"checkbox\" /> control — already ticked <span class=\"status ticked\">ticked" body))
+            (is (not (str/includes? body "<span class=\"muted\">control — </span>"))
+                "a word in the role slot that names no role is prose, not an owner")
             (is (not (str/includes? body "<h3 class=\"repo\">"))
                 "one repo, so the goals are one list — a heading over every line is noise")
             (is (str/includes? body "<span class=\"lane\">not opened</span>")

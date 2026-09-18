@@ -57,13 +57,15 @@
 (defn goal-lines
   "The checkbox lines of goal.md's Goal section: {:text :ticked :role :repos}.
    Parsed by the same function the judge uses, so the portal and the grader
-   never disagree about which repo a line belongs to."
-  [goal-md]
+   never disagree about which repo a line belongs to — which now means they
+   must be handed the same lineup, since that is what decides whether a word
+   in the role slot is a role at all."
+  [known-roles goal-md]
   (->> (str/split-lines (or goal-md ""))
        (drop-while #(not (re-matches #"(?i)##\s+goal\s*" (str/trim %))))
        rest
        (take-while #(not (str/starts-with? (str/trim %) "## ")))
-       (keep task-lib/goal-line)
+       (keep #(task-lib/goal-line known-roles %))
        vec))
 
 (defn goals-by-repo
@@ -1314,7 +1316,7 @@
                    [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
                    [:div.full (:text a)]]])
                [:p.empty "nothing needs a human"])])
-          (let [goals (goal-lines (text (:goal-file ctx)))
+          (let [goals (goal-lines (task-lib/role-names ctx) (text (:goal-file ctx)))
                 item (fn [g]
                        (let [{:keys [status roles]} (goal-status g vs)]
                          [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}]
