@@ -217,8 +217,9 @@
   [ctx plan summary]
   (let [verdict (some #(when (str/starts-with? (str/trim %) "READY") (str/trim %))
                       (str/split-lines (str (summary-section (:body summary) "Verdict"))))
+        known (task-lib/role-names ctx)
         goals (->> (str/split-lines (goal-text ctx))
-                   (keep task-lib/goal-line)
+                   (keep #(task-lib/goal-line known %))
                    (filter #(or (empty? (:repos %)) (some #{(:repo plan)} (:repos %)))))
         release (release-lines ctx)]
     (str "Opened by swarmkhazad for task `" (:task-id ctx) "`, branch `" (:branch plan) "`.\n\n"

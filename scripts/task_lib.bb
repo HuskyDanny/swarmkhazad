@@ -464,6 +464,19 @@
         (throw (ex-info (str "duplicate roles: " (str/join ", " dupes)) {}))))
     rows))
 
+(defn role-names
+  "The task's role names, or `[]` when the declaration cannot be read.
+
+   Tolerant on purpose: every reader of a goal line needs the lineup to know
+   which word in it is a role, and one of them is the portal, which renders
+   tasks in every state — scaffolded and not yet prepared, half-deleted, a
+   folder someone made by hand. `parse-roles` throws on all of those, and a
+   page that 500s because a task has no `roles` file yet is worse than one
+   that shows its goal lines as belonging to everybody."
+  [ctx]
+  (try (mapv :role (parse-roles ctx))
+       (catch Exception _ [])))
+
 ;; -------------------------------------------------------------- goal lines
 ;;
 ;; goal.md's checkboxes carry the two facts that decide the session table:
@@ -472,21 +485,41 @@
 (defn goal-line
   "One goal.md checkbox → {:ticked :role :repos :text}, or nil for other lines.
 
-   `- [ ] implement @gobel @cirdan — wire the exporter`. The role is the first
-   bare word before the em dash, `@tags` name repos, and both are optional: an
-   untagged line belongs to every role and every repo, which is what a
-   single-repo task writes and what the judge already assumed."
-  [line]
+   `- [ ] implement @gobel @cirdan — wire the exporter`. `@tags` name repos and
+   the first bare word before the em dash is the owning role — but only when
+   `known-roles` names it. Both are optional: a line that names no role and
+   tags no repo belongs to every role and every repo, which is what a
+   single-repo task writes and what the judge already assumed.
+
+   The lineup is an argument because the alternative is unowned lines nobody
+   ever sees. Measured on one machine: six of twelve tasks held a checkbox
+   whose first word was not a role — `Also`, `Cause:`, `The`, `G1`, a
+   backticked path — and task `gobel` had three lines reading `- [ ] gobel —`,
+   a repo name written without its `@`. Each of those named a role that does
+   not exist, so no session matched them, no verdict named them, and they
+   could neither block a handoff nor be ticked. Reading the word as prose
+   instead makes the line everyone's, which is what a line that never named a
+   role has always meant here. A word can only ever move from owning nobody to
+   owning everyone, so nothing that was graded stops being graded.
+
+   A word rejected this way goes back into `:text`: the portal and the PR body
+   both render `:role` and `:text` and nothing else, so dropping it would lose
+   a word from the sentence."
+  [known-roles line]
   (when-let [[_ box head body]
              (or (re-matches #"\s*- \[([ xX])\]\s*(.*?)\s*—\s*(.*)" line)
                  (when-let [[_ box body] (re-matches #"\s*- \[([ xX])\]\s*(.*)" line)]
                    [nil box "" body]))]
     (let [tokens (remove str/blank? (str/split head #"\s+"))
-          tag? #(str/starts-with? % "@")]
+          tag? #(str/starts-with? % "@")
+          words (remove tag? tokens)
+          role (some #{(first words)} known-roles)]
       {:ticked (not= " " box)
-       :role (first (remove tag? tokens))
+       :role role
        :repos (mapv #(subs % 1) (filter tag? tokens))
-       :text (str/trim body)})))
+       :text (str/trim (if (or role (empty? words))
+                         body
+                         (str (str/join " " words) " — " body)))})))
 
 (defn goal-repos
   "role → the repo names its goal lines tag, defaulting to every repo.
@@ -497,7 +530,7 @@
    only by watching it open the wrong worktree."
   [goals-md roles repo-names]
   (let [known (set repo-names)
-        lines (keep goal-line (str/split-lines (or goals-md "")))]
+        lines (keep #(goal-line (map :role roles) %) (str/split-lines (or goals-md "")))]
     (doseq [l lines
             tag (:repos l)
             :when (not (known tag))]
