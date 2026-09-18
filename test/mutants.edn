@@ -557,7 +557,57 @@
 
  {:file "scripts/portal.bb"
   :ns "portal"
-  :old "          (let [goals (goal-lines (task-lib/role-names ctx) (text (:goal-file ctx)))"
+  :old "          (let [goals (goal-lines (task-lib/declared-roles ctx) (text (:goal-file ctx)))"
   :new "          (let [goals (goal-lines [] (text (:goal-file ctx)))"
   :killed-by "the-task-page-is-a-view-of-the-folder-and-the-index-lists-it"
-  :why "the page parses goal lines against a lineup the grader does not share, so every line reads as everyone's on the portal and as one role's in the verdict — the exact disagreement the shared parser exists to prevent"}]
+  :why "the page parses goal lines against a lineup the grader does not share, so every line reads as everyone's on the portal and as one role's in the verdict — the exact disagreement the shared parser exists to prevent"}
+
+ ;; ------------------------------------------- a task picks a subset of the lineup
+ {:file "scripts/portal.bb"
+  :ns "portal"
+  :old "            (spit (str (:roles-file ctx)) (project-lib/roles-text (assoc project :roles lineup)))"
+  :new "            (spit (str (:roles-file ctx)) (project-lib/roles-text project))"
+  :killed-by "a-task-picks-a-subset-of-its-projects-roles"
+  :why "the bug itself: computes the subset and writes the project's whole lineup anyway, so every task opens every stage and the ticking is decoration"}
+
+ {:file "scripts/project_lib.bb"
+  :ns "portal"
+  :old "      :else {:roles (filterv #(contains? (set picked) (:role %)) (:roles project))})))"
+  :new "      :else {:roles (vec (:roles project))})))"
+  :killed-by "a-task-picks-a-subset-of-its-projects-roles"
+  :why "the pick is computed and discarded one layer earlier — same silent full lineup, from the shared rule rather than from one caller"}
+
+ {:file "scripts/project_lib.bb"
+  :ns "portal"
+  :old "      (seq outside)\n      {:error (str \"not a role in project \" (:name project) \": \" (str/join \", \" outside)"
+  :new "      (seq nil)\n      {:error (str \"not a role in project \" (:name project) \": \" (str/join \", \" outside)"
+  :killed-by "a-task-picks-a-subset-of-its-projects-roles"
+  :why "the ceiling is gone, so a task quietly runs a role its project does not declare and the swimlane has no column to draw it in"}
+
+ {:file "scripts/portal.bb"
+  :ns "portal"
+  :old "      (seq (unmeasured-picks lineup ctx bars))"
+  :new "      (seq nil)"
+  :killed-by "a-task-picks-a-subset-of-its-projects-roles"
+  :why "a lineup with nobody to measure the bars is accepted here and refused by `open` instead — after goal.md is written and chmod 444, so the fix needs an unlock"}
+
+ {:file "scripts/swarmkhazad.bb"
+  :ns "mcp"
+  :old "(project-lib/pick-roles project (flag-values args \"--role\"))"
+  :new "(project-lib/pick-roles project [])"
+  :killed-by "new-with-a-project-takes-its-lineup-its-checkouts-and-its-name"
+  :why "--role is accepted and ignored, which is worse than not having it: the caller believes it narrowed the lineup"}
+
+ {:file "scripts/mcp_gateway.bb"
+  :ns "mcp"
+  :old "          (mapcat (fn [r] [\"--role\" r]) roles)))"
+  :new "          nil))"
+  :killed-by "a-call-that-names-a-project-passes-it-through-to-open"
+  :why "the roles a model picked never reach the command — and `open --linear` scaffolds and launches in one call, so nothing downstream can put them back"}
+
+ {:file "scripts/linear_intake.bb"
+  :ns "linear"
+  :old "         (str/join \"\" (for [l lines] (str \"- [ ] \" owner \" — \" (str/trim l) \"\\n\")))"
+  :new "         (str/join \"\" (for [l lines] (str \"- [ ] implement — \" (str/trim l) \"\\n\")))"
+  :killed-by "the-goal-skeleton-is-built-without-any-network"
+  :why "every ticket's goal is owned by `implement` again, including the --investigate lane, whose roles are investigate and run — a prefix naming a role the task does not have"}]

@@ -60,6 +60,13 @@
         "costs one call and never opens anything.\n\n"
         "`repo` is optional and NARROWS: the task runs in the project's checkouts unless you "
         "name a subset of them. A path the project does not hold is refused rather than added.\n\n"
+        "`roles` is optional and NARROWS the same way: the task runs the project's whole lineup "
+        "unless you name a subset, in which case it runs those stages and skips the rest, in the "
+        "project's own order. This is how a small change stops paying for a big pipeline — a "
+        "one-line fix needs implement and run, not every stage the project declares. Name only "
+        "what the change can actually fail at. A role the project does not list is refused; "
+        "adding one is an edit on the project's page. Bars carrying commands still need the role "
+        "that runs them, and a lineup without it is refused rather than opened.\n\n"
         "`investigate` picks the two-role investigation lineup (investigate → run) instead of the "
         "project's lineup. Use it for a ticket with no Evidence label.")
    :inputSchema
@@ -70,6 +77,9 @@
                            :description "The project this task belongs to — its checkouts, roles and cloud environment."}
                  :repo {:type "array" :items {:type "string"}
                         :description "Absolute paths, a subset of the project's checkouts. Default: all of them."}
+                 :roles {:type "array" :items {:type "string"}
+                         :description (str "Role names, a subset of the project's lineup, run in the "
+                                           "project's order. Default: all of them.")}
                  :investigate {:type "boolean"
                                :description "Open the investigation lineup (investigate → run). Default false."}}
     :required ["issue_key" "project"]}})
@@ -100,8 +110,9 @@
    ABSENT one. A call with no project used to scaffold a task with a single
    implement role, no reviewer, no runner and no cloud environment, and nothing
    downstream could tell that apart from a task that meant it."
-  [{:keys [issue_key project repo investigate]}]
+  [{:keys [issue_key project repo roles investigate]}]
   (let [repos (cond (string? repo) [repo] (sequential? repo) (vec repo) :else [])
+        picked-roles (cond (string? roles) [roles] (sequential? roles) (vec roles) :else [])
         bad (remove #(and (string? %) (str/starts-with? % "/")) repos)]
     (cond
       (not (linear-intake/valid-issue-key? issue_key))
@@ -126,18 +137,27 @@
       (> (count repos) max-repos)
       {:error (str "at most " max-repos " repos; got " (count repos))}
 
+      ;; Answered here as well as in `project-scope!`, for the reason the whole
+      ;; function exists: these arrive from a MODEL and become argv elements.
+      ;; A role name that is not a role would otherwise be found only after
+      ;; `open` had fetched the ticket and built a worktree per repo.
+      (:error (project-lib/pick-roles (project-lib/read-project project) picked-roles))
+      {:error (:error (project-lib/pick-roles (project-lib/read-project project) picked-roles))}
+
       :else {:issue-key issue_key :project project :repos repos
+             :roles picked-roles
              :investigate (true? investigate)})))
 
 (defn open-argv
   "The `open` invocation a validated call becomes. Its own function because it
    is the seam this tool exists to hold: every guarantee above is a flag here,
    and a flag that stops being passed is invisible from either side."
-  [{:keys [issue-key project repos investigate]}]
+  [{:keys [issue-key project repos roles investigate]}]
   (concat ["bb" (str (fs/path script-dir "swarmkhazad.bb")) "open"
            "--linear" issue-key "--project" project]
           (when investigate ["--investigate"])
-          (mapcat (fn [p] ["--repo" p]) repos)))
+          (mapcat (fn [p] ["--repo" p]) repos)
+          (mapcat (fn [r] ["--role" r]) roles)))
 
 (defn add-task!
   "Shell `swarmkhazad open`. Returns {:ok? :text}."

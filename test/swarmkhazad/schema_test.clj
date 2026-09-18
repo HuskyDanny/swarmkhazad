@@ -82,3 +82,47 @@
     (is (not (re-find #"join\s+\"\\t\"\s+\[[:(]"
                       "(str/join \"\\t\" (map #(str (or (get r %) \"\")) tasks-tsv-columns))")))
     (is (not (re-find #"zipmap\s+\[:" "   vector in the reader's `zipmap` and a second literal in the writer's")))))
+
+(def def-line
+  "A top-level `(def…)` and the name it binds. Anchored at column 0, so a
+   `def` nested in a `let` or quoted inside a docstring is not one."
+  #"^\(def[a-z-]*\s+(?:\^\S+\s+)?([^\s()\[\]{}]+)")
+
+(defn redefinitions
+  "Per script, the names it binds more than once."
+  []
+  (for [f (script-files)
+        :let [names (keep #(second (re-find def-line %)) (str/split-lines (slurp f)))
+              dupes (->> names frequencies (filter (fn [[_ n]] (> n 1))) (map first) sort)]
+        :when (seq dupes)]
+    {:file (str/replace f (str (fs/cwd) "/") "") :names dupes}))
+
+(deftest a-name-is-defined-once-per-script
+  ;; A second `(defn x …)` in one file is not an error anywhere: the later one
+  ;; wins, every caller silently gets it, and `bb test` is green if the two
+  ;; agree on the cases the tests happen to cover.
+  ;;
+  ;; Measured: `task_lib` grew a second `role-names` — the first reading the
+  ;; `roles` file, the pre-existing one reading `state/sessions.tsv`. They
+  ;; agree for any task that has been prepared, which is every task a test
+  ;; opens, so the whole suite passed while four callers read a file none of
+  ;; them meant. The one caller that could tell was `new`, which writes the
+  ;; goal before anything is prepared, and it read an empty lineup.
+  (testing "no script binds a name twice"
+    (let [bad (redefinitions)]
+      (is (empty? bad)
+          (str "names bound more than once in one file:\n"
+               (str/join "\n" (for [{:keys [file names]} bad]
+                                (str "  " file "  " (str/join ", " names))))
+               "\n\nThe later definition wins and nothing says so. Rename one,"
+               " or delete it if the two answer the same question."))))
+
+  ;; A gate at zero that would read zero on a repo full of shadowed names is
+  ;; not a gate, so the pattern is asserted against the exact shape that
+  ;; shipped, and against the forms it must NOT claim.
+  (testing "the check can see an offender"
+    (is (= "role-names" (second (re-find def-line "(defn role-names"))))
+    (is (= "opus" (second (re-find def-line "(def opus \"anthropic:claude-opus-5[1m]\"")))))
+  (testing "and does not count a def that is not top-level, or one being talked about"
+    (is (nil? (re-find def-line "  (let [x 1] (def y 2))")))
+    (is (nil? (re-find def-line "   Not `role-names`, which answers a different question")))))

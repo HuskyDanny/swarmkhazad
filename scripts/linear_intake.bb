@@ -89,12 +89,17 @@
   "The skeleton: what the issue says, shaped as the contract. Nothing is
    invented — an issue with no acceptance criteria gets one checkbox naming the
    title, and the operator fills the rest in before `open`."
-  [task-id {:keys [identifier title description url state acceptance]}]
-  (let [lines (if (seq acceptance) acceptance [title])]
+  [task-id {:keys [identifier title description url state acceptance]} lead-role]
+  (let [lines (if (seq acceptance) acceptance [title])
+        ;; The first role of this task's own lineup, not the word `implement`.
+        ;; Hardcoded, it named a role the task does not have on every
+        ;; `--investigate` ticket — whose roles are `investigate` and `run` —
+        ;; and would do the same for any lineup narrowed past implement.
+        owner (or (not-empty (str lead-role)) "implement")]
     (str "# " task-id " — " title "\n"
          "From Linear " identifier (when-not (str/blank? state) (str " (" state ")")) " · " (java.time.LocalDate/now) "\n\n"
          "## Goal\n"
-         (str/join "" (for [l lines] (str "- [ ] implement — " (str/trim l) "\n")))
+         (str/join "" (for [l lines] (str "- [ ] " owner " — " (str/trim l) "\n")))
          "\n## Not-goal\n"
          "- <what this issue deliberately does not cover — fill in before open>\n"
          "\n## Hints\n"
@@ -108,15 +113,7 @@
   [issue-key]
   (str/lower-case issue-key))
 
-(defn write-from-issue!
-  "Write the task's goal.md, roles and repos from an already-fetched issue.
-
-   `investigate?` swaps the single `implement` role for the two-role
-   investigation lineup. It is the only difference between the two lanes at
-   scaffold time: the ticket text, the repos and the goal shape are the same,
-   because an investigation's goal IS the ticket's own words."
-  [ctx issue repos & [investigate?]]
-  (spit (str (:goal-file ctx)) (goal-md (:task-id ctx) issue))
-  (spit (str (:roles-file ctx)) (task-lib/roles-template repos investigate?))
-  (spit (str (:repos-file ctx)) (task-lib/repos-text repos))
-  issue)
+;; `write-from-issue!` lived here and wrote goal.md, roles and repos together.
+;; It is gone rather than kept: the roles file has to be written before the
+;; goal that names roles out of it, so `new!` writes all three in that order
+;; and this lane contributes the one thing only it knows — the goal text.

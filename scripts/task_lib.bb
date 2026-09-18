@@ -314,9 +314,9 @@
    investigation lineup. Repos are the task's, not a role's — see repos-text.
 
    One function with a flag, not two defs. As siblings they forced the identical
-   `(if investigate? … …)` at both scaffold sites (`new!` and
-   `write-from-issue!`), which is two places to edit for every lane after this
-   one."
+   `(if investigate? … …)` at each scaffold site, which was two places to edit
+   for every lane after this one. There is one site now — `new!` writes the
+   roles file once, before the goal that names roles out of it."
   [_repos & [investigate?]]
   (if investigate?
     investigation-roles-text
@@ -464,15 +464,25 @@
         (throw (ex-info (str "duplicate roles: " (str/join ", " dupes)) {}))))
     rows))
 
-(defn role-names
-  "The task's role names, or `[]` when the declaration cannot be read.
+(defn declared-roles
+  "The roles the task DECLARES, from its `roles` file, or `[]` when that file
+   cannot be read.
 
    Tolerant on purpose: every reader of a goal line needs the lineup to know
    which word in it is a role, and one of them is the portal, which renders
    tasks in every state — scaffolded and not yet prepared, half-deleted, a
    folder someone made by hand. `parse-roles` throws on all of those, and a
    page that 500s because a task has no `roles` file yet is worse than one
-   that shows its goal lines as belonging to everybody."
+   that shows its goal lines as belonging to everybody.
+
+   Not `role-names`, which answers a different question from a different file:
+   the roles that have SESSIONS, read from `state/sessions.tsv`. They agree for
+   a prepared task and they are the only two ways to ask, which is exactly why
+   the distinction has to be in the name — this one shipped as a second
+   `role-names` and, being defined later in the file, silently became the
+   definition every caller of either got. Nothing failed: the two answers match
+   wherever sessions exist, and `new` — which writes the goal before anything
+   is prepared — was the one caller that could tell, and read an empty lineup."
   [ctx]
   (try (mapv :role (parse-roles ctx))
        (catch Exception _ [])))

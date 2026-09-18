@@ -11,14 +11,16 @@
 
 (def usage-text
   (str "Usage:\n"
-       "  swarmkhazad new <task-id> [--project <name>] [--repo <path>]... [--linear <KEY>] [--investigate]\n"
+       "  swarmkhazad new <task-id> [--project <name>] [--repo <path>]... [--role <name>]...\n"
+       "                            [--linear <KEY>] [--investigate]\n"
        "                                                 scaffold goal.md, metrics.md, roles;\n"
        "                                                 --project takes that project's checkouts, role\n"
-       "                                                 lineup and cloud environment, and --repo then\n"
-       "                                                 narrows to a subset of them\n"
+       "                                                 lineup and cloud environment, and --repo and\n"
+       "                                                 --role then narrow to a subset of each\n"
        "  swarmkhazad prepare <task-id>                  layout, worktrees, mail dirs, sessions.tsv\n"
        "  swarmkhazad open <task-id>                     prepare, then spawn every declared role\n"
-       "  swarmkhazad open --linear <KEY> [--project <name>] [--repo <path>]... [--investigate]\n"
+       "  swarmkhazad open --linear <KEY> [--project <name>] [--repo <path>]... [--role <name>]...\n"
+       "                   [--investigate]\n"
        "                                                 scaffold from a Linear issue, then open;\n"
        "                                                 --investigate uses the investigate → run lineup\n"
        "                                                 instead of a single implement role\n"
@@ -44,7 +46,7 @@
   (binding [*out* *err*] (print usage-text) (flush))
   (System/exit 1))
 
-(defn goal-template [task-id]
+(defn goal-template [task-id roles]
   (str "# " task-id " — <what this task is, one line>\n"
        "Opened by <who> · " (java.time.LocalDate/now) "\n\n"
        "## Goal\n"
@@ -54,7 +56,11 @@
        ;; just scaffolded.
        "<!-- one line per outcome: `- [ ] <role> @<repo> — <outcome>`.\n"
        "     The role and the @repo tags are both optional; a line with neither\n"
-       "     belongs to every role and every repo. -->\n"
+       "     belongs to every role and every repo.\n"
+       ;; Named, because the roles file is the only other place they are
+       ;; written down and a word here that is not one of them is not a role
+       ;; at all — the line quietly becomes everybody's.
+       "     This task's roles: " (str/join ", " roles) ". -->\n"
        "- [ ] <the outcome, one line>\n\n"
        "## Not-goal\n- <deliberately not doing X — why>\n\n"
        "## Hints\n- <absolute path> — why it matters\n"))
@@ -82,7 +88,7 @@
    positional scan that assumes EVERY flag takes a value swallows the token
    after a boolean one, so `open --linear K --investigate --repo /p` read `/p`
    as the task id and scaffolded a task called `/p`."
-  #{"--linear" "--repo" "--project"})
+  #{"--linear" "--repo" "--project" "--role"})
 
 (defn positional-args
   "The bare arguments, with every flag — and the value of a value-taking flag —
@@ -96,15 +102,22 @@
       :else (recur more (conj out a)))))
 
 (defn project-scope!
-  "The project `--project` names and the checkouts a task inside it runs in, or
-   nil when no project was named. Exits on a project that does not exist or a
-   checkout it does not hold.
+  "The project `--project` names, the checkouts a task inside it runs in and
+   the roles it runs, or nil when no project was named. Exits on a project that
+   does not exist, a checkout it does not hold, or a role it does not list.
 
    The project owns the scope and the task picks inside it, exactly as the
-   portal's form does: `--repo` narrows, it never widens, and naming none means
-   all of them. Widening is one edit on the project's page — a decision with a
-   name on it — rather than a project that grows every time a task needs one
-   more tree."
+   portal's form does: `--repo` and `--role` narrow, they never widen, and
+   naming none of either means all of them. Widening is one edit on the
+   project's page — a decision with a name on it — rather than a project that
+   grows every time a task needs one more tree or one more stage.
+
+   `--role` exists for the door that cannot hand-edit. `new` leaves the `roles`
+   file unlocked and two lines long, so the CLI never needed a flag for it —
+   but `open --linear` scaffolds AND launches in one call, and that is the form
+   the MCP gateway shells, so there is no moment between the two in which
+   anything could edit the file. Without the flag an unattended caller can
+   narrow the checkouts and not the lineup."
   [args]
   (when-let [name (first (flag-values args "--project"))]
     (let [project (project-lib/read-project name)
@@ -122,7 +135,11 @@
                              "then open the task")))
       (when (empty? scope)
         (task-lib/fail! (str "project " name " holds no checkouts — add one on its edit page")))
-      {:project project :repos (if (seq picked) (vec picked) (vec (:repos project)))})))
+      (let [{:keys [roles error]} (project-lib/pick-roles project (flag-values args "--role"))]
+        (when error (task-lib/fail! error))
+        {:project project
+         :repos (if (seq picked) (vec picked) (vec (:repos project)))
+         :roles roles}))))
 
 (defn new!
   "Scaffold a task folder. With --linear <KEY> the goal comes from the issue
@@ -156,17 +173,26 @@
                   ((resolve 'linear-intake/fetch-issue) issue-key))]
       (fs/create-dirs (:task-dir ctx))
       (spit (str (:metrics-file ctx)) (metrics-template task-id))
-      (if issue
-        (do ((resolve 'linear-intake/write-from-issue!) ctx issue repos investigate?)
-            (println (str "linear: " (:identifier issue) " " (:title issue))))
-        (do (spit (str (:goal-file ctx)) (goal-template task-id))
-            (spit (str (:roles-file ctx)) (task-lib/roles-template repos investigate?))
-            (spit (str (:repos-file ctx)) (task-lib/repos-text repos))))
+      ;; The lineup is written FIRST, and in one place, because goal.md's role
+      ;; prefixes have to name roles this task actually has. It used to be
+      ;; written by whichever lane ran and then overwritten by the project
+      ;; block below, which left the goal already on disk prefixed for a lineup
+      ;; that was about to change. The Linear lane wrote `- [ ] implement — `
+      ;; on every acceptance line whatever the roles were, so every
+      ;; `--investigate` ticket got a goal owned by `implement` in a task whose
+      ;; roles are `investigate` and `run`.
+      (spit (str (:roles-file ctx))
+            (if (and project (not investigate?))
+              (project-lib/roles-text (assoc project :roles (:roles scope)))
+              (task-lib/roles-template repos investigate?)))
+      (spit (str (:repos-file ctx)) (task-lib/repos-text repos))
+      (let [lead (first (task-lib/declared-roles ctx))]
+        (if issue
+          (do (spit (str (:goal-file ctx))
+                    ((resolve 'linear-intake/goal-md) task-id issue lead))
+              (println (str "linear: " (:identifier issue) " " (:title issue))))
+          (spit (str (:goal-file ctx)) (goal-template task-id (task-lib/declared-roles ctx)))))
       (when project
-        ;; Written after either scaffold, so there is one place a project
-        ;; overrides what the lane wrote rather than a branch inside both.
-        (when-not investigate?
-          (spit (str (:roles-file ctx)) (project-lib/roles-text project)))
         (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
         (println (str "project: " (:name project))))
       (println (str (:task-dir ctx))))))

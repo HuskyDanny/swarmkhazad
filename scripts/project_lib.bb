@@ -138,6 +138,8 @@
 
 ;; ---------------------------------------------------------------- role cards
 
+(def prompts-src-dir (fs/path (fs/parent script-dir) "prompts"))
+
 (def not-a-role
   "Two prompts on disk are not roles. `constitution.prompt` is the preamble
    every role's prompt carries, and `default.prompt` is what a role with no
@@ -158,12 +160,30 @@
    of the prompt is the name of the role, which is what makes a role card a
    choice rather than a free-text field."
   []
-  (let [on-disk (->> (fs/glob (fs/path (fs/parent script-dir) "prompts") "*.prompt")
+  (let [on-disk (->> (fs/glob prompts-src-dir "*.prompt")
                      (map #(str/replace (fs/file-name %) #"\.prompt$" ""))
                      (remove not-a-role)
                      set)
         known (filterv on-disk pipeline-order)]
     (into known (sort (remove (set pipeline-order) on-disk)))))
+
+(defn stage-prompt
+  "The prompt text a role launches with — its own, or `default.prompt`."
+  [role]
+  (let [specific (fs/path prompts-src-dir (str role ".prompt"))
+        fallback (fs/path prompts-src-dir "default.prompt")]
+    (slurp (str (if (fs/regular-file? specific) specific fallback)))))
+
+(defn measures?
+  "Whether this role is the one that runs the bars.
+
+   Keyed on the PROMPT and not on a role being named `run`: the prompt is what
+   invokes the runner, so renaming the role cannot make this wrong in either
+   direction. Asked in two places — `open` refuses a task whose bars nobody
+   will measure, and the task form says so at the moment a box is unticked
+   rather than three steps later — and it is one rule, so it is one function."
+  [role]
+  (str/includes? (stage-prompt role) "run_evidence.bb"))
 
 (def opus "anthropic:claude-opus-5[1m]")
 
@@ -321,6 +341,43 @@
   (str task-lib/roles-grammar-comment
        (str/join "" (for [{:keys [role harness model]} roles]
                       (str role " " harness " task model=" model "\n")))))
+
+(defn pick-roles
+  "The lineup a task runs: the project's roles filtered to the names it picked,
+   or {:error <why>}.
+
+   The project owns the lineup and the task picks inside it, exactly as it
+   already does with checkouts. Before this, every task ran the project's whole
+   pipeline whatever it was — a one-line typo fix opened six sessions, paid for
+   six contexts and waited for six handoffs, because the only place a lineup
+   could be chosen was the project, and the project is shared by every task in
+   it. The routing was always per-task: `roles` is a file in the task folder
+   and `swarm_lib/role-header` reads the next role out of it. Nothing chose.
+
+   Picking none means all of them. A form whose every box is clear posts no
+   `role:` key at all, so `nothing ticked` and `no such field` arrive here
+   identical, and the safe reading of both is the lineup a task got before this
+   field existed.
+
+   Order is the project's, never the caller's. That order is three things at
+   once — the swimlane's columns, the next-role chain each session is told at
+   boot, and the order the judge grades in — so a task that reordered it would
+   make the board describe a flow the swarm does not run.
+
+   Subtracting only, like the checkouts: a role the project does not list is
+   refused rather than added, because widening should be one edit on the
+   project's page with a name on it, not a task that quietly grows the lineup
+   for everyone after it."
+  [project picked]
+  (let [known (set (map :role (:roles project)))
+        outside (remove known picked)]
+    (cond
+      (seq outside)
+      {:error (str "not a role in project " (:name project) ": " (str/join ", " outside)
+                   " — its lineup is " (str/join ", " (map :role (:roles project)))
+                   ", and adding one is an edit on the project's page")}
+      (empty? picked) {:roles (vec (:roles project))}
+      :else {:roles (filterv #(contains? (set picked) (:role %)) (:roles project))})))
 
 (defn repos-text
   "The project's `repos` declaration — every checkout it holds."

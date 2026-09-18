@@ -198,10 +198,12 @@
 
 ;; ---------------------------------------------------------------- prompts
 
-(defn stage-prompt [role]
-  (let [specific (fs/path prompts-src-dir (str role ".prompt"))
-        fallback (fs/path prompts-src-dir "default.prompt")]
-    (slurp (str (if (fs/regular-file? specific) specific fallback)))))
+;; Lives in project_lib beside `stage-prompts`, which lists the same files, and
+;; beside `measures?`, which is the one question two callers ask of a prompt.
+;; Delegated rather than aliased with `def`: a top-level def resolves at load
+;; time, and swarm_lib does not load project_lib — it reaches it the way
+;; `undispatchable-bars` already reaches `cloud-env-for`, from inside a body.
+(defn stage-prompt [role] (project-lib/stage-prompt role))
 
 (defn role-header [ctx rows row]
   (let [roles (vec (distinct (map :role rows)))
@@ -595,8 +597,7 @@
         commanded (remove #(placeholder? (:command %))
                           (filter run-evidence/runnable? (task-bars ctx)))]
     (when (and (seq commanded)
-               (not (some #(str/includes? (stage-prompt (:role %)) "run_evidence.bb")
-                          roles)))
+               (not (some #(project-lib/measures? (:role %)) roles)))
       (vec commanded))))
 
 (defn unreadable-bars

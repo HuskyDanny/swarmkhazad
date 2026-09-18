@@ -572,6 +572,34 @@
       (empty? picked) {:repos (vec (:repos project))}
       :else {:repos picked})))
 
+(defn task-roles
+  "The lineup one task runs: the subset of its project's roles the form ticked,
+   or {:error}. The rule and its reasons live in `project-lib/pick-roles`,
+   which the CLI and the MCP gateway ask the same question of."
+  [project params]
+  (project-lib/pick-roles
+   project
+   (->> (keys params) (keep #(second (re-matches #"role:(.+)" %))) sort vec)))
+
+(defn unmeasured-picks
+  "The names of the bars this lineup would leave unmeasured — empty when the
+   lineup holds a role whose prompt runs them, or when no bar carries a
+   command at all.
+
+   Parsed from the metrics.md this submit is about to write, rather than from
+   the brief's raw lines: `run_evidence/bars` is what decides that a backticked
+   identifier in prose is not a command, and a second opinion about that here
+   would be a second parser to keep in step with the first."
+  [lineup ctx bar-lines]
+  (when (and (seq bar-lines) (not (some #(project-lib/measures? (:role %)) lineup)))
+    (->> (run-evidence/bars ctx (project-lib/metrics-md (:task-id ctx) bar-lines))
+         (filter run-evidence/runnable?)
+         ;; The same placeholder rule `require-measurable!` applies, so the two
+         ;; answers cannot differ: a still-angle-bracketed command is a
+         ;; template line nobody meant to run.
+         (remove #(re-find #"<[^>]+>" (str (:command %))))
+         (mapv :name))))
+
 (defn kickstart-project!
   "A task inside a project: the role lineup comes from the project and the
    repos are the subset of it the form ticked, so the form contributes the
@@ -580,6 +608,7 @@
   (let [id (str/trim (or task-id ""))
         {:keys [goal not-goal bars seen]} (project-lib/parse-brief brief)
         {picked :repos repo-error :error} (task-repos project params)
+        {lineup :roles role-error :error} (task-roles project params)
         ctx (when (task-lib/valid-task-id? id) (task-lib/task-ctx id))]
     (cond
       (not (task-lib/valid-task-id? id)) {:error (str "invalid task id: " (pr-str id))}
@@ -593,8 +622,22 @@
       (empty? goal) {:error (str "the Goal section is empty — found "
                                  (str/join ", " (sort (map name seen))))}
       repo-error {:error repo-error}
+      role-error {:error role-error}
       (empty? picked) {:error (str "project " (:name project) " holds no checkouts — "
                                    "add one on its edit page")}
+      ;; `open` refuses this too and that refusal stays — it is the gate the
+      ;; CLI and the MCP gateway also pass through. Asking here as well is
+      ;; about WHEN. Past this button the brief is written and goal.md is
+      ;; chmod 444, so the same answer arriving from `open` costs an unlock of
+      ;; the truth file to fix a box that was one click away. Asked of the
+      ;; markdown that is about to be written, by the parser that will read it
+      ;; back, so the two cannot disagree about what counts as a command.
+      (seq (unmeasured-picks lineup ctx bars))
+      {:error (str "nothing in this lineup would measure "
+                   (str/join ", " (unmeasured-picks lineup ctx bars))
+                   " — tick the role whose prompt runs the bars (`run`), "
+                   "or move those lines out of the Bars section, which is "
+                   "what a bar judged by a person looks like.")}
       :else
       (let [new (apply process/sh {:continue true} "bb" cli "new" id
                        (mapcat #(vector "--repo" %) picked))]
@@ -605,7 +648,10 @@
             (when (seq bars)
               (spit (str (:metrics-file ctx)) (project-lib/metrics-md id bars)))
             (spit (str (project-lib/task-project-file ctx)) (str (:name project) "\n"))
-            (spit (str (:roles-file ctx)) (project-lib/roles-text project))
+            ;; The pick, not the project's whole lineup — same shape as the
+            ;; repos line below it. The project is the bound; this file is the
+            ;; task's own answer inside it.
+            (spit (str (:roles-file ctx)) (project-lib/roles-text (assoc project :roles lineup)))
             ;; The pick, not `project-lib/repos-text` — the project's set is
             ;; the bound, and this file is the task's own answer inside it.
             (spit (str (:repos-file ctx)) (task-lib/repos-text picked))
@@ -1033,7 +1079,10 @@
               ;; space that fits none of them.
               (when-let [p (:progress c)] [:span.muted p])])]])]]
      (when (seq stray)
-       [:p.muted "not in a lane yet: "
+       ;; Not "not in a lane yet" — it is in one, just not one this project
+       ;; draws. A task whose lineup names a role the project has since dropped
+       ;; lands here, and reading that as "not started" is the opposite of true.
+       [:p.muted "in a lane this project does not show: "
         (interpose ", " (for [c stray] [:a {:href (str "/tasks/" (:id c))} (:id c) " (" (:lane c) ")"]))])]))
 
 (defn index-page [error params]
@@ -1161,6 +1210,22 @@
                 [:span.muted "a checkout this task needs and the project does not hold is a "
                  [:a.doc {:href (str "/projects/" (:name project) "/edit")} "project edit"]
                  " — the project owns the scope"]])
+             ;; Same shape as the checkouts, for the same reason and with the
+             ;; same default. Until this field the lineup was the project's and
+             ;; only the project's, so a one-line typo fix opened every role
+             ;; the project had — six sessions, six contexts and six handoffs
+             ;; for a change one of them could make alone. The routing was
+             ;; always per task; nothing chose.
+             (let [any? (some #(re-matches #"role:(.+)" %) (keys params))]
+               [:label "roles — the lineup this one task runs, in the project's order"
+                [:div.picklist
+                 (for [{:keys [role model]} (:roles project)]
+                   [:label.pick [:input {:type "checkbox" :name (str "role:" role)
+                                         :checked (or (not any?) (contains? params (str "role:" role)))}]
+                    [:span.trunc role] [:span.muted model]])]
+                [:span.muted "unticking only skips a stage — a role the project does not "
+                 "list is an " [:a.doc {:href (str "/projects/" (:name project) "/edit")} "edit there"]
+                 ". Bars with commands still need the role that runs them"]])
              [:label "the brief, sorted — edit anything, this is what opens"
               [:textarea {:name "brief" :rows 20} markdown]]]
             [:div.go
@@ -1316,7 +1381,7 @@
                    [:summary [:span.kind (:kind a)] [:span.grow.trunc (:text a)]]
                    [:div.full (:text a)]]])
                [:p.empty "nothing needs a human"])])
-          (let [goals (goal-lines (task-lib/role-names ctx) (text (:goal-file ctx)))
+          (let [goals (goal-lines (task-lib/declared-roles ctx) (text (:goal-file ctx)))
                 item (fn [g]
                        (let [{:keys [status roles]} (goal-status g vs)]
                          [:li [:input {:type "checkbox" :disabled true :checked (contains? #{:met :ticked} status)}]
