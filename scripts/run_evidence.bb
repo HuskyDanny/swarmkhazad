@@ -483,6 +483,19 @@
                     (= e "0") :passed
                     :else :failed)})))
 
+(def unmeasured-states
+  "The states that mean the measuring did not happen — as distinct from
+   happening and coming out badly.
+
+   A narrower set than `unsatisfied-states`, and the split is deliberate. A
+   `:failed` bar is news about the CODE: the runner did its job and the code
+   missed the bar, which is for the merge verdict to weigh. These two are news
+   about the RUN: nothing executed the command, or it could not be sent at all.
+
+   `:dispatched` is not here. Sending an @cloud bar is the whole of what the
+   runner can do about it; waiting for the answer is not its failure."
+  #{:unmeasured :blocked})
+
 (def unsatisfied-states
   "The states that are not a pass, and cannot be argued into one.
 
