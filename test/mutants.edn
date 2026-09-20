@@ -610,4 +610,26 @@
   :old "         (str/join \"\" (for [l lines] (str \"- [ ] \" owner \" — \" (str/trim l) \"\\n\")))"
   :new "         (str/join \"\" (for [l lines] (str \"- [ ] implement — \" (str/trim l) \"\\n\")))"
   :killed-by "the-goal-skeleton-is-built-without-any-network"
-  :why "every ticket's goal is owned by `implement` again, including the --investigate lane, whose roles are investigate and run — a prefix naming a role the task does not have"}]
+  :why "every ticket's goal is owned by `implement` again, including the --investigate lane, whose roles are investigate and run — a prefix naming a role the task does not have"}
+
+ ;; ------------------------------------- a bar's evidence, not a bar's reviewer
+ {:file "scripts/run_evidence.bb"
+  :ns "evidence"
+  :old "  #{:failed :unmeasured :dispatched :blocked})"
+  :new "  #{:failed :dispatched :blocked})"
+  :killed-by "a-ready-verdict-the-evidence-contradicts-is-overridden"
+  :why "a bar nobody ran stops blocking the merge — and an unrun bar writes no evidence file, which is the same absence a reader sees for a bar that ran and passed"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "evidence"
+  :old "                    (= e \"0\") :passed"
+  :new "                    (some? e) :passed"
+  :killed-by "a-bars-state-is-read-from-its-evidence-and-is-not-a-judgement"
+  :why "any exit code reads as a pass, so `exit: 1` and the 124 a timeout writes both report the bar as met"}
+
+ {:file "scripts/summary.bb"
+  :ns "evidence"
+  :old "    (if (or (empty? bad) (not (re-find ready-line-re text)))"
+  :new "    (if true"
+  :killed-by "a-ready-verdict-the-evidence-contradicts-is-overridden"
+  :why "the gate is gone and the model has the last word on whether a bar passed again — the one question its own evidence file already answers"}]

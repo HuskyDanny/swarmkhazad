@@ -20,6 +20,7 @@
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "task_lib.bb")))
 (load-file (str (fs/path script-dir "ask.bb")))
+(load-file (str (fs/path script-dir "run_evidence.bb")))
 
 (def merge-order-heading
   "The section ship reads its order from. One name, in one place: the prompt
@@ -140,6 +141,30 @@
       (str/join "\n" (for [f (sort (fs/list-dir dir))]
                        (str "--- " (fs/file-name f) "\n" (clip (slurp (str f)) 2500)))))))
 
+(defn bar-facts
+  "The computed state of every declared bar, as a block for the prompt.
+
+   Given to the model as FACTS rather than asked of it. `exit:` is an integer
+   the runner wrote down; deciding what it means is not a reading comprehension
+   problem, and a reader handed a directory of files cannot tell a bar that
+   passed from one that nobody ran — both look like an absence unless it is
+   told which bars were supposed to be there."
+  [ctx]
+  (let [states (run-evidence/bar-states ctx (run-evidence/declared-bars ctx))]
+    (if (empty? states)
+      "(this task declares no bars)"
+      (str/join "\n"
+                (for [{:keys [bar state exit]} states]
+                  (format "- %-11s %s%s" (name state) (:name bar)
+                          (case state
+                            :passed     " — its command exited 0. Whether that MEETS the threshold is yours to read from the output."
+                            :failed     (str " — its command exited " exit ". This is not a judgement call: it did not pass.")
+                            :unmeasured " — NO evidence file. Nothing ran it. An unrun bar is not a met bar."
+                            :dispatched " — sent to the cloud runner and has not answered. Being sent somewhere is not a measurement."
+                            :blocked    " — could not be dispatched at all."
+                            :prose      " — its measure is prose, so no run was expected; a human judges this one."
+                            "")))))))
+
 (defn gather
   "Everything the question needs, as one document. Sections that are empty say
    so: a missing decision.md and an unread one look identical otherwise, and the
@@ -174,6 +199,9 @@
      ;; escalation.md, where they read as reasons not to merge.
      (section "release.md — what must be true around the merge, written by the roles"
               (read-file (:release-file ctx) file-budget))
+     ;; Computed, not asked. See `bar-facts`.
+     (section "bar state — computed from each bar's own evidence file, not an opinion"
+              (bar-facts ctx))
      (section "evidence — each bar's own output" (evidence-section ctx))
      ;; One diff per repo, not per session: roles sharing a repo share its
      ;; worktree, so a per-session loop would print the same diff twice.
@@ -258,6 +286,35 @@
    "here gets something merged. Never claim a command was run; only the "
    "evidence section records what ran."))
 
+(def ready-line-re
+  "The verdict line `ship` reads. It looks for a line whose first word is
+   READY, so that is exactly what this has to be able to find and rewrite."
+  #"(?m)^(READY[^\n]*)$")
+
+(defn gate-verdict
+  "Downgrade a READY verdict the evidence contradicts.
+
+   The model writes the prose, the findings and the merge order — all things a
+   rule cannot do. It does not get the last word on whether a bar passed,
+   because that word is already written in the bar's own evidence file. This
+   is the same shape as `own-unmet-only` in the goal judge: a deterministic
+   filter over a probabilistic answer, applied in the one direction that can
+   only ever be safer — it can turn READY into NOT READY and never the reverse.
+
+   Returns the text unchanged when there is nothing to gate."
+  [ctx text]
+  (let [bad (run-evidence/unsatisfied ctx (run-evidence/declared-bars ctx))]
+    (if (or (empty? bad) (not (re-find ready-line-re text)))
+      text
+      (str/replace-first
+       text ready-line-re
+       (fn [[_ line]]
+         (str "NOT READY — " (count bad) " bar(s) did not pass: "
+              (str/join ", " (for [b bad] (str (:name (:bar b)) " (" (name (:state b)) ")")))
+              ".\n\n> The verdict below was written as `" (str/trim line) "` and was"
+              " overridden here. A bar's own evidence file says whether it passed;"
+              " that is not something this summary is allowed to talk its way past."))))))
+
 (defn summarize!
   "One call, then written to state/summary.md with a header saying when and at
    what cost. Returns {:ok path} or {:error ...}."
@@ -278,7 +335,7 @@
                    "cost: " (format "%.4f" (double (or (:cost r) 0))) "\n"
                    "input-chars: " (count doc) "\n"
                    "--- summary ---\n"
-                   (str/trim (:text r)) "\n"))
+                   (str/trim (gate-verdict ctx (:text r))) "\n"))
         {:ok (str f) :cost (:cost r)}))))
 
 (defn read-summary

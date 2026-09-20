@@ -414,6 +414,92 @@
                (when-not (str/ends-with? (:output result) "\n") "\n")))
     file))
 
+;; ------------------------------------------------- reading the evidence back
+;;
+;; The file above is written by this namespace, so it is read back here too.
+;; Everything downstream — the page, the merge verdict — asks for a STATE
+;; rather than parsing `exit:` itself, because the whole point of these four
+;; states is that they are not a matter of opinion.
+
+(defn declared-bars
+  "Every bar this task declares, across BOTH sources, in the order
+   `measure-all!` reads them.
+
+   One function because the argument ORDER is load-bearing: it decides which of
+   two same-named bars gets `<bar>-2`, so a caller that passed metrics.md alone
+   disagreed with the runner about which evidence file belonged to which bar.
+   That happened — a repro bar was measured, its file written, and the row
+   omitted from the one page a human checks."
+  [ctx]
+  (let [read #(when (fs/regular-file? %) (slurp (str %)))]
+    (bars ctx
+          (or (read (:metrics-file ctx)) "")
+          (or (read (:repro-file ctx)) ""))))
+
+(defn read-evidence
+  "One bar's evidence file → `{:headers {} :output ... :head ...}`, or nil when
+   there is no file.
+
+   `:head` is the raw text before the marker, kept because a bar whose evidence
+   a role WROTE BY HAND has no `--- output ---` in it at all — the whole file is
+   head, and a reader that only ever showed `:output` would render it as empty.
+   The portal has shown such a file since before the runner existed."
+  [ctx bar-id]
+  (let [f (fs/path (:evidence-dir ctx) (str bar-id ".txt"))]
+    (when (fs/regular-file? f)
+      (let [[head out] (str/split (slurp (str f)) #"--- output ---\n" 2)]
+        {:head head
+         :output out
+         :headers (into {} (for [l (str/split-lines head)
+                                 :let [[k v] (str/split l #": " 2)]
+                                 :when v]
+                             [k v]))}))))
+
+(defn bar-state
+  "What a bar's own evidence says happened, as one of:
+
+     :passed      the command ran and exited 0
+     :failed      it ran and exited non-zero (124 is the timeout)
+     :dispatched  an @cloud bar was sent and has not answered — `exit: pending`
+     :blocked     an @cloud bar could not be sent at all
+     :unmeasured  there is no evidence file: nothing ran it
+     :prose       the measure is not a command, so no run was ever expected
+
+   `:passed` is deliberately the weakest of these. It says the command exited
+   0, which is not the same as the THRESHOLD being met — `bar: median under
+   20 ms` is prose, and a script that prints 45 ms still exits 0. Reading the
+   number out of the output is a judgement, and that judgement stays with the
+   reader. Everything else in this list is not a judgement at all."
+  [ctx bar]
+  (if-not (runnable? bar)
+    {:bar bar :state :prose}
+    (let [h (read-evidence ctx (:id bar))
+          e (get (:headers h) "exit")]
+      {:bar bar
+       :exit e
+       :state (cond (nil? h) :unmeasured
+                    (= e "pending") :dispatched
+                    (= e "blocked") :blocked
+                    (= e "0") :passed
+                    :else :failed)})))
+
+(def unsatisfied-states
+  "The states that are not a pass, and cannot be argued into one.
+
+   `:unmeasured` belongs here and is the reason this exists. A bar nobody ran
+   writes no file, and a bar that ran and passed writes one saying `exit: 0` —
+   but a reader handed the evidence DIRECTORY sees an absence in both cases if
+   it is not told which bars were supposed to be there. That absence has been
+   read as a pass before."
+  #{:failed :unmeasured :dispatched :blocked})
+
+(defn bar-states [ctx bars] (mapv #(bar-state ctx %) bars))
+
+(defn unsatisfied
+  "The bars that stop a task being ready to merge, by their own evidence."
+  [ctx bars]
+  (filterv #(unsatisfied-states (:state %)) (bar-states ctx bars)))
+
 (defn mine?
   "A bar is this session's when it tags no repo or tags this one. Untagged is
    the same default a goal line has: a line that never said belongs to
