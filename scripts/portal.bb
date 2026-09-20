@@ -109,13 +109,14 @@
       (and (seq verdicts) (every? :met (vals verdicts))) {:status :met :roles (vec (keys verdicts))}
       :else {:status :pending :roles []})))
 
-(defn evidence-for [ctx bar-id]
-  (let [f (fs/path (:evidence-dir ctx) (str bar-id ".txt"))]
-    (when-let [s (text f)]
-      (let [[head out] (str/split s #"--- output ---\n" 2)
-            headers (into {} (for [l (str/split-lines head) :let [[k v] (str/split l #": " 2)] :when v] [k v]))]
-        {:exit (get headers "exit") :at (get headers "started_at")
-         :tail (str/join "\n" (take-last 6 (str/split-lines (or out head))))}))))
+(defn evidence-for
+  "One bar's evidence, for display. The parse lives in `run_evidence`, which
+   writes the format — two spellings of it would be free to drift, and this
+   page and the merge verdict must agree about what `exit:` said."
+  [ctx bar-id]
+  (when-let [{:keys [headers output head]} (run-evidence/read-evidence ctx bar-id)]
+    {:exit (get headers "exit") :at (get headers "started_at")
+     :tail (str/join "\n" (take-last 6 (str/split-lines (or output head))))}))
 
 (defn bars-with-evidence
   "Every bar the runner will measure, with its evidence file.
@@ -127,9 +128,7 @@
    a bar nobody could see was declared. Same argument order matters, because
    that is what makes the two agree on `<bar>-2` when a name repeats."
   [ctx]
-  (for [bar (run-evidence/bars ctx
-                              (or (text (:metrics-file ctx)) "")
-                              (or (text (:repro-file ctx)) ""))]
+  (for [bar (run-evidence/declared-bars ctx)]
     (assoc bar :evidence (evidence-for ctx (:id bar)))))
 
 (defn count-files [dir]

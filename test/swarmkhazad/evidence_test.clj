@@ -403,3 +403,104 @@
       (measure)
       (is (fs/regular-file? (fs/path dir "evidence" "repo-tests.txt"))
           "one repo, so there is nothing to disambiguate and the suffix would only break old readers"))))
+
+;; ------------------------------------------- what a bar's evidence decides
+
+(defn- eval-in
+  "Evaluate a form against task `t` under a throwaway SWARMKHAZAD_HOME.
+
+   A REAL `task-ctx`, not a hand-built map. The first version of this passed a
+   three-key map and every case died in `substitute` on a nil `:task-id` —
+   which proved only that the fixture was wrong, and would have gone on
+   passing if the code under test had been deleted."
+  [home form]
+  (let [r (process/sh {:dir repo-root :continue true
+                       :extra-env {"SWARMKHAZAD_HOME" (str home)}}
+                      "bb" "-e" (str "(require '[babashka.fs :as fs]) "
+                                     "(load-file \"" scripts "/summary.bb\") "
+                                     "(let [ctx (task-lib/task-ctx \"t\")] (print " form "))"))]
+    (str (:out r) (:err r))))
+
+(defn- with-evidence
+  "A SWARMKHAZAD_HOME holding task `t` with metrics.md and the named evidence."
+  [metrics files f]
+  (let [d (fs/create-temp-dir {:prefix "sk-barstate-"})
+        t (fs/path d "tasks" "t")]
+    (try
+      (write! (fs/path t "metrics.md") metrics)
+      (doseq [[name text] files] (write! (fs/path t "evidence" name) text))
+      (f (str d))
+      (finally (fs/delete-tree d)))))
+
+(def ^:private two-bars
+  (str "# t — bars\n\n## Quantitative\n"
+       "- alpha — bar: exits 0 — measure: `echo a`\n"
+       "- beta — bar: exits 0 — measure: `echo b`\n"
+       "- gamma — bar: a person looks — measure: someone reads the page\n"))
+
+(defn- ev [exit] (str "bar: x\ncommand: echo a\ncwd: /tmp\nexit: " exit "\n--- output ---\nout\n"))
+
+(deftest a-bars-state-is-read-from-its-evidence-and-is-not-a-judgement
+  ;; `exit:` is an integer the runner wrote down. Handing the evidence
+  ;; DIRECTORY to a reader and asking what passed is a different, worse
+  ;; question — and an unrun bar writes no file, so it is indistinguishable
+  ;; from a bar that ran and passed unless the reader is told which bars were
+  ;; supposed to be there.
+  (testing "each state comes from the file, and a missing file is its own state"
+    (with-evidence two-bars {"alpha.txt" (ev "0") "beta.txt" (ev "1")}
+      (fn [d]
+        (let [out (eval-in d (str "(mapv (juxt (comp :name :bar) :state)"
+                                  " (run-evidence/bar-states ctx (run-evidence/declared-bars ctx)))"))]
+          (is (str/includes? out "[alpha :passed]") out)
+          (is (str/includes? out "[beta :failed]") "exit 1 is not a matter of opinion")
+          (is (str/includes? out "[gamma :prose]")
+              "a measure that is not a command was never going to be run, and is a human's to judge")))))
+
+  (testing "a bar with no evidence file at all is unmeasured, never passed"
+    (with-evidence two-bars {"alpha.txt" (ev "0")}
+      (fn [d]
+        (let [out (eval-in d (str "(mapv (juxt (comp :name :bar) :state)"
+                                  " (run-evidence/unsatisfied ctx (run-evidence/declared-bars ctx)))"))]
+          (is (str/includes? out "[beta :unmeasured]"))
+          (is (not (str/includes? out "alpha")) "a passed bar does not block")
+          (is (not (str/includes? out "gamma")) "and neither does one nobody was going to run"))))))
+
+(deftest a-ready-verdict-the-evidence-contradicts-is-overridden
+  ;; The model writes the prose, the findings and the merge order. It does not
+  ;; get the last word on whether a bar passed, because that word is already in
+  ;; the bar's own evidence file. One direction only: this can turn READY into
+  ;; NOT READY and never the reverse.
+  (let [verdict "## Verdict\nREADY TO MERGE — everything looks good.\n\n## Findings\n- nothing\n"
+        gate (fn [d text] (eval-in d (str "(summary/gate-verdict ctx " (pr-str text) ")")))]
+
+    (testing "a failed bar downgrades it and says which"
+      (with-evidence two-bars {"alpha.txt" (ev "0") "beta.txt" (ev "1")}
+        (fn [d]
+          (let [out (gate d verdict)]
+            (is (str/includes? out "NOT READY"))
+            (is (str/includes? out "beta (failed)") "and names the bar, not just a count")
+            (is (str/includes? out "READY TO MERGE") "the original line is kept, quoted, not silently deleted")
+            (is (str/includes? out "## Findings") "and the rest of the summary is untouched")))))
+
+    (testing "so does a bar nobody ran"
+      (with-evidence two-bars {"alpha.txt" (ev "0")}
+        (fn [d]
+          (is (str/includes? (gate d verdict) "beta (unmeasured)")))))
+
+    (testing "an @cloud bar that was only dispatched is not a measurement either"
+      (with-evidence two-bars {"alpha.txt" (ev "0") "beta.txt" (ev "pending")}
+        (fn [d]
+          (is (str/includes? (gate d verdict) "beta (dispatched)")))))
+
+    (testing "every bar passing leaves the verdict exactly as written"
+      (with-evidence two-bars {"alpha.txt" (ev "0") "beta.txt" (ev "0")}
+        (fn [d]
+          (is (= (str/trim verdict) (str/trim (gate d verdict)))
+              "no rewrite at all — the gate is not a rephrasing pass"))))
+
+    (testing "and a verdict that was already NOT READY is left alone"
+      (with-evidence two-bars {"beta.txt" (ev "1")}
+        (fn [d]
+          (let [nr "## Verdict\nNOT READY — the diff is empty.\n"]
+            (is (= (str/trim nr) (str/trim (gate d nr)))
+                "the line ship reads starts with READY; this one never matched")))))))
