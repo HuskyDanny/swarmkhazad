@@ -51,7 +51,7 @@
 (defn with-task
   "A prepared task over `repo-names` (default one repo), roles a and b on
    claude and c on grok. f gets the helpers defined here."
-  [{:keys [repo-names goal]} f]
+  [{:keys [repo-names goal roles metrics]} f]
   (let [sandbox (fs/create-temp-dir {:prefix "swarmkhazad-judge."})
         home (str (fs/path sandbox "home"))
         stubdir (str (fs/path sandbox "stubbin"))
@@ -72,7 +72,8 @@
       (fs/set-posix-file-permissions (fs/path stubdir "bb") "rwxr-xr-x")
       (run {:env base-env} cli "new" id "--repo" (first srcs))
       (let [dir (fs/path home "tasks" id)]
-        (spit (str (fs/path dir "roles")) "a claude task\nb claude task\nc grok task\n")
+        (spit (str (fs/path dir "roles")) (or roles "a claude task\nb claude task\nc grok task\n"))
+        (when metrics (spit (str (fs/path dir "metrics.md")) metrics))
         (spit (str (fs/path dir "repos")) (str/join "" (map #(str % "\n") srcs)))
         (spit (str (fs/path dir "goal.md"))
               (or goal "# t-judge\n\n## Goal\n- [ ] a — GOAL-X\n\n## Not-goal\n- none\n"))
@@ -336,4 +337,69 @@
         (is (str/includes? line "a_fixture: goal judge says unmet — GOAL-X"))
         (is (str/includes? line "** — at ") "claim and why, split where every reader splits them")
         (is (= 1 (count (str/split-lines line))) "one line, so the file stays parseable")))))
+
+;; ------------------------------------- the bar the runner never ran
+
+(def ^:private one-commanded-bar
+  "# t-judge — bars\n\n## Quantitative\n- alpha — bar: exits 0 — measure: `echo a`\n")
+
+(defn- evidence! [dir id exit]
+  (write! (fs/path dir "evidence" (str id ".txt"))
+          (str "bar: alpha\ncommand: echo a\ncwd: /tmp\nexit: " exit "\n--- output ---\nout\n")))
+
+(deftest the-role-that-runs-the-bars-cannot-come-back-met-having-run-none
+  ;; The model is shown the evidence DIRECTORY and graded against it. An
+  ;; absence there is the one thing it cannot read: a bar nobody ran wrote no
+  ;; file, and a bar that ran and passed wrote one saying `exit: 0`. Measured
+  ;; on a real task — five `measure:` commands, evidence/ holding two files a
+  ;; role had typed by hand, and the verdict reporting the bars as missing
+  ;; evidence rather than as never run.
+  (with-task {:roles "implement claude task\nrun claude task\n"
+              :metrics one-commanded-bar
+              :goal "# t-judge\n\n## Goal\n- [ ] run — GOAL-X\n"}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (testing "a met verdict over a bar with no evidence file is overridden"
+        (let [r (handoff! "run" "fixture" "implement" "{\"met\":true,\"unmet\":[]}")]
+          (is (= 1 (:exit r)) "the handoff is refused, exactly as any other unmet verdict is")
+          (is (false? (:met (verdict-file dir "run"))))
+          (is (some #(str/includes? % "alpha") (:unmet (verdict-file dir "run")))
+              "and the bar is named, so the role knows what to run")
+          (is (some #(str/includes? % "never measured") (:unmet (verdict-file dir "run"))))))
+
+      (testing "once it has evidence, this gate stops objecting"
+        (evidence! dir "alpha" "0")
+        (let [r (handoff! "run" "fixture" "implement" "{\"met\":true,\"unmet\":[]}")]
+          (is (zero? (:exit r)) (:err r))
+          (is (true? (:met (verdict-file dir "run"))))))
+
+      (testing "and a bar that RAN and failed is not this gate's business"
+        ;; It is news about the code, not about the measuring. The merge
+        ;; verdict refuses to call such a task ready; blocking the runner's
+        ;; handoff for it would stop the role that is doing its job correctly.
+        ;; A new commit first: the handoff above went through, and a second one
+        ;; from the same role to the same role at the same HEAD is refused as a
+        ;; duplicate before the judge is ever consulted.
+        (commit! "fixture" "y.txt")
+        (evidence! dir "alpha" "1")
+        (let [r (handoff! "run" "fixture" "implement" "{\"met\":true,\"unmet\":[]}")]
+          (is (zero? (:exit r)) (:err r))
+          (is (true? (:met (verdict-file dir "run")))))))))
+
+(deftest a-role-that-does-not-run-the-bars-is-not-held-to-them
+  ;; The ordering this gate has to survive. Bars are measured by the run role,
+  ;; which is normally LAST — so at implement's handoff every bar is correctly
+  ;; unmeasured. A gate that counted them here would refuse the first handoff
+  ;; of every task that declares a bar, which is most of them.
+  (with-task {:roles "implement claude task\nrun claude task\n"
+              :metrics one-commanded-bar
+              :goal "# t-judge\n\n## Goal\n- [ ] implement — GOAL-X\n"}
+    (fn [{:keys [dir commit! handoff!]}]
+      (commit! "fixture" "x.txt")
+      (is (not (fs/exists? (fs/path dir "evidence" "alpha.txt")))
+          "nothing has run the bar yet, which is the normal state at this point")
+      (let [r (handoff! "implement" "fixture" "run" "{\"met\":true,\"unmet\":[]}")]
+        (is (zero? (:exit r)) (:err r))
+        (is (true? (:met (verdict-file dir "implement")))
+            "implement's prompt does not run the bars, so an unmeasured bar is not its gap")))))
 

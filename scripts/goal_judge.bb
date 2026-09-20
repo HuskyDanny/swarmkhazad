@@ -47,6 +47,9 @@
 
 (def script-dir (fs/parent (fs/absolutize *file*)))
 (load-file (str (fs/path script-dir "handoff_lib.bb")))
+;; For the one question about this session that is not a judgement: did the
+;; bars it was supposed to measure actually get measured.
+(load-file (str (fs/path script-dir "run_evidence.bb")))
 
 (def max-nudges
   "How many times one turn may be held open to ask for a handoff. The nudge is
@@ -396,6 +399,51 @@
                :met (if (empty? kept) true (:met verdict))
                :dropped-unmet dropped)))))
 
+(defn bars-it-owed
+  "The bars this session was supposed to measure and did not, or nil.
+
+   Only the role whose PROMPT runs the bars is asked this, and that restriction
+   is the whole design. Bars are measured by that role, which is normally last
+   in the lineup — so at `implement`'s handoff every bar is correctly
+   `:unmeasured`, and a gate that counted them there would refuse the first
+   handoff of every task that declares a bar.
+
+   `:failed` is deliberately not counted. A bar that ran and came out badly is
+   news about the code, and what that means for this role's own goal lines is a
+   judgement — the merge verdict already refuses to call such a task ready.
+   What is not a judgement is a bar nobody ran."
+  [ctx row]
+  (when (project-lib/measures? (:role row))
+    (seq (filterv #(run-evidence/unmeasured-states (:state %))
+                  (run-evidence/bar-states
+                   ctx (filterv #(run-evidence/mine? (:repo row) %)
+                                (run-evidence/declared-bars ctx)))))))
+
+(defn measured-what-it-owed
+  "A measuring session cannot come back `met` while a bar it owns has no
+   evidence at all.
+
+   The model is shown the evidence directory and asked to grade against it. An
+   absence in that directory is the one thing it cannot read: a bar nobody ran
+   wrote no file, and a bar that ran and passed wrote one saying `exit: 0`, so
+   the model sees nothing in both cases unless it is told which bars were
+   declared. Measured on a real task — five `measure:` commands, `evidence/`
+   holding two files a role had typed by hand, and the verdict reporting the
+   bars as missing evidence rather than as never run.
+
+   Appended to `:unmet` rather than replacing it: the model's own reasons are
+   still reasons, and this adds the one it could not see."
+  [verdict ctx row]
+  (if-let [bad (bars-it-owed ctx row)]
+    (assoc verdict
+           :met false
+           :unmet (into (vec (:unmet verdict))
+                        (for [{:keys [bar state]} bad]
+                          (str "bar `" (:name bar) "` was never measured ("
+                               (name state) ") — its `measure:` command has no evidence file,"
+                               " and this role is the one whose prompt runs them"))))
+    verdict))
+
 (defn grade!
   "Grade the session's committed state now, write the verdict, return it.
 
@@ -406,7 +454,11 @@
   [session]
   (let [{:keys [ctx row worktree goals other-roles]} (session-ctx session)
         verdict (-> (grade goals (working-state ctx session worktree (:repo row)))
-                    (own-unmet-only (or (:role row) session) other-roles))]
+                    (own-unmet-only (or (:role row) session) other-roles)
+                    ;; After own-unmet-only, never before: that one can turn
+                    ;; met back on when every reason belonged to someone else,
+                    ;; and an unmeasured bar is this session's own reason.
+                    (measured-what-it-owed ctx row))]
     (fs/create-dirs (fs/path (:state-dir ctx) "judge"))
     (spit (str (verdict-file ctx session))
           (json/generate-string (merge verdict {:role session :at (handoff-lib/timestamp)})

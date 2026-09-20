@@ -636,4 +636,26 @@
   :old "    (if (or (empty? bad) (not (re-find ready-line-re text)))"
   :new "    (if true"
   :killed-by "a-ready-verdict-the-evidence-contradicts-is-overridden"
-  :why "the gate is gone and the model has the last word on whether a bar passed again — the one question its own evidence file already answers"}]
+  :why "the gate is gone and the model has the last word on whether a bar passed again — the one question its own evidence file already answers"}
+
+ ;; ------------------------------------- the bar the runner never ran
+ {:file "scripts/goal_judge.bb"
+  :ns "judge"
+  :old "  (when (project-lib/measures? (:role row))"
+  :new "  (when false"
+  :killed-by "the-role-that-runs-the-bars-cannot-come-back-met-having-run-none"
+  :why "the runner can report met having run nothing, which is the state the model cannot see — a bar nobody ran and a bar that passed are the same absence in the evidence directory"}
+
+ {:file "scripts/goal_judge.bb"
+  :ns "judge"
+  :old "  (when (project-lib/measures? (:role row))"
+  :new "  (when true"
+  :killed-by "a-role-that-does-not-run-the-bars-is-not-held-to-them"
+  :why "every role is held to bars only the runner measures, so implement's FIRST handoff is refused on a bar that was never going to have run yet — this refuses the opening move of every task that declares one"}
+
+ {:file "scripts/run_evidence.bb"
+  :ns "judge"
+  :old "  #{:unmeasured :blocked})"
+  :new "  #{:unmeasured :blocked :failed})"
+  :killed-by "the-role-that-runs-the-bars-cannot-come-back-met-having-run-none"
+  :why "a bar that ran and failed blocks the runner's own handoff, punishing the role that did its job for what the code did — and the merge verdict already refuses to call that task ready"}]
